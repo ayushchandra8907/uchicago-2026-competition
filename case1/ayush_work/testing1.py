@@ -29,12 +29,7 @@ class MyXchangeClient(XChangeClient):
 
     async def trade(self):
         """This is a simple example bot that places orders and prints updates."""
-        await asyncio.sleep(5)
-
-        # Place an order
-
-
-        await self.place_order("A", 10, Side.BUY, None)
+        
 
         # # You can also look at order books like this
         # for security, book in self.order_books.items():
@@ -43,23 +38,11 @@ class MyXchangeClient(XChangeClient):
         #         sorted_asks = sorted((k,v) for k,v in book.asks.items() if v != 0)
         #         print(f"Bids for {security}:\n{sorted_bids}")
         #         print(f"Asks for {security}:\n{sorted_asks}")
-        pass
+        
 
     async def start(self):
         asyncio.create_task(self.trade())
         await self.connect()
 
 
-"""CONNECTING TO EXCHANGE"""
-
-async def main():
-    SERVER = '34.197.188.76:3333'
-    my_client = MyXchangeClient(SERVER, "uiuc", "mesa-lynx-octopus")
-    await my_client.start()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-    # comment
-    # comment 2
+ 
