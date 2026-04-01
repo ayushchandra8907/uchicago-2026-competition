@@ -32,15 +32,18 @@ class MyXchangeClient(XChangeClient):
         await asyncio.sleep(5)
 
         # Place an order
-        await self.place_order("A", 10, Side.BUY, 100)
 
-        # You can also look at order books like this
-        for security, book in self.order_books.items():
-            if book.bids or book.asks:
-                sorted_bids = sorted((k,v) for k,v in book.bids.items() if v != 0)
-                sorted_asks = sorted((k,v) for k,v in book.asks.items() if v != 0)
-                print(f"Bids for {security}:\n{sorted_bids}")
-                print(f"Asks for {security}:\n{sorted_asks}")
+
+        await self.place_order("A", 10, Side.BUY, None)
+
+        # # You can also look at order books like this
+        # for security, book in self.order_books.items():
+        #     if book.bids or book.asks:
+        #         sorted_bids = sorted((k,v) for k,v in book.bids.items() if v != 0)
+        #         sorted_asks = sorted((k,v) for k,v in book.asks.items() if v != 0)
+        #         print(f"Bids for {security}:\n{sorted_bids}")
+        #         print(f"Asks for {security}:\n{sorted_asks}")
+        pass
 
     async def start(self):
         asyncio.create_task(self.trade())
