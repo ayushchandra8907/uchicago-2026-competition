@@ -396,6 +396,7 @@ class MyXchangeClient(XChangeClient):
 
 
 """ CONNECTING TO EXCHANGE """
+#test
 
 async def main():
     SERVER = "34.197.188.76:3333"
