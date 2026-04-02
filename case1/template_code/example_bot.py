@@ -32,7 +32,7 @@ class MyXchangeClient(XChangeClient):
         await asyncio.sleep(5)
 
         # Place an order
-        await self.place_order("A", 10, Side.BUY, 100)
+        await self.place_order("A", 10, Side.BUY, None)
 
         # You can also look at order books like this
         for security, book in self.order_books.items():
@@ -48,8 +48,8 @@ class MyXchangeClient(XChangeClient):
 
 
 async def main():
-    SERVER = '127.0.0.1:3333'
-    my_client = MyXchangeClient(SERVER, "user", "password")
+    SERVER = '34.197.188.76:3333'
+    my_client = MyXchangeClient(SERVER, "uiuc", "mesa-lynx-octopus")
     await my_client.start()
 
 
