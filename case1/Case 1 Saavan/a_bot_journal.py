@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+from a_bot_strategy import ManagedOrder
+
+
+@dataclass(frozen=True)
+class JournalReplayState:
+    fair_value: int | None
+    inventory: int
+    live_orders: tuple[ManagedOrder, ...]
+
+
+class TradingJournal:
+    """Append-only JSONL journal used to recover local bot state after a crash."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self.path.touch()
+
+    def append(self, event_type: str, **payload) -> None:
+        record = {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "event_type": event_type,
+            **payload,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def record_order_submitted(self, order: ManagedOrder) -> None:
+        self.append(
+            "order_submitted",
+            order_id=order.order_id,
+            side=order.side,
+            px=order.px,
+            qty=order.qty,
+            remaining_qty=order.remaining_qty,
+            submitted_ms=order.submitted_ms,
+            aggressive=order.aggressive,
+        )
+
+    def record_cancel_requested(self, order_id: str) -> None:
+        self.append("cancel_requested", order_id=order_id)
+
+    def record_cancel_response(self, order_id: str, success: bool, error: str | None = None) -> None:
+        self.append("cancel_response", order_id=order_id, success=success, error=error)
+
+    def record_fill(self, order_id: str, qty: int, price: int) -> None:
+        self.append("order_fill", order_id=order_id, qty=qty, price=price)
+
+    def record_rejection(self, order_id: str, reason: str) -> None:
+        self.append("order_rejected", order_id=order_id, reason=reason)
+
+    def record_fair_value(
+        self,
+        fair_value: int,
+        source: str,
+        earnings_value: float | None = None,
+    ) -> None:
+        self.append(
+            "fair_value_updated",
+            fair_value=int(fair_value),
+            source=source,
+            earnings_value=earnings_value,
+        )
+
+    def record_inventory(self, inventory: int, cash: int | None = None) -> None:
+        self.append("inventory_updated", inventory=int(inventory), cash=cash)
+
+    def load_replay_state(self) -> JournalReplayState:
+        fair_value: int | None = None
+        inventory = 0
+        live_orders: dict[str, ManagedOrder] = {}
+
+        with self.path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = record.get("event_type")
+                order_id = record.get("order_id")
+                if event_type == "order_submitted" and order_id:
+                    live_orders[order_id] = ManagedOrder(
+                        order_id=order_id,
+                        side=record["side"],
+                        px=int(record["px"]),
+                        qty=int(record["qty"]),
+                        remaining_qty=int(record.get("remaining_qty", record["qty"])),
+                        submitted_ms=int(record.get("submitted_ms", 0)),
+                        aggressive=bool(record.get("aggressive", False)),
+                        restored=True,
+                    )
+                elif event_type == "cancel_requested" and order_id in live_orders:
+                    live_orders[order_id].cancel_pending = True
+                elif event_type == "cancel_response" and order_id in live_orders:
+                    if record.get("success"):
+                        live_orders.pop(order_id, None)
+                    else:
+                        live_orders[order_id].cancel_pending = False
+                elif event_type == "order_fill" and order_id in live_orders:
+                    live_orders[order_id].remaining_qty = max(
+                        0,
+                        live_orders[order_id].remaining_qty - int(record["qty"]),
+                    )
+                    if live_orders[order_id].remaining_qty == 0:
+                        live_orders.pop(order_id, None)
+                elif event_type == "order_rejected" and order_id in live_orders:
+                    live_orders.pop(order_id, None)
+                elif event_type == "fair_value_updated":
+                    fair_value = int(record["fair_value"])
+                elif event_type == "inventory_updated":
+                    inventory = int(record["inventory"])
+
+        # Restored orders are treated as potentially live because the exchange API
+        # gives us a position snapshot but not an open-order snapshot on reconnect.
+        restored = []
+        for order in live_orders.values():
+            restored.append(
+                ManagedOrder(
+                    order_id=order.order_id,
+                    side=order.side,
+                    px=order.px,
+                    qty=order.qty,
+                    remaining_qty=order.remaining_qty,
+                    submitted_ms=order.submitted_ms,
+                    aggressive=order.aggressive,
+                    cancel_pending=False,
+                    restored=True,
+                )
+            )
+
+        return JournalReplayState(
+            fair_value=fair_value,
+            inventory=inventory,
+            live_orders=tuple(restored),
+        )
