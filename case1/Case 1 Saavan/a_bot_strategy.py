@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil, floor
+from statistics import median
+import time
 from typing import Iterable, Literal
 
 from a_bot_config import AConfig, RiskConfig
@@ -88,11 +90,55 @@ class SyncActions:
     placements: tuple[PlaceCommand, ...]
 
 
-class AValuationModel:
-    """Keeps the latest fair value estimate for A and updates it from earnings news."""
+@dataclass
+class PECalibrationJob:
+    earnings_value: float
+    started_ms: int
+    sample_start_ms: int
+    finalize_ms: int
+    samples: list[float] = field(default_factory=list)
 
-    def __init__(self, pe_ratio: float, initial_fair_value: int | None = None):
-        self.pe_ratio = pe_ratio
+
+@dataclass(frozen=True)
+class NewsReaction:
+    relevant: bool
+    fair_value_updated: bool
+    started_pe_calibration: bool
+    earnings_value: float | None = None
+
+
+@dataclass(frozen=True)
+class LearnedPEUpdate:
+    status: str
+    implied_pe: float
+    trusted_pe: float
+    trusted_confidence: int
+    candidate_pe: float | None
+    candidate_confidence: int
+    reference_price: float
+    sample_count: int
+    trading_ready: bool
+
+
+class AValuationModel:
+    """Keeps the latest fair value estimate for A and learns a hidden constant P/E ratio."""
+
+    def __init__(
+        self,
+        a_config: AConfig,
+        *,
+        learned_pe_ratio: float | None = None,
+        learned_pe_confidence: int = 0,
+        initial_fair_value: int | None = None,
+    ):
+        self.configured_pe_ratio = a_config.pe_ratio
+        self.trusted_pe_ratio = learned_pe_ratio
+        self.trusted_pe_confidence = max(0, int(learned_pe_confidence))
+        self.min_learned_confidence = max(1, int(a_config.pe_learning_min_confidence))
+        self.consistency_tolerance = max(0.0, float(a_config.pe_learning_consistency_tolerance))
+        self.replacement_confirmations = max(1, int(a_config.pe_replacement_confirmations))
+        self.candidate_pe_ratio: float | None = None
+        self.candidate_pe_confidence = 0
         self.fair_value = initial_fair_value
         self.last_earnings_value: float | None = None
         self.last_source = "config" if initial_fair_value is not None else "none"
@@ -105,22 +151,143 @@ class AValuationModel:
         self.fair_value = int(fair_value)
         self.last_source = source
 
-    def update_from_news(self, news_release: dict) -> bool:
+    @property
+    def effective_pe_ratio(self) -> float | None:
+        if self.configured_pe_ratio is not None:
+            return self.configured_pe_ratio
+        return self.trusted_pe_ratio
+
+    @property
+    def can_trade_from_pe(self) -> bool:
+        if self.configured_pe_ratio is not None:
+            return True
+        return self.trusted_pe_ratio is not None and self.trusted_pe_confidence >= self.min_learned_confidence
+
+    @property
+    def pe_status_reason(self) -> str | None:
+        if self.configured_pe_ratio is not None:
+            return None
+        if self.trusted_pe_ratio is None:
+            return "No learned A P/E ratio yet; waiting for A earnings to calibrate."
+        if self.trusted_pe_confidence < self.min_learned_confidence:
+            return (
+                f"Learned A P/E={self.trusted_pe_ratio:.4f} "
+                f"with confidence {self.trusted_pe_confidence}/{self.min_learned_confidence}; waiting for another confirming earnings event."
+            )
+        return None
+
+    def on_earnings_release(self, earnings_value: float) -> bool:
+        self.last_earnings_value = float(earnings_value)
+        pe_ratio = self.effective_pe_ratio
+        if pe_ratio is None:
+            return False
+        self.set_fair_value(round(pe_ratio * self.last_earnings_value), source="earnings")
+        return True
+
+    def apply_learned_pe(
+        self,
+        implied_pe: float,
+        *,
+        reference_price: float,
+        sample_count: int,
+    ) -> LearnedPEUpdate:
+        implied_pe = float(implied_pe)
+        if self.configured_pe_ratio is not None:
+            trusted_pe = self.configured_pe_ratio
+            trusted_confidence = self.min_learned_confidence
+            status = "configured"
+        else:
+            if not self.can_trade_from_pe:
+                if self.trusted_pe_ratio is None:
+                    self.trusted_pe_ratio = implied_pe
+                    self.trusted_pe_confidence = 1
+                    status = "bootstrap_started"
+                else:
+                    relative_diff = self._relative_difference(implied_pe, self.trusted_pe_ratio)
+                    if relative_diff <= self.consistency_tolerance:
+                        weight = min(max(self.trusted_pe_confidence, 1), 5)
+                        self.trusted_pe_ratio = ((self.trusted_pe_ratio * weight) + implied_pe) / (weight + 1)
+                        self.trusted_pe_confidence = min(self.trusted_pe_confidence + 1, 10)
+                        status = "bootstrap_confirmed"
+                    else:
+                        self.trusted_pe_ratio = implied_pe
+                        self.trusted_pe_confidence = 1
+                        status = "bootstrap_reset"
+                self.candidate_pe_ratio = None
+                self.candidate_pe_confidence = 0
+            else:
+                relative_diff = self._relative_difference(implied_pe, self.trusted_pe_ratio)
+                if relative_diff <= self.consistency_tolerance:
+                    weight = min(max(self.trusted_pe_confidence, 1), 5)
+                    self.trusted_pe_ratio = ((self.trusted_pe_ratio * weight) + implied_pe) / (weight + 1)
+                    self.trusted_pe_confidence = min(self.trusted_pe_confidence + 1, 10)
+                    self.candidate_pe_ratio = None
+                    self.candidate_pe_confidence = 0
+                    status = "trusted_confirmed"
+                else:
+                    if self.candidate_pe_ratio is None:
+                        self.candidate_pe_ratio = implied_pe
+                        self.candidate_pe_confidence = 1
+                        status = "candidate_started"
+                    else:
+                        candidate_diff = self._relative_difference(implied_pe, self.candidate_pe_ratio)
+                        if candidate_diff <= self.consistency_tolerance:
+                            weight = min(max(self.candidate_pe_confidence, 1), 5)
+                            self.candidate_pe_ratio = ((self.candidate_pe_ratio * weight) + implied_pe) / (weight + 1)
+                            self.candidate_pe_confidence += 1
+                            status = "candidate_confirmed"
+                            if self.candidate_pe_confidence >= self.replacement_confirmations:
+                                self.trusted_pe_ratio = self.candidate_pe_ratio
+                                self.trusted_pe_confidence = max(
+                                    self.min_learned_confidence,
+                                    self.candidate_pe_confidence,
+                                )
+                                self.candidate_pe_ratio = None
+                                self.candidate_pe_confidence = 0
+                                status = "candidate_promoted"
+                        else:
+                            self.candidate_pe_ratio = implied_pe
+                            self.candidate_pe_confidence = 1
+                            status = "candidate_restarted"
+            trusted_pe = float(self.trusted_pe_ratio)
+            trusted_confidence = int(self.trusted_pe_confidence)
+
+        if trusted_pe is not None and self.last_earnings_value is not None:
+            source = "learned_pe" if self.configured_pe_ratio is None else "configured"
+            self.set_fair_value(round(trusted_pe * self.last_earnings_value), source=source)
+
+        return LearnedPEUpdate(
+            status=status,
+            implied_pe=implied_pe,
+            trusted_pe=float(trusted_pe),
+            trusted_confidence=int(trusted_confidence),
+            candidate_pe=self.candidate_pe_ratio,
+            candidate_confidence=int(self.candidate_pe_confidence),
+            reference_price=float(reference_price),
+            sample_count=int(sample_count),
+            trading_ready=self.can_trade_from_pe,
+        )
+
+    @property
+    def learned_pe_ratio(self) -> float | None:
+        return self.trusted_pe_ratio
+
+    @property
+    def learned_pe_confidence(self) -> int:
+        return self.trusted_pe_confidence
+
+    @staticmethod
+    def _relative_difference(left: float, right: float) -> float:
+        return abs(left - right) / max(abs(right), 1e-9)
+
+    def handles_news(self, news_release: dict) -> bool:
         if news_release.get("kind") != "structured":
             return False
         new_data = news_release.get("new_data") or {}
         if new_data.get("structured_subtype") != "earnings":
             return False
-
         asset = str(new_data.get("asset") or news_release.get("symbol") or "").upper()
-        if asset != "A":
-            return False
-
-        earnings_value = float(new_data["value"])
-        self.last_earnings_value = earnings_value
-        self.fair_value = int(round(self.pe_ratio * earnings_value))
-        self.last_source = "earnings"
-        return True
+        return asset == "A"
 
 
 class QuoteEngine:
@@ -138,6 +305,7 @@ class QuoteEngine:
         sell_exposure: int,
         can_trade: bool,
         reason_if_blocked: str,
+        quote_size: int | None = None,
     ) -> QuotePlan:
         if not can_trade:
             return QuotePlan(
@@ -158,6 +326,7 @@ class QuoteEngine:
             )
 
         # Treat current inventory plus same-side resting orders as committed exposure.
+        quote_size = self.risk.quote_size if quote_size is None else int(quote_size)
         allowed_buy = max(0, self.risk.max_position - (inventory + buy_exposure))
         allowed_sell = max(0, self.risk.max_position + inventory - sell_exposure)
 
@@ -184,7 +353,7 @@ class QuoteEngine:
                     DesiredOrder(
                         side="BUY",
                         px=book.best_ask.px,
-                        qty=min(self.risk.quote_size, allowed_buy, book.best_ask.qty),
+                        qty=min(quote_size, allowed_buy, book.best_ask.qty),
                         aggressive=True,
                         reason="best ask is cheap versus fair value",
                     )
@@ -196,7 +365,7 @@ class QuoteEngine:
                     DesiredOrder(
                         side="SELL",
                         px=book.best_bid.px,
-                        qty=min(self.risk.quote_size, allowed_sell, book.best_bid.qty),
+                        qty=min(quote_size, allowed_sell, book.best_bid.qty),
                         aggressive=True,
                         reason="best bid is rich versus fair value",
                     )
@@ -207,7 +376,7 @@ class QuoteEngine:
             desired_bid = DesiredOrder(
                 side="BUY",
                 px=bid_px,
-                qty=min(self.risk.quote_size, allowed_buy),
+                qty=min(quote_size, allowed_buy),
                 aggressive=False,
                 reason="passive buy quote around reservation price",
             )
@@ -215,7 +384,7 @@ class QuoteEngine:
             desired_ask = DesiredOrder(
                 side="SELL",
                 px=ask_px,
-                qty=min(self.risk.quote_size, allowed_sell),
+                qty=min(quote_size, allowed_sell),
                 aggressive=False,
                 reason="passive sell quote around reservation price",
             )
@@ -405,13 +574,19 @@ class MarketAStrategy:
         risk: RiskConfig,
         restored_orders: Iterable[ManagedOrder] = (),
         recovered_fair_value: int | None = None,
+        learned_pe_ratio: float | None = None,
+        learned_pe_confidence: int = 0,
     ):
         starting_fair = recovered_fair_value
         if starting_fair is None:
             starting_fair = a_config.initial_fair_value
 
+        self.a_config = a_config
+        self.risk = risk
         self.valuation = AValuationModel(
-            pe_ratio=a_config.pe_ratio,
+            a_config=a_config,
+            learned_pe_ratio=learned_pe_ratio,
+            learned_pe_confidence=learned_pe_confidence,
             initial_fair_value=starting_fair,
         )
         if recovered_fair_value is not None:
@@ -421,6 +596,8 @@ class MarketAStrategy:
         self.order_manager = OrderManager(symbol="A", risk=risk)
         self.inventory = 0
         self.book = BookSnapshot()
+        self.current_round_earnings_seen = False
+        self.pending_pe_calibration: PECalibrationJob | None = None
         self.recovery_pending: set[str] = set()
         self.recovery_active = False
 
@@ -435,17 +612,79 @@ class MarketAStrategy:
     def fair_value(self) -> int | None:
         return self.valuation.fair_value
 
+    @property
+    def effective_pe_ratio(self) -> float | None:
+        return self.valuation.effective_pe_ratio
+
+    @property
+    def learned_pe_ratio(self) -> float | None:
+        return self.valuation.learned_pe_ratio
+
+    @property
+    def learned_pe_confidence(self) -> int:
+        return self.valuation.learned_pe_confidence
+
     def set_inventory(self, inventory: int) -> None:
         self.inventory = int(inventory)
 
     def on_book_update(self, symbol: str, book) -> bool:
+        return self.on_book_update_at(symbol, book, self._now_ms())
+
+    def on_book_update_at(self, symbol: str, book, now_ms: int) -> bool:
         if symbol != "A":
             return False
         self.book = BookSnapshot.from_order_book(book)
+        self._capture_mid_sample(now_ms)
         return True
 
-    def on_news(self, news_release: dict) -> bool:
-        return self.valuation.update_from_news(news_release)
+    def on_news(self, news_release: dict, now_ms: int) -> NewsReaction:
+        if not self.valuation.handles_news(news_release):
+            return NewsReaction(relevant=False, fair_value_updated=False, started_pe_calibration=False)
+
+        earnings_value = float(news_release["new_data"]["value"])
+        self.current_round_earnings_seen = True
+        fair_updated = self.valuation.on_earnings_release(earnings_value)
+        started_pe_calibration = False
+
+        if self.valuation.configured_pe_ratio is None:
+            self.pending_pe_calibration = PECalibrationJob(
+                earnings_value=earnings_value,
+                started_ms=now_ms,
+                sample_start_ms=now_ms + self.a_config.pe_learning_delay_ms,
+                finalize_ms=now_ms + self.a_config.pe_learning_delay_ms + self.a_config.pe_learning_sample_window_ms,
+            )
+            started_pe_calibration = True
+
+        return NewsReaction(
+            relevant=True,
+            fair_value_updated=fair_updated,
+            started_pe_calibration=started_pe_calibration,
+            earnings_value=earnings_value,
+        )
+
+    def maybe_finalize_pe_learning(self, now_ms: int) -> LearnedPEUpdate | None:
+        if self.pending_pe_calibration is None:
+            return None
+
+        self._capture_mid_sample(now_ms)
+        pending = self.pending_pe_calibration
+        if now_ms < pending.finalize_ms:
+            return None
+        if len(pending.samples) < self.a_config.pe_learning_min_samples:
+            return None
+        if pending.earnings_value == 0:
+            self.pending_pe_calibration = None
+            return None
+
+        reference_price = float(median(pending.samples))
+        implied_pe = reference_price / pending.earnings_value
+        update = self.valuation.apply_learned_pe(
+            implied_pe,
+            reference_price=reference_price,
+            sample_count=len(pending.samples),
+        )
+        self.pending_pe_calibration = None
+        return update
 
     def on_fill(self, order_id: str, qty: int, price: int) -> ManagedOrder | None:
         order = self.order_manager.handle_fill(order_id, qty)
@@ -492,6 +731,16 @@ class MarketAStrategy:
         ]
 
     def compute_quotes(self) -> QuotePlan:
+        if not self.valuation.can_trade_from_pe:
+            return self.quote_engine.compute_quotes(
+                fair_value=None,
+                inventory=self.inventory,
+                book=self.book,
+                buy_exposure=self.order_manager.buy_exposure(),
+                sell_exposure=self.order_manager.sell_exposure(),
+                can_trade=False,
+                reason_if_blocked=self.valuation.pe_status_reason or "A valuation is not ready yet.",
+            )
         reason_if_blocked = "Waiting for recovered A orders to be cancelled."
         return self.quote_engine.compute_quotes(
             fair_value=self.valuation.fair_value,
@@ -501,8 +750,39 @@ class MarketAStrategy:
             sell_exposure=self.order_manager.sell_exposure(),
             can_trade=not self.recovery_active,
             reason_if_blocked=reason_if_blocked,
+            quote_size=self._active_quote_size(),
         )
 
     def _maybe_finish_recovery(self) -> None:
         if self.recovery_active and not self.recovery_pending:
             self.on_recovery_complete()
+
+    def _active_quote_size(self) -> int:
+        if self.valuation.configured_pe_ratio is not None:
+            return self.risk.quote_size
+        if self.current_round_earnings_seen:
+            return self.risk.quote_size
+        if self.valuation.can_trade_from_pe:
+            return max(1, self.risk.quote_size // 2)
+        return self.risk.quote_size
+
+    def _capture_mid_sample(self, now_ms: int | None = None) -> None:
+        if self.pending_pe_calibration is None:
+            return
+        if now_ms is None:
+            now_ms = self._now_ms()
+        if now_ms < self.pending_pe_calibration.sample_start_ms:
+            return
+        current_mid = self._current_mid()
+        if current_mid is None:
+            return
+        self.pending_pe_calibration.samples.append(current_mid)
+
+    def _current_mid(self) -> float | None:
+        if self.book.best_bid is None or self.book.best_ask is None:
+            return None
+        return (self.book.best_bid.px + self.book.best_ask.px) / 2.0
+
+    @staticmethod
+    def _now_ms() -> int:
+        return int(time.monotonic() * 1000)

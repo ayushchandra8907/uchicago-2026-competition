@@ -21,6 +21,17 @@ except ModuleNotFoundError as exc:
 LOGGER = logging.getLogger("market-a-bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
+# Quick-start defaults so clicking the IDE Run button works the same way as the
+# provided example bot. Environment variables still override these.
+DEFAULT_SERVER = "34.197.188.76:3333"
+DEFAULT_USERNAME = "uiuc"
+DEFAULT_PASSWORD = "mesa-lynx-octopus"
+
+# Leave this as None until you know the correct constant P/E ratio for A.
+# With None, the bot will connect successfully but stay observe-only.
+DEFAULT_A_PE_RATIO: float | None = None
+DEFAULT_A_INITIAL_FAIR_VALUE: int | None = None
+
 
 class MarketABot(XChangeClient):
     """Live A-only bot with fair-value updates, passive quotes, and restart recovery."""
@@ -35,11 +46,14 @@ class MarketABot(XChangeClient):
         self.config = config
         self.journal = TradingJournal(config.paths.journal_path)
         replay_state = self.journal.load_replay_state()
+        recovered_fair_value = replay_state.fair_value if replay_state.live_orders else None
         self.strategy = MarketAStrategy(
             a_config=config.market_a,
             risk=config.risk,
             restored_orders=replay_state.live_orders,
-            recovered_fair_value=replay_state.fair_value,
+            recovered_fair_value=recovered_fair_value,
+            learned_pe_ratio=replay_state.learned_pe_ratio,
+            learned_pe_confidence=replay_state.learned_pe_confidence,
         )
         self.strategy.set_inventory(replay_state.inventory)
         self._quote_lock = asyncio.Lock()
@@ -47,12 +61,21 @@ class MarketABot(XChangeClient):
         self._shutdown = asyncio.Event()
         self._refresh_task: asyncio.Task | None = None
         self._recovery_task: asyncio.Task | None = None
+        self._last_observe_only_reason: str | None = None
 
         if replay_state.live_orders:
             restored_ids = ", ".join(order.order_id for order in replay_state.live_orders)
             LOGGER.warning("Recovered %d local A orders from journal: %s", len(replay_state.live_orders), restored_ids)
-        if replay_state.fair_value is not None:
-            LOGGER.info("Recovered last known A fair value from journal: %s", replay_state.fair_value)
+        if recovered_fair_value is not None:
+            LOGGER.info("Recovered last known A fair value from journal: %s", recovered_fair_value)
+        if replay_state.learned_pe_ratio is not None:
+            LOGGER.info(
+                "Loaded trusted A P/E estimate %.4f with confidence %s",
+                replay_state.learned_pe_ratio,
+                replay_state.learned_pe_confidence,
+            )
+        elif config.market_a.pe_ratio is None:
+            LOGGER.warning("No configured A P/E estimate yet; the bot will learn it from A earnings before trading.")
 
     def handle_position_snapshot(self, msg) -> None:
         """Use the exchange snapshot as the anchor for inventory and recovery startup."""
@@ -123,29 +146,35 @@ class MarketABot(XChangeClient):
     async def bot_handle_book_update(self, symbol: str) -> None:
         if symbol != "A":
             return
-        self.strategy.on_book_update(symbol, self.order_books[symbol])
+        self.strategy.on_book_update_at(symbol, self.order_books[symbol], self._now_ms())
         await self._evaluate_and_sync("book update")
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool) -> None:
         LOGGER.info("Ignoring swap response in A-only bot: %s qty=%s success=%s", swap, qty, success)
 
     async def bot_handle_news(self, news_release: dict) -> None:
-        changed = self.strategy.on_news(news_release)
-        if not changed:
+        reaction = self.strategy.on_news(news_release, self._now_ms())
+        if not reaction.relevant:
             return
-        fair_value = self.strategy.fair_value
-        earnings_value = self.strategy.valuation.last_earnings_value
-        self.journal.record_fair_value(
-            fair_value=fair_value,
-            source=self.strategy.valuation.last_source,
-            earnings_value=earnings_value,
-        )
-        LOGGER.info(
-            "Updated A fair value to %s from earnings=%s using PE=%s",
-            fair_value,
-            earnings_value,
-            self.config.market_a.pe_ratio,
-        )
+        if reaction.started_pe_calibration:
+            LOGGER.info(
+                "Started A P/E calibration from earnings=%s; waiting %sms to settle and %sms to sample.",
+                reaction.earnings_value,
+                self.config.market_a.pe_learning_delay_ms,
+                self.config.market_a.pe_learning_sample_window_ms,
+            )
+        if reaction.fair_value_updated and self.strategy.fair_value is not None:
+            self.journal.record_fair_value(
+                fair_value=self.strategy.fair_value,
+                source=self.strategy.valuation.last_source,
+                earnings_value=self.strategy.valuation.last_earnings_value,
+            )
+            LOGGER.info(
+                "Updated A fair value to %s from earnings=%s using PE=%s",
+                self.strategy.fair_value,
+                self.strategy.valuation.last_earnings_value,
+                self.strategy.effective_pe_ratio,
+            )
         await self._evaluate_and_sync("news")
 
     async def bot_handle_market_resolved(self, market_id: str, winning_symbol: str, tick: int):
@@ -186,11 +215,58 @@ class MarketABot(XChangeClient):
         if not self.connected or not self._position_snapshot_seen.is_set():
             return
         async with self._quote_lock:
+            learned_pe_update = self.strategy.maybe_finalize_pe_learning(self._now_ms())
+            if learned_pe_update is not None:
+                self.journal.record_learned_pe(
+                    effective_pe=learned_pe_update.trusted_pe,
+                    confidence=learned_pe_update.trusted_confidence,
+                    implied_pe=learned_pe_update.implied_pe,
+                    reference_price=learned_pe_update.reference_price,
+                    earnings_value=self.strategy.valuation.last_earnings_value or 0.0,
+                    sample_count=learned_pe_update.sample_count,
+                )
+                if self.strategy.fair_value is not None:
+                    self.journal.record_fair_value(
+                        fair_value=self.strategy.fair_value,
+                        source=self.strategy.valuation.last_source,
+                        earnings_value=self.strategy.valuation.last_earnings_value,
+                    )
+                if learned_pe_update.status in {"bootstrap_started", "bootstrap_confirmed", "bootstrap_reset", "trusted_confirmed"}:
+                    LOGGER.info(
+                        "Updated trusted A P/E from earnings: status=%s implied=%.4f reference_mid=%.2f trusted_pe=%.4f confidence=%s trading_ready=%s",
+                        learned_pe_update.status,
+                        learned_pe_update.implied_pe,
+                        learned_pe_update.reference_price,
+                        learned_pe_update.trusted_pe,
+                        learned_pe_update.trusted_confidence,
+                        learned_pe_update.trading_ready,
+                    )
+                elif learned_pe_update.status in {"candidate_started", "candidate_confirmed", "candidate_restarted"}:
+                    LOGGER.info(
+                        "Observed candidate A P/E: status=%s implied=%.4f trusted_pe=%.4f candidate_pe=%.4f candidate_confidence=%s; continuing to trade trusted P/E.",
+                        learned_pe_update.status,
+                        learned_pe_update.implied_pe,
+                        learned_pe_update.trusted_pe,
+                        learned_pe_update.candidate_pe or learned_pe_update.trusted_pe,
+                        learned_pe_update.candidate_confidence,
+                    )
+                elif learned_pe_update.status == "candidate_promoted":
+                    LOGGER.info(
+                        "Promoted candidate A P/E to trusted: implied=%.4f new_trusted_pe=%.4f confidence=%s trading_ready=%s",
+                        learned_pe_update.implied_pe,
+                        learned_pe_update.trusted_pe,
+                        learned_pe_update.trusted_confidence,
+                        learned_pe_update.trading_ready,
+                    )
             # The strategy only decides what the bot wants to own on each side.
             # The order manager turns that target state into cancel/place actions.
             plan = self.strategy.compute_quotes()
             if plan.observe_only:
-                LOGGER.info("A bot observe-only: %s", plan.reason)
+                if plan.reason != self._last_observe_only_reason:
+                    LOGGER.info("A bot observe-only: %s", plan.reason)
+                    self._last_observe_only_reason = plan.reason
+            else:
+                self._last_observe_only_reason = None
             actions = self.strategy.order_manager.build_actions(plan, self._now_ms())
 
             for cancel in actions.cancels:
@@ -233,12 +309,21 @@ class MarketABot(XChangeClient):
 async def main() -> None:
     base_dir = Path(__file__).resolve().parent
     try:
-        config = load_bot_config(base_dir)
+        config = load_bot_config(
+            base_dir,
+            default_host=DEFAULT_SERVER,
+            default_username=DEFAULT_USERNAME,
+            default_password=DEFAULT_PASSWORD,
+            default_pe_ratio=DEFAULT_A_PE_RATIO,
+            default_initial_fair_value=DEFAULT_A_INITIAL_FAIR_VALUE,
+        )
     except ConfigError as exc:
         raise SystemExit(str(exc)) from exc
 
     LOGGER.info("Starting A-only bot against %s", config.exchange.host)
     LOGGER.info("Journal path: %s", config.paths.journal_path)
+    if not config.trading_enabled and config.trading_disabled_reason:
+        LOGGER.warning(config.trading_disabled_reason)
     bot = MarketABot(config)
     await bot.start()
 
