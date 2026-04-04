@@ -1,4 +1,15 @@
 """
+
+Here's the bot. A few critical things before you can run it:
+You MUST update before competition day:
+
+Option symbol names. The OPTION_STRIKES list at the top uses placeholder strings like "B95C". You need to replace these with whatever the actual exchange symbols are. You'll discover these during practice rounds or from the exchange's symbol universe. This is the single most important thing — if the symbols are wrong, the entire fair value computation fails.
+Strike prices. The strikes (95, 100, 105) are placeholders. The case says "3 strikes around spot" — these shift dynamically. You may need to detect them from the symbol universe at runtime rather than hardcoding.
+Credentials and host. HOST, USERNAME, PASSWORD at the top.
+Risk limits. Update the MAX_* variables when final limits are published on Ed.
+
+
+
 B Stock Trading Bot
 ====================
 Trades stock B using the option chain as a fair-value oracle.
