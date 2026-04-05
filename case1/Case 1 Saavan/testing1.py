@@ -27,8 +27,8 @@ DEFAULT_SERVER = "34.197.188.76:3333"
 DEFAULT_USERNAME = "uiuc"
 DEFAULT_PASSWORD = "mesa-lynx-octopus"
 
-# A has a fixed economic P/E of 10 and trades in cents.
-DEFAULT_A_PE_RATIO: float | None = 10.0
+# A's price-to-earnings multiplier changes by round, so we learn it live.
+DEFAULT_A_INITIAL_MULTIPLIER: float | None = None
 DEFAULT_A_INITIAL_FAIR_VALUE: int | None = None
 
 
@@ -45,12 +45,16 @@ class MarketABot(XChangeClient):
         self.config = config
         self.journal = TradingJournal(config.paths.journal_path)
         replay_state = self.journal.load_replay_state()
+        recovered_multiplier = replay_state.multiplier if replay_state.live_orders else None
+        recovered_multiplier_confidence = replay_state.multiplier_confidence if replay_state.live_orders else 0
         recovered_fair_value = replay_state.fair_value if replay_state.live_orders else None
         recovered_earnings_value = replay_state.earnings_value if replay_state.live_orders else None
         self.strategy = MarketAStrategy(
             a_config=config.market_a,
             risk=config.risk,
             restored_orders=replay_state.live_orders,
+            recovered_multiplier=recovered_multiplier,
+            recovered_multiplier_confidence=recovered_multiplier_confidence,
             recovered_fair_value=recovered_fair_value,
             recovered_earnings_value=recovered_earnings_value,
         )
@@ -66,13 +70,18 @@ class MarketABot(XChangeClient):
         if replay_state.live_orders:
             restored_ids = ", ".join(order.order_id for order in replay_state.live_orders)
             LOGGER.warning("Recovered %d local A orders from journal: %s", len(replay_state.live_orders), restored_ids)
+        if recovered_multiplier is not None:
+            LOGGER.info(
+                "Recovered last known A multiplier from journal: %.4f (confidence=%s)",
+                recovered_multiplier,
+                recovered_multiplier_confidence,
+            )
         if recovered_fair_value is not None:
             LOGGER.info("Recovered last known A fair value from journal: %s", recovered_fair_value)
-        LOGGER.info(
-            "A valuation uses fixed PE=%s and price_scale=%s",
-            config.market_a.pe_ratio,
-            config.market_a.price_scale,
-        )
+        if config.market_a.initial_multiplier is not None and recovered_multiplier is None:
+            LOGGER.info("Seeding A multiplier from config: %.4f", config.market_a.initial_multiplier)
+        else:
+            LOGGER.info("A valuation will learn a round-specific multiplier from structured earnings.")
 
     def handle_position_snapshot(self, msg) -> None:
         """Use the exchange snapshot as the anchor for inventory and recovery startup."""
@@ -200,6 +209,8 @@ class MarketABot(XChangeClient):
 
     async def bot_handle_news(self, news_release: dict) -> None:
         reaction = self.strategy.on_news(news_release, self._now_ms())
+        if reaction.note:
+            LOGGER.info(reaction.note)
         if not reaction.relevant:
             if reaction.tick is not None:
                 await self._evaluate_and_sync("news tick")
@@ -209,15 +220,6 @@ class MarketABot(XChangeClient):
                 fair_value=self.strategy.fair_value,
                 source=self.strategy.valuation.last_source,
                 earnings_value=self.strategy.valuation.last_earnings_value,
-            )
-            LOGGER.info(
-                "A earnings tick=%s moved fair from %s to %s on earnings=%s; shock_direction=%s threshold=%s",
-                reaction.tick,
-                reaction.old_fair_value,
-                reaction.new_fair_value,
-                reaction.earnings_value,
-                reaction.shock_direction,
-                reaction.shock_threshold,
             )
         await self._evaluate_and_sync("news")
 
@@ -260,7 +262,42 @@ class MarketABot(XChangeClient):
             # The strategy only decides what the bot wants to own on each side.
             # The order manager turns that target state into cancel/place actions.
             now_ms = self._now_ms()
+            prior_fair = self.strategy.fair_value
+            prior_multiplier = self.strategy.trusted_multiplier
+            prior_confidence = self.strategy.multiplier_confidence
             plan = self.strategy.compute_quotes(now_ms=now_ms)
+            for event in self.strategy.drain_learning_events():
+                if event.status == "skipped":
+                    LOGGER.warning("Skipped A multiplier calibration: %s", event.reason)
+                    continue
+                LOGGER.info(
+                    "A multiplier %s via %s estimate=%.4f settled_mid=%s trusted=%.4f confidence=%s tolerance=%s",
+                    event.status,
+                    event.method,
+                    event.estimate,
+                    "n/a" if event.settled_mid is None else f"{event.settled_mid:.2f}",
+                    event.trusted_multiplier or 0.0,
+                    event.confidence,
+                    "n/a" if event.tolerance is None else f"{event.tolerance:.2f}",
+                )
+                if event.trusted_multiplier is not None:
+                    self.journal.record_multiplier(
+                        multiplier=event.trusted_multiplier,
+                        confidence=event.confidence,
+                        source=event.status,
+                        estimate=event.estimate,
+                        method=event.method,
+                    )
+            if self.strategy.fair_value is not None and self.strategy.fair_value != prior_fair:
+                self.journal.record_fair_value(
+                    fair_value=self.strategy.fair_value,
+                    source=self.strategy.valuation.last_source,
+                    earnings_value=self.strategy.valuation.last_earnings_value,
+                )
+                if prior_fair is None:
+                    LOGGER.info("A fair value initialized at %s after multiplier learning.", self.strategy.fair_value)
+                elif self.strategy.trusted_multiplier != prior_multiplier or self.strategy.multiplier_confidence != prior_confidence:
+                    LOGGER.info("A fair value refreshed from %s to %s after multiplier update.", prior_fair, self.strategy.fair_value)
             if plan.mode != self._last_mode:
                 until_next = self.strategy.ms_until_next_scheduled_earnings(now_ms)
                 LOGGER.info(
@@ -325,7 +362,7 @@ async def main() -> None:
             default_host=DEFAULT_SERVER,
             default_username=DEFAULT_USERNAME,
             default_password=DEFAULT_PASSWORD,
-            default_pe_ratio=DEFAULT_A_PE_RATIO,
+            default_initial_multiplier=DEFAULT_A_INITIAL_MULTIPLIER,
             default_initial_fair_value=DEFAULT_A_INITIAL_FAIR_VALUE,
         )
     except ConfigError as exc:

@@ -18,12 +18,22 @@ class ExchangeConfig:
 
 @dataclass(frozen=True)
 class AConfig:
-    pe_ratio: float = 10.0
-    price_scale: int = 100
+    initial_multiplier: float | None = None
     initial_fair_value: int | None = None
     startup_assume_fresh_round: bool = True
     pre_news_pullback_ms: int = 4_000
+    calibration_min_delay_ms: int = 5_000
+    calibration_max_delay_ms: int = 20_000
+    calibration_sample_period_ms: int = 1_000
+    calibration_stability_band_ticks: int = 8
+    calibration_tolerance_fraction: float = 0.10
+    calibration_min_tolerance_fraction: float = 0.03
+    candidate_confirmations: int = 2
+    news_caution_quote_size: int = 1
+    news_caution_max_position: int = 8
+    news_caution_half_spread_ticks: int = 5
     steady_half_spread_ticks: int = 1
+    steady_take_min_edge: int = 1
     opening_quote_size: int = 1
     opening_max_position: int = 8
     opening_half_spread_ticks: int = 4
@@ -43,11 +53,13 @@ class AConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     reprice_cooldown_ms: int = 250
+    passive_reprice_threshold_ticks: int = 2
+    passive_quote_ttl_ms: int = 3_000
 
     @property
     def stale_quote_ms(self) -> int:
         """Refresh stale quotes periodically without thrashing the exchange."""
-        return max(self.reprice_cooldown_ms * 4, 1_000)
+        return max(self.passive_quote_ttl_ms, self.reprice_cooldown_ms)
 
 
 @dataclass(frozen=True)
@@ -115,7 +127,7 @@ def load_bot_config(
     default_host: str | None = None,
     default_username: str | None = None,
     default_password: str | None = None,
-    default_pe_ratio: float | None = 10.0,
+    default_initial_multiplier: float | None = None,
     default_initial_fair_value: int | None = None,
 ) -> BotConfig:
     """Load the exchange, valuation, and risk parameters from env vars or quick-start defaults."""
@@ -139,12 +151,22 @@ def load_bot_config(
             password=password,
         ),
         market_a=AConfig(
-            pe_ratio=_optional_float("A_PE_RATIO", default=default_pe_ratio) or 10.0,
-            price_scale=_optional_int("A_PRICE_SCALE", 100) or 100,
+            initial_multiplier=_optional_float("A_INITIAL_MULTIPLIER", default=default_initial_multiplier),
             initial_fair_value=_optional_int("A_INITIAL_FAIR_VALUE", default_initial_fair_value),
             startup_assume_fresh_round=_optional_bool("A_STARTUP_ASSUME_FRESH_ROUND", True),
             pre_news_pullback_ms=_optional_int("A_PRE_NEWS_PULLBACK_MS", 4_000) or 4_000,
+            calibration_min_delay_ms=_optional_int("A_CALIBRATION_MIN_DELAY_MS", 5_000) or 5_000,
+            calibration_max_delay_ms=_optional_int("A_CALIBRATION_MAX_DELAY_MS", 20_000) or 20_000,
+            calibration_sample_period_ms=_optional_int("A_CALIBRATION_SAMPLE_PERIOD_MS", 1_000) or 1_000,
+            calibration_stability_band_ticks=_optional_int("A_CALIBRATION_STABILITY_BAND_TICKS", 8) or 8,
+            calibration_tolerance_fraction=_optional_float("A_CALIBRATION_TOLERANCE_FRACTION", 0.10) or 0.10,
+            calibration_min_tolerance_fraction=_optional_float("A_CALIBRATION_MIN_TOLERANCE_FRACTION", 0.03) or 0.03,
+            candidate_confirmations=_optional_int("A_CANDIDATE_CONFIRMATIONS", 2) or 2,
+            news_caution_quote_size=_optional_int("A_NEWS_CAUTION_QUOTE_SIZE", 1) or 1,
+            news_caution_max_position=_optional_int("A_NEWS_CAUTION_MAX_POSITION", 8) or 8,
+            news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 5) or 5,
             steady_half_spread_ticks=_optional_int("A_STEADY_HALF_SPREAD_TICKS", 1) or 1,
+            steady_take_min_edge=_optional_int("A_STEADY_TAKE_MIN_EDGE", 1) or 1,
             opening_quote_size=_optional_int("A_OPENING_QUOTE_SIZE", 1) or 1,
             opening_max_position=_optional_int("A_OPENING_MAX_POSITION", 8) or 8,
             opening_half_spread_ticks=_optional_int("A_OPENING_HALF_SPREAD_TICKS", 4) or 4,
@@ -162,6 +184,8 @@ def load_bot_config(
         ),
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
+            passive_reprice_threshold_ticks=_optional_int("A_PASSIVE_REPRICE_THRESHOLD_TICKS", 2) or 2,
+            passive_quote_ttl_ms=_optional_int("A_PASSIVE_QUOTE_TTL_MS", 3_000) or 3_000,
         ),
         paths=BotPaths(
             base_dir=base_path,

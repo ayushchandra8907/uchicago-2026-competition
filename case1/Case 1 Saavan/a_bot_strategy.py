@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from math import ceil, floor
+from dataclasses import dataclass, field
+from math import ceil, floor, sqrt
+from statistics import median
 import time
 from typing import Iterable, Literal
 
@@ -12,15 +13,16 @@ SideName = Literal["BUY", "SELL"]
 ModeName = Literal[
     "OPENING_MICRO_MM",
     "PRE_NEWS_PULLBACK",
-    "POST_NEWS_SHOCK",
+    "POST_EARNINGS_SHOCK",
+    "MULTIPLIER_DISCOVERY",
+    "NEWS_CAUTIOUS_MM",
     "UNWIND",
     "STEADY_MM",
 ]
 
-TICKS_PER_SECOND = 5
 DAY_TICKS = 450
 DAY_MS = 90_000
-EARNINGS_TICKS = (110, 440)
+EARNINGS_TICKS = (150, 300)
 TICK_MS = 200
 
 
@@ -119,6 +121,7 @@ class SyncActions:
 class NewsReaction:
     relevant: bool
     fair_value_updated: bool
+    note: str | None = None
     earnings_value: float | None = None
     old_fair_value: int | None = None
     new_fair_value: int | None = None
@@ -127,35 +130,172 @@ class NewsReaction:
     tick: int | None = None
 
 
+@dataclass(frozen=True)
+class LearningEvent:
+    status: Literal["trusted", "updated", "candidate", "replaced", "skipped"]
+    estimate: float | None
+    trusted_multiplier: float | None
+    confidence: int
+    method: str
+    settled_mid: float | None
+    reason: str
+    tolerance: float | None = None
+
+
+@dataclass
+class DiscoveryWindow:
+    started_ms: int
+    min_lock_ms: int
+    max_lock_ms: int
+    next_sample_ms: int
+    earnings_value: float
+    samples: list[float] = field(default_factory=list)
+    invalidated_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MultiplierUpdateResult:
+    status: Literal["trusted", "updated", "candidate", "replaced"]
+    estimate: float
+    trusted_multiplier: float
+    confidence: int
+    tolerance: float
+    reason: str
+
+
 class AValuationModel:
-    """Deterministic A valuation from earnings, fixed P/E, and exchange price scaling."""
+    """Round-specific A valuation learned as price-units per unit of earnings."""
 
     def __init__(
         self,
         a_config: AConfig,
         *,
+        initial_multiplier: float | None = None,
+        initial_confidence: int = 0,
         initial_fair_value: int | None = None,
         initial_earnings_value: float | None = None,
     ):
-        self.pe_ratio = float(a_config.pe_ratio)
-        self.price_scale = int(a_config.price_scale)
+        self.a_config = a_config
+        self.trusted_multiplier = float(initial_multiplier) if initial_multiplier is not None else None
+        self.multiplier_confidence = int(initial_confidence) if self.trusted_multiplier is not None else 0
+        self.candidate_multiplier: float | None = None
+        self.candidate_hits = 0
         self.fair_value = initial_fair_value
         self.last_earnings_value = initial_earnings_value
         self.last_source = "journal" if initial_fair_value is not None else "none"
+
+        if self.fair_value is None and self.trusted_multiplier is not None and initial_earnings_value is not None:
+            self.fair_value = self.fair_from_earnings(initial_earnings_value, multiplier=self.trusted_multiplier)
+            self.last_source = "journal_multiplier"
 
     @property
     def has_fair_value(self) -> bool:
         return self.fair_value is not None
 
-    def fair_from_earnings(self, earnings_value: float) -> int:
-        return round(float(earnings_value) * self.pe_ratio * self.price_scale)
+    @property
+    def has_multiplier(self) -> bool:
+        return self.trusted_multiplier is not None
 
-    def on_earnings_release(self, earnings_value: float) -> tuple[int | None, int]:
+    def fair_from_earnings(self, earnings_value: float, *, multiplier: float | None = None) -> int | None:
+        chosen_multiplier = self.trusted_multiplier if multiplier is None else multiplier
+        if chosen_multiplier is None:
+            return None
+        return round(float(earnings_value) * chosen_multiplier)
+
+    def on_structured_earnings(self, earnings_value: float) -> tuple[int | None, int | None]:
         old_fair = self.fair_value
         self.last_earnings_value = float(earnings_value)
         self.fair_value = self.fair_from_earnings(self.last_earnings_value)
-        self.last_source = "earnings"
+        self.last_source = "trusted_multiplier" if self.fair_value is not None else "earnings_pending"
         return old_fair, self.fair_value
+
+    def current_tolerance(self) -> float | None:
+        if self.trusted_multiplier is None:
+            return None
+        scaled_fraction = self.a_config.calibration_tolerance_fraction / max(1.0, sqrt(max(1, self.multiplier_confidence)))
+        fraction = max(self.a_config.calibration_min_tolerance_fraction, scaled_fraction)
+        return max(8.0, self.trusted_multiplier * fraction)
+
+    def absorb_estimate(self, estimate: float) -> MultiplierUpdateResult:
+        estimate = float(estimate)
+        if estimate <= 0:
+            raise ValueError("Multiplier estimates must be positive.")
+
+        if self.trusted_multiplier is None:
+            self.trusted_multiplier = estimate
+            self.multiplier_confidence = 1
+            self.candidate_multiplier = None
+            self.candidate_hits = 0
+            if self.last_earnings_value is not None:
+                self.fair_value = self.fair_from_earnings(self.last_earnings_value)
+            self.last_source = "learned_multiplier"
+            return MultiplierUpdateResult(
+                status="trusted",
+                estimate=estimate,
+                trusted_multiplier=self.trusted_multiplier,
+                confidence=self.multiplier_confidence,
+                tolerance=self.current_tolerance() or 0.0,
+                reason="Bootstrapped the round multiplier from settled post-earnings price levels.",
+            )
+
+        tolerance = self.current_tolerance() or 0.0
+        if abs(estimate - self.trusted_multiplier) <= tolerance:
+            blended = ((self.trusted_multiplier * self.multiplier_confidence) + estimate) / (self.multiplier_confidence + 1)
+            self.trusted_multiplier = blended
+            self.multiplier_confidence += 1
+            self.candidate_multiplier = None
+            self.candidate_hits = 0
+            if self.last_earnings_value is not None:
+                self.fair_value = self.fair_from_earnings(self.last_earnings_value)
+            self.last_source = "learned_multiplier"
+            return MultiplierUpdateResult(
+                status="updated",
+                estimate=estimate,
+                trusted_multiplier=self.trusted_multiplier,
+                confidence=self.multiplier_confidence,
+                tolerance=self.current_tolerance() or tolerance,
+                reason="Reconfirmed the round multiplier inside tolerance and tightened the estimate.",
+            )
+
+        if self.candidate_multiplier is None or abs(estimate - self.candidate_multiplier) > tolerance:
+            self.candidate_multiplier = estimate
+            self.candidate_hits = 1
+            return MultiplierUpdateResult(
+                status="candidate",
+                estimate=estimate,
+                trusted_multiplier=self.trusted_multiplier,
+                confidence=self.multiplier_confidence,
+                tolerance=tolerance,
+                reason="Observed a divergent multiplier candidate; waiting for another structured-earnings confirmation before replacing the trusted value.",
+            )
+
+        self.candidate_multiplier = ((self.candidate_multiplier * self.candidate_hits) + estimate) / (self.candidate_hits + 1)
+        self.candidate_hits += 1
+        if self.candidate_hits < self.a_config.candidate_confirmations:
+            return MultiplierUpdateResult(
+                status="candidate",
+                estimate=estimate,
+                trusted_multiplier=self.trusted_multiplier,
+                confidence=self.multiplier_confidence,
+                tolerance=tolerance,
+                reason="Divergent candidate repeated but still needs one more confirmation before replacing the trusted value.",
+            )
+
+        self.trusted_multiplier = self.candidate_multiplier
+        self.multiplier_confidence = 1
+        self.candidate_multiplier = None
+        self.candidate_hits = 0
+        if self.last_earnings_value is not None:
+            self.fair_value = self.fair_from_earnings(self.last_earnings_value)
+        self.last_source = "replaced_multiplier"
+        return MultiplierUpdateResult(
+            status="replaced",
+            estimate=estimate,
+            trusted_multiplier=self.trusted_multiplier,
+            confidence=self.multiplier_confidence,
+            tolerance=self.current_tolerance() or tolerance,
+            reason="Repeated divergent estimates replaced the trusted round multiplier.",
+        )
 
 
 class QuoteEngine:
@@ -180,14 +320,7 @@ class QuoteEngine:
         shock_threshold: int | None = None,
     ) -> QuotePlan:
         if not can_trade:
-            return QuotePlan(
-                mode=mode,
-                bid=None,
-                ask=None,
-                aggressive_actions=(),
-                observe_only=True,
-                reason=reason_if_blocked,
-            )
+            return QuotePlan(mode=mode, bid=None, ask=None, aggressive_actions=(), observe_only=True, reason=reason_if_blocked)
 
         if mode == "PRE_NEWS_PULLBACK":
             return QuotePlan(
@@ -202,6 +335,9 @@ class QuoteEngine:
         if mode == "OPENING_MICRO_MM":
             return self._opening_quotes(mode, inventory, book, buy_exposure, sell_exposure)
 
+        if mode in {"MULTIPLIER_DISCOVERY", "NEWS_CAUTIOUS_MM"}:
+            return self._cautious_quotes(mode, fair_value, inventory, book, buy_exposure, sell_exposure)
+
         if fair_value is None:
             return QuotePlan(
                 mode=mode,
@@ -209,10 +345,10 @@ class QuoteEngine:
                 ask=None,
                 aggressive_actions=(),
                 observe_only=True,
-                reason="Waiting for the first usable A fair value.",
+                reason="Waiting for a clean A multiplier estimate.",
             )
 
-        if mode == "POST_NEWS_SHOCK":
+        if mode == "POST_EARNINGS_SHOCK":
             return self._shock_quotes(
                 mode,
                 fair_value,
@@ -252,39 +388,97 @@ class QuoteEngine:
         bid_px = int(floor(mid - self.a_config.opening_half_spread_ticks))
         ask_px = int(ceil(mid + self.a_config.opening_half_spread_ticks))
         bid_px, ask_px = self._clamp_inside_book(bid_px, ask_px, book)
+        allowed_buy, allowed_sell = self._allowed_size(inventory, buy_exposure, sell_exposure, cap=self.a_config.opening_max_position)
 
-        allowed_buy, allowed_sell = self._allowed_size(
-            inventory,
-            buy_exposure,
-            sell_exposure,
-            cap=self.a_config.opening_max_position,
-        )
-        desired_bid = None
-        desired_ask = None
-        if allowed_buy > 0:
-            desired_bid = DesiredOrder(
+        return QuotePlan(
+            mode=mode,
+            bid=DesiredOrder(
                 side="BUY",
                 px=bid_px,
                 qty=min(self.a_config.opening_quote_size, allowed_buy),
                 aggressive=False,
                 reason="opening micro-mm bid around live mid",
             )
-        if allowed_sell > 0:
-            desired_ask = DesiredOrder(
+            if allowed_buy > 0
+            else None,
+            ask=DesiredOrder(
                 side="SELL",
                 px=ask_px,
                 qty=min(self.a_config.opening_quote_size, allowed_sell),
                 aggressive=False,
                 reason="opening micro-mm ask around live mid",
             )
-
-        return QuotePlan(
-            mode=mode,
-            bid=desired_bid,
-            ask=desired_ask,
+            if allowed_sell > 0
+            else None,
             aggressive_actions=(),
             observe_only=False,
             reason="opening micro-mm",
+        )
+
+    def _cautious_quotes(
+        self,
+        mode: ModeName,
+        fair_value: int | None,
+        inventory: int,
+        book: BookSnapshot,
+        buy_exposure: int,
+        sell_exposure: int,
+    ) -> QuotePlan:
+        anchor = book.mid
+        if anchor is None and fair_value is not None:
+            anchor = float(fair_value)
+        if anchor is None:
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=True,
+                reason="waiting for a usable A anchor during cautious quoting",
+            )
+
+        bid_px = int(floor(anchor - self.a_config.news_caution_half_spread_ticks))
+        ask_px = int(ceil(anchor + self.a_config.news_caution_half_spread_ticks))
+        if book.best_bid is not None:
+            bid_px = min(bid_px, book.best_bid.px - 1)
+        if book.best_ask is not None:
+            ask_px = max(ask_px, book.best_ask.px + 1)
+        if bid_px >= ask_px:
+            bid_px = ask_px - 1
+
+        allowed_buy, allowed_sell = self._allowed_size(
+            inventory,
+            buy_exposure,
+            sell_exposure,
+            cap=self.a_config.news_caution_max_position,
+        )
+        reason = "tiny quotes while A-specific news risk is elevated"
+        if mode == "MULTIPLIER_DISCOVERY":
+            reason = "tiny quotes while the post-earnings multiplier is still settling"
+
+        return QuotePlan(
+            mode=mode,
+            bid=DesiredOrder(
+                side="BUY",
+                px=bid_px,
+                qty=min(self.a_config.news_caution_quote_size, allowed_buy),
+                aggressive=False,
+                reason=reason,
+            )
+            if allowed_buy > 0
+            else None,
+            ask=DesiredOrder(
+                side="SELL",
+                px=ask_px,
+                qty=min(self.a_config.news_caution_quote_size, allowed_sell),
+                aggressive=False,
+                reason=reason,
+            )
+            if allowed_sell > 0
+            else None,
+            aggressive_actions=(),
+            observe_only=False,
+            reason="cautious quoting",
         )
 
     def _steady_quotes(
@@ -303,8 +497,8 @@ class QuoteEngine:
             sell_exposure,
             cap=self.a_config.steady_max_position,
         )
-        take_edge = max(2, self.a_config.steady_half_spread_ticks + 1)
 
+        take_edge = max(self.a_config.steady_take_min_edge, self.a_config.steady_half_spread_ticks)
         if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - take_edge:
             aggressive_actions.append(
                 DesiredOrder(
@@ -330,31 +524,28 @@ class QuoteEngine:
         bid_px = int(floor(reservation - self.a_config.steady_half_spread_ticks))
         ask_px = int(ceil(reservation + self.a_config.steady_half_spread_ticks))
         bid_px, ask_px = self._clamp_inside_book(bid_px, ask_px, book)
-
         aggressive_sides = {action.side for action in aggressive_actions}
-        desired_bid = None
-        desired_ask = None
-        if allowed_buy > 0 and "BUY" not in aggressive_sides:
-            desired_bid = DesiredOrder(
+
+        return QuotePlan(
+            mode=mode,
+            bid=DesiredOrder(
                 side="BUY",
                 px=bid_px,
                 qty=min(self.a_config.steady_quote_size, allowed_buy),
                 aggressive=False,
-                reason="steady-state bid around exact fair",
+                reason="steady-state bid around learned fair",
             )
-        if allowed_sell > 0 and "SELL" not in aggressive_sides:
-            desired_ask = DesiredOrder(
+            if allowed_buy > 0 and "BUY" not in aggressive_sides
+            else None,
+            ask=DesiredOrder(
                 side="SELL",
                 px=ask_px,
                 qty=min(self.a_config.steady_quote_size, allowed_sell),
                 aggressive=False,
-                reason="steady-state ask around exact fair",
+                reason="steady-state ask around learned fair",
             )
-
-        return QuotePlan(
-            mode=mode,
-            bid=desired_bid,
-            ask=desired_ask,
+            if allowed_sell > 0 and "SELL" not in aggressive_sides
+            else None,
             aggressive_actions=tuple(aggressive_actions),
             observe_only=False,
             reason="steady mm",
@@ -379,7 +570,6 @@ class QuoteEngine:
             sell_exposure,
             cap=self.a_config.shock_max_position,
         )
-
         desired_bid = None
         desired_ask = None
         half_spread = self.a_config.steady_half_spread_ticks
@@ -403,7 +593,7 @@ class QuoteEngine:
                     px=ask_px,
                     qty=min(self.a_config.shock_quote_size, allowed_sell),
                     aggressive=False,
-                    reason="post-shock ask to unwind long inventory",
+                    reason="post-earnings ask to unwind long inventory",
                 )
         elif shock_direction < 0:
             if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + shock_threshold:
@@ -424,7 +614,7 @@ class QuoteEngine:
                     px=bid_px,
                     qty=min(self.a_config.shock_quote_size, allowed_buy),
                     aggressive=False,
-                    reason="post-shock bid to unwind short inventory",
+                    reason="post-earnings bid to unwind short inventory",
                 )
         else:
             return self._steady_quotes("STEADY_MM", fair_value, inventory, book, buy_exposure, sell_exposure)
@@ -435,7 +625,7 @@ class QuoteEngine:
             ask=desired_ask,
             aggressive_actions=tuple(aggressive_actions),
             observe_only=False,
-            reason="post-news shock",
+            reason="post-earnings shock",
         )
 
     def _unwind_quotes(
@@ -660,25 +850,23 @@ class OrderManager:
             if live is not None and live.cancel_pending:
                 continue
 
-            needs_reprice = (
-                live is not None
-                and desired is not None
-                and (
-                    live.px != desired.px
-                    or live.remaining_qty != desired.qty
-                    or live.aggressive != desired.aggressive
-                )
-            )
-
             if live is not None and desired is None:
                 if now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms:
                     cancels.append(CancelCommand(order_id=live.order_id, side=side))
                 continue
 
-            if live is not None and needs_reprice:
-                if now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms:
-                    # Cancel first and let the next event loop place the replacement.
-                    # This keeps the bot from doubling exposure on a single side.
+            if live is not None and desired is not None:
+                price_gap = abs(live.px - desired.px)
+                stale = now_ms - live.submitted_ms >= self.risk.stale_quote_ms
+                needs_reprice = (
+                    live.remaining_qty != desired.qty
+                    or live.aggressive != desired.aggressive
+                    or stale
+                    or live.aggressive
+                    or desired.aggressive
+                    or price_gap >= self.risk.passive_reprice_threshold_ticks
+                )
+                if needs_reprice and now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms:
                     cancels.append(CancelCommand(order_id=live.order_id, side=side))
                 continue
 
@@ -708,24 +896,26 @@ class OrderManager:
 
 
 class MarketAStrategy:
-    """Owns the valuation model, schedule tracking, quote engine, and order manager for A."""
+    """Owns multiplier learning, schedule tracking, quote generation, and recovery for A."""
 
     def __init__(
         self,
         a_config: AConfig,
         risk: RiskConfig,
         restored_orders: Iterable[ManagedOrder] = (),
+        recovered_multiplier: float | None = None,
+        recovered_multiplier_confidence: int = 0,
         recovered_fair_value: int | None = None,
         recovered_earnings_value: float | None = None,
     ):
-        starting_fair = recovered_fair_value
-        if starting_fair is None:
-            starting_fair = a_config.initial_fair_value
-
+        starting_fair = recovered_fair_value if recovered_fair_value is not None else a_config.initial_fair_value
+        starting_multiplier = recovered_multiplier if recovered_multiplier is not None else a_config.initial_multiplier
         self.a_config = a_config
         self.risk = risk
         self.valuation = AValuationModel(
             a_config=a_config,
+            initial_multiplier=starting_multiplier,
+            initial_confidence=recovered_multiplier_confidence,
             initial_fair_value=starting_fair,
             initial_earnings_value=recovered_earnings_value,
         )
@@ -738,19 +928,19 @@ class MarketAStrategy:
         self.tick_anchor_tick: int | None = None
         self.tick_anchor_ms: int | None = None
         self.last_news_tick: int | None = None
-        self.current_round_earnings_seen = recovered_fair_value is not None
+        self.discovery_window: DiscoveryWindow | None = None
+        self.news_caution_active = False
         self.shock_started_ms: int | None = None
-        self.shock_reference_fair: int | None = None
-        self.shock_target_fair: int | None = None
         self.shock_direction = 0
         self.shock_threshold: int | None = None
+        self.shock_target_fair: int | None = None
+        self.learning_events: list[LearningEvent] = []
         self.recovery_pending: set[str] = set()
         self.recovery_active = False
 
         for order in restored_orders:
             self.order_manager.restore_order(order)
             self.recovery_pending.add(order.order_id)
-
         if self.recovery_pending:
             self.recovery_active = True
 
@@ -762,8 +952,21 @@ class MarketAStrategy:
     def last_earnings_value(self) -> float | None:
         return self.valuation.last_earnings_value
 
+    @property
+    def trusted_multiplier(self) -> float | None:
+        return self.valuation.trusted_multiplier
+
+    @property
+    def multiplier_confidence(self) -> int:
+        return self.valuation.multiplier_confidence
+
     def set_inventory(self, inventory: int) -> None:
         self.inventory = int(inventory)
+
+    def drain_learning_events(self) -> list[LearningEvent]:
+        events = list(self.learning_events)
+        self.learning_events.clear()
+        return events
 
     def on_book_update(self, symbol: str, book) -> bool:
         return self.on_book_update_at(symbol, book, self._now_ms())
@@ -772,6 +975,7 @@ class MarketAStrategy:
         if symbol != "A":
             return False
         self.book = BookSnapshot.from_order_book(book)
+        self._advance_discovery(now_ms)
         self.mode = self._determine_mode(now_ms)
         return True
 
@@ -782,35 +986,67 @@ class MarketAStrategy:
             self.tick_anchor_ms = now_ms
             self.last_news_tick = tick
 
+        if self._is_a_unstructured_news(news_release):
+            self.news_caution_active = True
+            if self.discovery_window is not None and self.discovery_window.invalidated_reason is None:
+                self.discovery_window.invalidated_reason = (
+                    "calibration contaminated because unstructured A news arrived before the new multiplier locked"
+                )
+            self.mode = self._determine_mode(now_ms)
+            return NewsReaction(
+                relevant=True,
+                fair_value_updated=False,
+                note="Detected unstructured A news; switching into cautious quoting until the next structured A earnings reset.",
+                tick=tick if isinstance(tick, int) else None,
+            )
+
         if not self._handles_a_earnings(news_release):
             self.mode = self._determine_mode(now_ms)
             return NewsReaction(relevant=False, fair_value_updated=False, tick=tick if isinstance(tick, int) else None)
 
         earnings_value = float(news_release["new_data"]["value"])
-        self.current_round_earnings_seen = True
-        old_fair, new_fair = self.valuation.on_earnings_release(earnings_value)
-        reference_fair = old_fair
-        if reference_fair is None:
-            mid = self.book.mid
-            if mid is not None:
-                reference_fair = round(mid)
-        if reference_fair is None:
-            reference_fair = new_fair
-
-        move_size = abs(new_fair - reference_fair)
-        self.shock_reference_fair = reference_fair
-        self.shock_target_fair = new_fair
-        self.shock_direction = 1 if new_fair > reference_fair else -1 if new_fair < reference_fair else 0
-        self.shock_threshold = max(
-            self.a_config.shock_take_min_edge,
-            round(self.a_config.shock_take_fraction * move_size),
+        old_fair, new_fair = self.valuation.on_structured_earnings(earnings_value)
+        self.news_caution_active = False
+        self.discovery_window = DiscoveryWindow(
+            started_ms=now_ms,
+            min_lock_ms=now_ms + self.a_config.calibration_min_delay_ms,
+            max_lock_ms=now_ms + self.a_config.calibration_max_delay_ms,
+            next_sample_ms=now_ms + self.a_config.calibration_min_delay_ms,
+            earnings_value=earnings_value,
         )
-        self.shock_started_ms = now_ms
-        self.mode = self._determine_mode(now_ms)
 
+        if new_fair is not None:
+            reference_fair = old_fair
+            if reference_fair is None and self.book.mid is not None:
+                reference_fair = round(self.book.mid)
+            if reference_fair is None:
+                reference_fair = new_fair
+            move_size = abs(new_fair - reference_fair)
+            self.shock_started_ms = now_ms
+            self.shock_direction = 1 if new_fair > reference_fair else -1 if new_fair < reference_fair else 0
+            self.shock_threshold = max(self.a_config.shock_take_min_edge, round(self.a_config.shock_take_fraction * move_size))
+            self.shock_target_fair = new_fair
+            note = (
+                f"A earnings tick={tick} moved provisional fair from {old_fair} to {new_fair} "
+                f"on earnings={earnings_value}; shock_direction={self.shock_direction} threshold={self.shock_threshold}"
+            )
+            fair_updated = True
+        else:
+            self.shock_started_ms = None
+            self.shock_direction = 0
+            self.shock_threshold = None
+            self.shock_target_fair = None
+            note = (
+                f"Structured A earnings arrived with earnings={earnings_value}; "
+                f"starting multiplier discovery after {self.a_config.calibration_min_delay_ms}ms."
+            )
+            fair_updated = False
+
+        self.mode = self._determine_mode(now_ms)
         return NewsReaction(
             relevant=True,
-            fair_value_updated=True,
+            fair_value_updated=fair_updated,
+            note=note,
             earnings_value=earnings_value,
             old_fair_value=old_fair,
             new_fair_value=new_fair,
@@ -823,8 +1059,7 @@ class MarketAStrategy:
         order = self.order_manager.handle_fill(order_id, qty)
         if order is None:
             return None
-        signed_qty = qty if order.side == "BUY" else -qty
-        self.inventory += signed_qty
+        self.inventory += qty if order.side == "BUY" else -qty
         if order_id in self.recovery_pending and order.remaining_qty == 0:
             self.recovery_pending.discard(order_id)
             self._maybe_finish_recovery()
@@ -836,8 +1071,6 @@ class MarketAStrategy:
             return None
         if order_id in self.recovery_pending:
             if not success:
-                # After a restart there is no open-order snapshot, so we treat a failed
-                # recovery cancel as unresolved local state and stop managing it.
                 self.order_manager.forget_order(order_id)
             self.recovery_pending.discard(order_id)
             self._maybe_finish_recovery()
@@ -863,15 +1096,11 @@ class MarketAStrategy:
             if order.order_id in self.recovery_pending and not order.cancel_pending
         ]
 
-    def _maybe_finish_recovery(self) -> None:
-        if self.recovery_active and not self.recovery_pending:
-            self.on_recovery_complete()
-
     def compute_quotes(self, now_ms: int | None = None) -> QuotePlan:
         if now_ms is None:
             now_ms = self._now_ms()
+        self._advance_discovery(now_ms)
         self.mode = self._determine_mode(now_ms)
-        reason_if_blocked = "Waiting for recovered A orders to be cancelled."
         return self.quote_engine.compute_quotes(
             mode=self.mode,
             fair_value=self.valuation.fair_value,
@@ -880,7 +1109,7 @@ class MarketAStrategy:
             buy_exposure=self.order_manager.buy_exposure(),
             sell_exposure=self.order_manager.sell_exposure(),
             can_trade=not self.recovery_active,
-            reason_if_blocked=reason_if_blocked,
+            reason_if_blocked="Waiting for recovered A orders to be cancelled.",
             shock_direction=self.shock_direction,
             shock_threshold=self.shock_threshold,
         )
@@ -894,26 +1123,123 @@ class MarketAStrategy:
                 return None
             next_tick = self._next_earnings_day_tick(estimated_day_tick)
             delta_ticks = (next_tick - estimated_day_tick) % DAY_TICKS
-            if delta_ticks == 0:
-                return 0
-            return round(delta_ticks * TICK_MS)
+            return 0 if delta_ticks == 0 else round(delta_ticks * TICK_MS)
 
         if not self.a_config.startup_assume_fresh_round:
             return None
 
         day_elapsed_ms = max(0, (now_ms - self.startup_ms) % DAY_MS)
-        for earnings_ms in (22_000, 88_000):
+        for earnings_ms in (30_000, 60_000):
             if day_elapsed_ms <= earnings_ms:
                 return earnings_ms - day_elapsed_ms
-        return DAY_MS - day_elapsed_ms + 22_000
+        return DAY_MS - day_elapsed_ms + 30_000
+
+    def _advance_discovery(self, now_ms: int) -> None:
+        window = self.discovery_window
+        if window is None:
+            return
+
+        if window.invalidated_reason is not None:
+            self.learning_events.append(
+                LearningEvent(
+                    status="skipped",
+                    estimate=None,
+                    trusted_multiplier=self.valuation.trusted_multiplier,
+                    confidence=self.valuation.multiplier_confidence,
+                    method="skipped",
+                    settled_mid=None,
+                    reason=window.invalidated_reason,
+                )
+            )
+            self.discovery_window = None
+            return
+
+        while window.next_sample_ms <= min(now_ms, window.max_lock_ms):
+            if self.book.mid is not None:
+                window.samples.append(float(self.book.mid))
+            window.next_sample_ms += self.a_config.calibration_sample_period_ms
+
+            if len(window.samples) >= 4:
+                recent = window.samples[-4:]
+                if max(recent) - min(recent) <= self.a_config.calibration_stability_band_ticks:
+                    self._finalize_discovery(
+                        settled_mid=float(median(recent)),
+                        method="stable_level",
+                        reason="Locked the round multiplier once the last four one-second samples fell inside the stability band.",
+                    )
+                    return
+
+        if now_ms < window.max_lock_ms:
+            return
+
+        if not window.samples:
+            self.learning_events.append(
+                LearningEvent(
+                    status="skipped",
+                    estimate=None,
+                    trusted_multiplier=self.valuation.trusted_multiplier,
+                    confidence=self.valuation.multiplier_confidence,
+                    method="skipped",
+                    settled_mid=None,
+                    reason="Timed out the multiplier discovery window without any usable A mid-price samples.",
+                )
+            )
+            self.discovery_window = None
+            return
+
+        self._finalize_discovery(
+            settled_mid=float(median(window.samples)),
+            method="fallback_level",
+            reason="Reached the end of the discovery window and accepted the median post-earnings level as the multiplier estimate.",
+        )
+
+    def _finalize_discovery(self, *, settled_mid: float, method: str, reason: str) -> None:
+        window = self.discovery_window
+        if window is None:
+            return
+        estimate = settled_mid / window.earnings_value if window.earnings_value > 0 else None
+        self.discovery_window = None
+        if estimate is None or estimate <= 0:
+            self.learning_events.append(
+                LearningEvent(
+                    status="skipped",
+                    estimate=None,
+                    trusted_multiplier=self.valuation.trusted_multiplier,
+                    confidence=self.valuation.multiplier_confidence,
+                    method="skipped",
+                    settled_mid=settled_mid,
+                    reason="Could not extract a positive multiplier estimate from the settled post-earnings level.",
+                )
+            )
+            return
+
+        update = self.valuation.absorb_estimate(estimate)
+        self.learning_events.append(
+            LearningEvent(
+                status=update.status,
+                estimate=estimate,
+                trusted_multiplier=update.trusted_multiplier,
+                confidence=update.confidence,
+                method=method,
+                settled_mid=settled_mid,
+                reason=reason if update.status != "candidate" else update.reason,
+                tolerance=update.tolerance,
+            )
+        )
 
     def _determine_mode(self, now_ms: int) -> ModeName:
         if self._shock_active(now_ms):
-            return "POST_NEWS_SHOCK"
+            return "POST_EARNINGS_SHOCK"
 
         until_next_earnings = self.ms_until_next_scheduled_earnings(now_ms)
         if until_next_earnings is not None and until_next_earnings <= self.a_config.pre_news_pullback_ms:
             return "PRE_NEWS_PULLBACK"
+
+        if self.news_caution_active:
+            return "NEWS_CAUTIOUS_MM"
+
+        if self.discovery_window is not None:
+            return "MULTIPLIER_DISCOVERY"
 
         if self.valuation.fair_value is None:
             return "OPENING_MICRO_MM"
@@ -926,9 +1252,7 @@ class MarketAStrategy:
     def _shock_active(self, now_ms: int) -> bool:
         if self.shock_started_ms is None or self.shock_target_fair is None:
             return False
-        if now_ms - self.shock_started_ms < self.a_config.shock_window_ms:
-            return True
-        return False
+        return now_ms - self.shock_started_ms < self.a_config.shock_window_ms
 
     def _should_unwind(self) -> bool:
         if self.shock_started_ms is None:
@@ -936,6 +1260,10 @@ class MarketAStrategy:
         if self.inventory == 0:
             return False
         return abs(self.inventory) > self.a_config.unwind_flatten_threshold
+
+    def _maybe_finish_recovery(self) -> None:
+        if self.recovery_active and not self.recovery_pending:
+            self.on_recovery_complete()
 
     @staticmethod
     def _handles_a_earnings(news_release: dict) -> bool:
@@ -946,6 +1274,16 @@ class MarketAStrategy:
             return False
         asset = str(new_data.get("asset") or news_release.get("symbol") or "").upper()
         return asset == "A"
+
+    @staticmethod
+    def _is_a_unstructured_news(news_release: dict) -> bool:
+        if news_release.get("kind") == "structured":
+            return False
+        symbol = str(news_release.get("symbol") or "").upper()
+        if symbol == "A":
+            return True
+        raw_content = str(news_release.get("raw_content") or news_release.get("content") or "").upper()
+        return " A " in f" {raw_content} "
 
     @staticmethod
     def _next_earnings_day_tick(current_day_tick: float) -> int:
