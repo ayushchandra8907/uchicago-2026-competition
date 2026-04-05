@@ -1,0 +1,2 @@
+session_count,avg_pnl,median_pnl,stdev_pnl,min_pnl,max_pnl,avg_max_drawdown,passive_fill_count,aggressive_fill_count,avg_abs_final_inventory,total_pnl_mode_earnings_shock,total_pnl_mode_inventory_unwind,total_pnl_mode_normal_mm,total_pnl_mode_overshoot_fade
+15,97014.13333333333,85000.0,80211.53347315807,-8623.0,238415.0,18684.966666666667,5589,6755,116.26666666666667,-34071.0,436416.5,720665.0,105086.0

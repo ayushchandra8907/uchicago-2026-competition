@@ -1,0 +1,42 @@
+{
+  "paths": {
+    "data_root": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/data_scraping/data",
+    "output_root": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/case1/ayush_work/marketA_v1/outputs",
+    "project_root": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/case1/ayush_work/marketA_v1",
+    "repo_root": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition"
+  },
+  "replay": {
+    "mark_to_market": "mid",
+    "passive_queue_book_move": true
+  },
+  "risk": {
+    "normal_soft_position_limit": 80,
+    "open_volume_limit": 80,
+    "order_size_limit": 40,
+    "position_limit": 200,
+    "shock_soft_position_limit": 140
+  },
+  "strategy": {
+    "aggressive_edge_px": 7,
+    "base_half_spread_px": 3,
+    "fill_widening": 2.0,
+    "initial_pe_ratio": 11.219195492852428,
+    "inventory_penalty": 0.45,
+    "market_spread_weight": 0.35,
+    "microprice_alpha": 0.65,
+    "min_half_spread_px": 2,
+    "normal_order_size": 12,
+    "overshoot_fade_edge_px": 5,
+    "overshoot_trigger_px": 10,
+    "overshoot_window_ms": 7000,
+    "price_scale": 100,
+    "requote_cooldown_ms": 250,
+    "shock_aggressive_edge_px": 4,
+    "shock_order_size": 20,
+    "shock_window_ms": 2500,
+    "toxicity_widening": 4.0,
+    "trade_pressure_alpha": 3.0,
+    "unwind_order_size": 16,
+    "vol_widening": 18.0
+  }
+}

@@ -1,15 +1,19 @@
 # Market Research Logger
 
-This folder contains a passive research logger for the UChicago Trading Competition exchange. It listens through `XChangeClient`, never trades, logs market data for `A`, `B`, `C`, and `ETF`, and automatically creates plots when the run ends.
+This folder now uses a two-stage pipeline:
+
+1. `market_research_logger.py` is a lightweight live collector that only writes compact raw exchange data.
+2. `analyze_logs.py` runs afterward and reconstructs book state, computes mid/spread offline, and creates plots.
+
+The live logger does not compute features, does not create heartbeats, and does not auto-run analysis when the round ends.
 
 ## Files
 
-- `market_research_logger.py`: live passive logger for the full data pipeline
+- `market_research_logger.py`: live passive raw-data collector
+- `analyze_logs.py`: offline reconstruction, summary generation, and plotting
 - `config.py`: reads settings from `local_config.json`
 - `local_config.json`: one-time local credentials and logger settings
-- `feature_extractor.py`: order-book and short-horizon feature helpers
-- `csv_writer.py`: append-safe CSV writer
-- `analyze_logs.py`: multi-symbol offline analysis and plot generation
+- `csv_writer.py`: buffered append-safe CSV writer
 
 ## Normal Workflow
 
@@ -21,173 +25,162 @@ On macOS in VSCode:
 4. Select `Market Research Logger`.
 5. Click Run at the start of the round.
 6. Stop it when the round is over.
-
-That is the full workflow. You do not need environment variables or command-line flags.
-
-If you want terminal fallback once in a while, it is still just:
+7. After the run, generate plots manually:
 
 ```bash
-python3 data_scraping/market_research_logger.py
+python3 data_scraping/analyze_logs.py --plot data_scraping/data/market_research_YYYY-MM-DD_HH-MM-SS_live_round
 ```
+
+That is the intended workflow. The live logger only collects data. The analyzer does all reconstruction and plotting afterward.
 
 ## What Happens On Each Run
 
-The logger writes one run folder under:
+The live logger writes one run folder under:
 
 ```text
 data_scraping/data/market_research_YYYY-MM-DD_HH-MM-SS/
 ```
 
-When you stop the logger, it automatically runs:
+That folder contains compact raw CSVs plus `session_metadata.json`.
 
-```text
-python3 data_scraping/analyze_logs.py --run-dir <that_run_dir> --plot
-```
+No mid, spread, microprice, imbalance, volatility, or other derived fields are written during the live run.
 
-So every run ends with:
+## Raw Output Files
 
-- raw CSV logs
-- a summary CSV
-- a `graphs/` folder with plots
+### `raw_book_snapshots_<SYMBOL>.csv`
 
-## Symbols And Earnings Markers
+One row per full book snapshot for that symbol.
 
-The logger records market data for:
+Examples:
 
-- `A`
-- `B`
-- `C`
-- `ETF`
+- `raw_book_snapshots_A.csv`
+- `raw_book_snapshots_B.csv`
+- `raw_book_snapshots_C.csv`
+- `raw_book_snapshots_ETF.csv`
 
-The plots use earnings markers like this:
+Columns:
 
-- `A` graph: only `A` earnings
-- `C` graph: only `C` earnings
-- `ETF` graph: both `A` and `C` earnings
-- `B` graph: no earnings markers by default
-
-Those defaults come from `local_config.json`.
-
-## Output Files
-
-### `raw_book_events.csv`
-
-One row per monitored-symbol book update, plus heartbeat snapshots.
-
-This combined file contains all monitored symbols together. You also get separate per-symbol book files:
-
-- `raw_book_events_A.csv`
-- `raw_book_events_B.csv`
-- `raw_book_events_C.csv`
-- `raw_book_events_ETF.csv`
-
-Important columns:
-
+- `message_index`
 - `symbol`
-- `event_type`
-- `wall_time_iso`, `wall_time_ns`, `monotonic_ns`, `exchange_tick`
-- `best_bid_px`, `best_bid_qty`, `best_ask_px`, `best_ask_qty`
-- `mid_px`, `spread`, `microprice`, `top_of_book_imbalance`
-- `bid_levels_json`, `ask_levels_json`
-- `current_position_symbol`, `current_cash`
-- `last_trade_px_for_symbol`, `last_trade_qty_for_symbol`
-- `most_recent_news_id_affecting_symbol`
-- `seconds_since_last_news_for_symbol`
+- `bids_json`
+- `asks_json`
 
-### `raw_trade_events.csv`
+These are compact serializations of the exact snapshot levels received from the exchange.
 
-One row per trade print for any monitored symbol.
+### `raw_book_updates_<SYMBOL>.csv`
 
-This combined file contains all monitored symbols together. You also get separate per-symbol trade files:
+One row per incremental book update for that symbol.
+
+Examples:
+
+- `raw_book_updates_A.csv`
+- `raw_book_updates_B.csv`
+- `raw_book_updates_C.csv`
+- `raw_book_updates_ETF.csv`
+
+Columns:
+
+- `message_index`
+- `symbol`
+- `side`
+- `px`
+- `dq`
+
+This is the raw exchange delta stream. No reconstructed top-of-book fields are added here.
+
+### `raw_trade_events_<SYMBOL>.csv`
+
+One row per trade message for that symbol.
+
+Examples:
 
 - `raw_trade_events_A.csv`
 - `raw_trade_events_B.csv`
 - `raw_trade_events_C.csv`
 - `raw_trade_events_ETF.csv`
 
-Important columns:
+Columns:
 
-- `symbol`, `trade_px`, `trade_qty`
-- `mid_at_trade`, `spread_at_trade`
-- `time_since_last_symbol_news`
-- `latest_known_eps_for_symbol`
+- `message_index`
+- `symbol`
+- `price`
+- `qty`
 
 ### `raw_news_events.csv`
 
-Logged whenever news affects at least one monitored symbol.
+One row per inbound news callback from the exchange. This file is no longer filtered.
 
-Important columns:
+Columns:
 
-- `kind`
-- `structured_subtype`
-- `earnings_asset`
-- `earnings_value`
-- `affected_symbols_json`
-- `previous_known_eps_for_asset`
-- `new_known_eps_for_asset`
-- `inferred_fair_price_before`
-- `inferred_fair_price_after`
-- `raw_content`, `normalized_content`
-
-### `raw_all_news_callbacks.csv`
-
-Debug file that logs every inbound news callback before symbol filtering.
-
-Use this file when a headline appears in the exchange UI but not in `raw_news_events.csv`.
-
-Important columns:
-
+- `message_index`
+- `tick`
+- `tick_ms`
 - `kind`
 - `symbol`
 - `message_type`
 - `structured_subtype`
-- `raw_content`, `normalized_content`
-- `affected_symbols_json`
-- `kept_in_raw_news_events`
-- `kept_news_id`
-- `drop_reason`
+- `earnings_asset`
+- `earnings_value`
+- `petition_asset`
+- `petition_new_signatures`
+- `petition_cumulative`
+- `cpi_forecast`
+- `cpi_actual`
+- `raw_content`
+- `normalized_content`
 
-If a headline is present here but missing from `raw_news_events.csv`, then the logger received it and filtered it out. If it is missing from both files, the callback never reached this logger run.
+Important behavior:
 
-### `derived_feature_rows.csv`
+- structured earnings arrive as numeric values
+- unstructured stock news arrives as literal text in `raw_content`
+- `tick_ms` is just `tick * 200`
 
-A research-friendly aligned feature table for all monitored symbols. Each row is tied to one symbol and is built from either a book event or a news event.
+## Why `message_index` Exists
 
-Important columns:
+The exchange envelope includes a global message index. We log that directly because:
 
-- `symbol`
-- best bid/ask, mid, spread, microprice, imbalance
-- trailing trade counts and volumes
-- trailing realized volatility
-- past returns and future returns
-- `latest_known_eps_for_symbol`
-- `naive_fair_price_for_symbol`
-- `seconds_since_last_news_for_symbol`
-- pre/post news context columns for news-triggered rows
+- book updates do not carry exchange tick
+- trades do not carry exchange tick
+- news does carry exchange tick
 
-By default, `naive_fair_price_for_symbol` is only populated for `A`. `C` is intentionally left without a constant-PE fair-value model because its valuation is not constant in this case.
+Offline, `analyze_logs.py` uses news ticks plus message indices to infer an approximate exchange-time axis for book updates and trades. That keeps the live logger raw while still allowing price-vs-signal plots later.
+
+## Offline Outputs
+
+When you run:
+
+```bash
+python3 data_scraping/analyze_logs.py --plot data_scraping/data/market_research_YYYY-MM-DD_HH-MM-SS_live_round
+```
+
+the analyzer reconstructs each symbol’s book from snapshots plus updates, then writes:
 
 ### `earnings_event_summary.csv`
 
-Created automatically when the run ends. This is a combined summary across the plotted symbols.
+A compact summary of earnings reactions for the plotted symbols.
 
 Important columns:
 
 - `plot_symbol`
 - `earnings_asset`
+- `news_message_index`
+- `exchange_tick`
+- `exchange_time_ms`
 - `old_eps`
 - `new_eps`
 - `model_fair_value_jump`
-- pre-news mid/spread
-- post-news mid/spread at `100ms`, `250ms`, `500ms`, `1s`, `2s`, `5s`
+- `market_mid_before_news`
+- `spread_before_news`
+- `market_mid_after_100ms`
+- `market_mid_after_250ms`
+- `market_mid_after_500ms`
+- `market_mid_after_1s`
+- `market_mid_after_2s`
+- `market_mid_after_5s`
 - `max_excursion_from_pre_news_mid`
 - `final_settling_move_5s`
 
-For `C` and any other symbol without a configured constant PE model, `model_fair_value_jump` will be blank.
-
 ### `graphs/`
-
-Created automatically when the run ends.
 
 Expected files:
 
@@ -198,47 +191,40 @@ Expected files:
 
 Each plot shows:
 
-- the symbol mid-price over time
+- reconstructed mid-price over time
 - red dashed earnings markers where applicable
-- a separate lower news lane with green dashed non-earnings news markers when that same symbol is actually mentioned or tagged by the logged news, labeled with the logged headline/content text
-- EPS change labels such as `A EPS 0.95 -> 1.03` or `C EPS START -> 0.88`
+- a lower news lane with green dashed non-earnings markers
+- green labels using the literal logged headline/content text
 
-### `session_metadata.json`
+Current earnings/news plotting rules:
 
-Run metadata including the config used, positions, latest known EPS values, and notes about the exchange API.
+- `A` graph: only `A` earnings
+- `C` graph: only `C` earnings, plus non-earnings news that is not directly about `A`
+- `ETF` graph: both `A` and `C` earnings
+- `B` graph: no earnings markers by default
+
+For unstructured news markers, a graph only gets green lines when that same symbol is tagged or explicitly mentioned in the news text.
 
 ## Config Notes
 
-The most important settings in `local_config.json` are:
+The settings that still matter in `local_config.json` are:
 
+- `host`
+- `username`
+- `password`
 - `monitored_symbols`
 - `plot_symbols`
 - `direct_earnings_symbols`
 - `etf_news_assets`
 - `pe_constants`
-- `heartbeat_interval_seconds`
 - `log_root`
+- `run_label`
 
-The default setup already matches the workflow you asked for, so in practice you usually only need to touch:
-
-- `host`
-- `username`
-- `password`
-
-`pe_constants` is optional. The default config only includes `A`. That means the pipeline will not pretend that `C` has a constant PE ratio.
-
-## Manual Re-Analysis
-
-If you ever want to regenerate summaries or plots for an old run, you can point the analyzer directly at the saved run folder:
-
-```bash
-python3 data_scraping/analyze_logs.py --plot data_scraping/data/market_research_YYYY-MM-DD_HH-MM-SS_live_round
-```
-
-You can also pass any file inside a run folder and the analyzer will use that file's parent folder.
+`pe_constants` is only used offline for the optional `model_fair_value_jump` calculation in the summary. It does not affect raw collection.
 
 ## Notes
 
 - The logger never places trades.
-- Round/day are left blank because the current user API does not expose them directly.
-- CSVs flush on every write to reduce data loss if the process stops unexpectedly.
+- The live collector is intentionally small: no derived features, no heartbeat snapshots, no automatic plotting.
+- Buffered CSV writes are used for the high-frequency streams to reduce I/O overhead during the round.
+- Because book/trade messages do not include exchange tick, the analyzer’s time axis is approximate and inferred from nearby news ticks.
