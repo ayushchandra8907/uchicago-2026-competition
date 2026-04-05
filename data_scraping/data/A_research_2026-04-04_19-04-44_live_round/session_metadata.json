@@ -1,0 +1,46 @@
+{
+  "config": {
+    "config_path": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/data_scraping/local_config.json",
+    "heartbeat_interval_seconds": 1.0,
+    "history_maxlen": 20000,
+    "host": "practice.uchicago.exchange:3333",
+    "log_root": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/data_scraping/data",
+    "password": "mesa-lynx-octopus",
+    "pe_constant_a": 10.0,
+    "post_news_window_seconds": 5.0,
+    "run_label": "live_round",
+    "symbol": "A",
+    "top_k_depth": 3,
+    "top_n_levels": 5,
+    "username": "uiuc"
+  },
+  "latest_exchange_tick": 3075,
+  "latest_known_eps_a": 0.7888442008499641,
+  "notes": {
+    "no_trading": "This listener never calls place_order, cancel_order, or place_swap_order.",
+    "round_day_inference": "The current utcxchangelib client does not expose round/day directly. Raw tick and timestamps are preserved for offline inference."
+  },
+  "open_orders_count": 0,
+  "positions": {
+    "A": 0,
+    "B": 0,
+    "B_C_1000": 0,
+    "B_C_1050": 0,
+    "B_C_950": 0,
+    "B_P_1000": 0,
+    "B_P_1050": 0,
+    "B_P_950": 0,
+    "C": 0,
+    "ETF": 0,
+    "R_CUT": 0,
+    "R_HIKE": 0,
+    "R_HOLD": 0,
+    "cash": 0
+  },
+  "run_id": "0bbebde3d5824359a06f0ab697948d52",
+  "session_id": "A_research_2026-04-04_19-04-44_live_round",
+  "status": "stopped",
+  "target_symbol": "A",
+  "written_at_iso": "2026-04-05T00:25:54.036336+00:00",
+  "written_at_ns": 1775348754036336000
+}

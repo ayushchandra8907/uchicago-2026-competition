@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Market Research Logger",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/data_scraping/market_research_logger.py",
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole"
+    }
+  ]
+}

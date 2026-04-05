@@ -1,0 +1,19 @@
+{
+  "host": "practice.uchicago.exchange:3333",
+  "username": "uiuc",
+  "password": "mesa-lynx-octopus",
+  "monitored_symbols": ["A", "B", "C", "ETF"],
+  "plot_symbols": ["A", "B", "C", "ETF"],
+  "direct_earnings_symbols": ["A", "C"],
+  "etf_news_assets": ["A", "C"],
+  "pe_constants": {
+    "A": 10.0
+  },
+  "heartbeat_interval_seconds": 1.0,
+  "top_k_depth": 3,
+  "top_n_levels": 5,
+  "post_news_window_seconds": 5.0,
+  "history_maxlen": 20000,
+  "log_root": "data",
+  "run_label": "live_round"
+}
