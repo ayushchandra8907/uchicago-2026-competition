@@ -10,6 +10,8 @@ from a_bot_strategy import ManagedOrder
 
 @dataclass(frozen=True)
 class JournalReplayState:
+    multiplier: float | None
+    multiplier_confidence: int
     fair_value: int | None
     earnings_value: float | None
     inventory: int
@@ -71,10 +73,29 @@ class TradingJournal:
             earnings_value=earnings_value,
         )
 
+    def record_multiplier(
+        self,
+        multiplier: float,
+        confidence: int,
+        source: str,
+        estimate: float | None = None,
+        method: str | None = None,
+    ) -> None:
+        self.append(
+            "multiplier_updated",
+            multiplier=float(multiplier),
+            confidence=int(confidence),
+            source=source,
+            estimate=estimate,
+            method=method,
+        )
+
     def record_inventory(self, inventory: int, cash: int | None = None) -> None:
         self.append("inventory_updated", inventory=int(inventory), cash=cash)
 
     def load_replay_state(self) -> JournalReplayState:
+        multiplier: float | None = None
+        multiplier_confidence = 0
         fair_value: int | None = None
         earnings_value: float | None = None
         inventory = 0
@@ -119,6 +140,9 @@ class TradingJournal:
                         live_orders.pop(order_id, None)
                 elif event_type == "order_rejected" and order_id in live_orders:
                     live_orders.pop(order_id, None)
+                elif event_type == "multiplier_updated":
+                    multiplier = float(record["multiplier"])
+                    multiplier_confidence = int(record.get("confidence", 0))
                 elif event_type == "fair_value_updated":
                     fair_value = int(record["fair_value"])
                     raw_earnings = record.get("earnings_value")
@@ -145,6 +169,8 @@ class TradingJournal:
             )
 
         return JournalReplayState(
+            multiplier=multiplier,
+            multiplier_confidence=multiplier_confidence,
             fair_value=fair_value,
             earnings_value=earnings_value,
             inventory=inventory,
