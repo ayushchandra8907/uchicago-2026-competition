@@ -22,14 +22,13 @@ class AConfig:
     initial_fair_value: int | None = None
     startup_assume_fresh_round: bool = True
     pre_news_pullback_ms: int = 4_000
-    calibration_delay_ms: int = 2_000
-    calibration_window_ms: int = 2_000
-    calibration_min_samples: int = 4
-    calibration_min_eps_jump: float = 0.03
+    calibration_min_delay_ms: int = 5_000
+    calibration_max_delay_ms: int = 20_000
+    calibration_sample_period_ms: int = 1_000
+    calibration_stability_band_ticks: int = 8
     calibration_tolerance_fraction: float = 0.10
     calibration_min_tolerance_fraction: float = 0.03
     candidate_confirmations: int = 2
-    news_caution_ms: int = 8_000
     news_caution_quote_size: int = 1
     news_caution_max_position: int = 8
     news_caution_half_spread_ticks: int = 5
@@ -55,11 +54,12 @@ class AConfig:
 class RiskConfig:
     reprice_cooldown_ms: int = 250
     passive_reprice_threshold_ticks: int = 2
+    passive_quote_ttl_ms: int = 3_000
 
     @property
     def stale_quote_ms(self) -> int:
         """Refresh stale quotes periodically without thrashing the exchange."""
-        return max(self.reprice_cooldown_ms * 4, 1_000)
+        return max(self.passive_quote_ttl_ms, self.reprice_cooldown_ms)
 
 
 @dataclass(frozen=True)
@@ -155,14 +155,13 @@ def load_bot_config(
             initial_fair_value=_optional_int("A_INITIAL_FAIR_VALUE", default_initial_fair_value),
             startup_assume_fresh_round=_optional_bool("A_STARTUP_ASSUME_FRESH_ROUND", True),
             pre_news_pullback_ms=_optional_int("A_PRE_NEWS_PULLBACK_MS", 4_000) or 4_000,
-            calibration_delay_ms=_optional_int("A_CALIBRATION_DELAY_MS", 2_000) or 2_000,
-            calibration_window_ms=_optional_int("A_CALIBRATION_WINDOW_MS", 2_000) or 2_000,
-            calibration_min_samples=_optional_int("A_CALIBRATION_MIN_SAMPLES", 4) or 4,
-            calibration_min_eps_jump=_optional_float("A_CALIBRATION_MIN_EPS_JUMP", 0.03) or 0.03,
+            calibration_min_delay_ms=_optional_int("A_CALIBRATION_MIN_DELAY_MS", 5_000) or 5_000,
+            calibration_max_delay_ms=_optional_int("A_CALIBRATION_MAX_DELAY_MS", 20_000) or 20_000,
+            calibration_sample_period_ms=_optional_int("A_CALIBRATION_SAMPLE_PERIOD_MS", 1_000) or 1_000,
+            calibration_stability_band_ticks=_optional_int("A_CALIBRATION_STABILITY_BAND_TICKS", 8) or 8,
             calibration_tolerance_fraction=_optional_float("A_CALIBRATION_TOLERANCE_FRACTION", 0.10) or 0.10,
             calibration_min_tolerance_fraction=_optional_float("A_CALIBRATION_MIN_TOLERANCE_FRACTION", 0.03) or 0.03,
             candidate_confirmations=_optional_int("A_CANDIDATE_CONFIRMATIONS", 2) or 2,
-            news_caution_ms=_optional_int("A_NEWS_CAUTION_MS", 8_000) or 8_000,
             news_caution_quote_size=_optional_int("A_NEWS_CAUTION_QUOTE_SIZE", 1) or 1,
             news_caution_max_position=_optional_int("A_NEWS_CAUTION_MAX_POSITION", 8) or 8,
             news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 5) or 5,
@@ -186,6 +185,7 @@ def load_bot_config(
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
             passive_reprice_threshold_ticks=_optional_int("A_PASSIVE_REPRICE_THRESHOLD_TICKS", 2) or 2,
+            passive_quote_ttl_ms=_optional_int("A_PASSIVE_QUOTE_TTL_MS", 3_000) or 3_000,
         ),
         paths=BotPaths(
             base_dir=base_path,
