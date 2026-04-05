@@ -1,3 +1,5 @@
 /case1/Case 1 Saavan/runtime/
 /case1/Case 1 Saavan/__pycache__/
 /case1/Case 1 Saavan/tests/__pycache__/
+__pycache__/
+*.pyc
