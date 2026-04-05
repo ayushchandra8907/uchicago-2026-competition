@@ -11,10 +11,9 @@ from a_bot_strategy import ManagedOrder
 @dataclass(frozen=True)
 class JournalReplayState:
     fair_value: int | None
+    earnings_value: float | None
     inventory: int
     live_orders: tuple[ManagedOrder, ...]
-    learned_pe_ratio: float | None
-    learned_pe_confidence: int
 
 
 class TradingJournal:
@@ -72,33 +71,13 @@ class TradingJournal:
             earnings_value=earnings_value,
         )
 
-    def record_learned_pe(
-        self,
-        effective_pe: float,
-        confidence: int,
-        implied_pe: float,
-        reference_price: float,
-        earnings_value: float,
-        sample_count: int,
-    ) -> None:
-        self.append(
-            "learned_pe_updated",
-            effective_pe=float(effective_pe),
-            confidence=int(confidence),
-            implied_pe=float(implied_pe),
-            reference_price=float(reference_price),
-            earnings_value=float(earnings_value),
-            sample_count=int(sample_count),
-        )
-
     def record_inventory(self, inventory: int, cash: int | None = None) -> None:
         self.append("inventory_updated", inventory=int(inventory), cash=cash)
 
     def load_replay_state(self) -> JournalReplayState:
         fair_value: int | None = None
+        earnings_value: float | None = None
         inventory = 0
-        learned_pe_ratio: float | None = None
-        learned_pe_confidence = 0
         live_orders: dict[str, ManagedOrder] = {}
 
         with self.path.open("r", encoding="utf-8") as handle:
@@ -142,9 +121,8 @@ class TradingJournal:
                     live_orders.pop(order_id, None)
                 elif event_type == "fair_value_updated":
                     fair_value = int(record["fair_value"])
-                elif event_type == "learned_pe_updated":
-                    learned_pe_ratio = float(record["effective_pe"])
-                    learned_pe_confidence = int(record.get("confidence", 0))
+                    raw_earnings = record.get("earnings_value")
+                    earnings_value = None if raw_earnings is None else float(raw_earnings)
                 elif event_type == "inventory_updated":
                     inventory = int(record["inventory"])
 
@@ -168,8 +146,7 @@ class TradingJournal:
 
         return JournalReplayState(
             fair_value=fair_value,
+            earnings_value=earnings_value,
             inventory=inventory,
             live_orders=tuple(restored),
-            learned_pe_ratio=learned_pe_ratio,
-            learned_pe_confidence=learned_pe_confidence,
         )

@@ -18,29 +18,36 @@ class ExchangeConfig:
 
 @dataclass(frozen=True)
 class AConfig:
-    pe_ratio: float | None
+    pe_ratio: float = 10.0
+    price_scale: int = 100
     initial_fair_value: int | None = None
-    pe_learning_delay_ms: int = 1_500
-    pe_learning_sample_window_ms: int = 750
-    pe_learning_min_samples: int = 3
-    pe_learning_min_confidence: int = 2
-    pe_learning_consistency_tolerance: float = 0.15
-    pe_replacement_confirmations: int = 2
+    startup_assume_fresh_round: bool = True
+    pre_news_pullback_ms: int = 4_000
+    steady_half_spread_ticks: int = 1
+    opening_quote_size: int = 1
+    opening_max_position: int = 8
+    opening_half_spread_ticks: int = 4
+    opening_min_book_spread: int = 10
+    steady_quote_size: int = 2
+    steady_max_position: int = 24
+    steady_inventory_skew: float = 0.75
+    unwind_inventory_skew: float = 1.50
+    unwind_flatten_threshold: int = 2
+    shock_quote_size: int = 12
+    shock_max_position: int = 80
+    shock_window_ms: int = 3_000
+    shock_take_fraction: float = 0.25
+    shock_take_min_edge: int = 4
 
 
 @dataclass(frozen=True)
 class RiskConfig:
-    max_position: int = 80
-    quote_size: int = 4
-    min_edge: int = 2
-    take_edge: int = 4
-    inventory_skew: float = 0.35
-    reprice_cooldown_ms: int = 750
+    reprice_cooldown_ms: int = 250
 
     @property
     def stale_quote_ms(self) -> int:
-        """Reuse the cooldown knob as the stale-quote trigger, but a bit wider."""
-        return max(self.reprice_cooldown_ms * 3, 1_500)
+        """Refresh stale quotes periodically without thrashing the exchange."""
+        return max(self.reprice_cooldown_ms * 4, 1_000)
 
 
 @dataclass(frozen=True)
@@ -55,7 +62,7 @@ class BotConfig:
     market_a: AConfig
     risk: RiskConfig
     paths: BotPaths
-    trading_enabled: bool
+    trading_enabled: bool = True
     trading_disabled_reason: str | None = None
 
 
@@ -90,13 +97,25 @@ def _optional_int(name: str, default: int | None = None) -> int | None:
         raise ConfigError(f"Environment variable {name} must be an integer.") from exc
 
 
+def _optional_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return bool(default)
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"Environment variable {name} must be a boolean.")
+
+
 def load_bot_config(
     base_dir: str | Path,
     *,
     default_host: str | None = None,
     default_username: str | None = None,
     default_password: str | None = None,
-    default_pe_ratio: float | None = None,
+    default_pe_ratio: float | None = 10.0,
     default_initial_fair_value: int | None = None,
 ) -> BotConfig:
     """Load the exchange, valuation, and risk parameters from env vars or quick-start defaults."""
@@ -104,13 +123,6 @@ def load_bot_config(
     host = _required_value("UTC_HOST", default_host)
     username = _required_value("UTC_USERNAME", default_username)
     password = _required_value("UTC_PASSWORD", default_password)
-    pe_ratio = _optional_float("A_PE_RATIO", default=default_pe_ratio)
-    trading_enabled = pe_ratio is not None
-    trading_disabled_reason = None
-    if not trading_enabled:
-        trading_disabled_reason = (
-            "A_PE_RATIO is not set, so the bot will connect and learn A's P/E from earnings before trading."
-        )
 
     journal_env = os.getenv("A_JOURNAL_PATH")
     if journal_env and journal_env.strip():
@@ -127,27 +139,32 @@ def load_bot_config(
             password=password,
         ),
         market_a=AConfig(
-            pe_ratio=pe_ratio,
+            pe_ratio=_optional_float("A_PE_RATIO", default=default_pe_ratio) or 10.0,
+            price_scale=_optional_int("A_PRICE_SCALE", 100) or 100,
             initial_fair_value=_optional_int("A_INITIAL_FAIR_VALUE", default_initial_fair_value),
-            pe_learning_delay_ms=_optional_int("A_PE_LEARNING_DELAY_MS", 1_500) or 1_500,
-            pe_learning_sample_window_ms=_optional_int("A_PE_SAMPLE_WINDOW_MS", 750) or 750,
-            pe_learning_min_samples=_optional_int("A_PE_LEARNING_MIN_SAMPLES", 3) or 3,
-            pe_learning_min_confidence=_optional_int("A_PE_MIN_CONFIDENCE", 2) or 2,
-            pe_learning_consistency_tolerance=_optional_float("A_PE_TOLERANCE", 0.15) or 0.15,
-            pe_replacement_confirmations=_optional_int("A_PE_REPLACEMENT_CONFIRMATIONS", 2) or 2,
+            startup_assume_fresh_round=_optional_bool("A_STARTUP_ASSUME_FRESH_ROUND", True),
+            pre_news_pullback_ms=_optional_int("A_PRE_NEWS_PULLBACK_MS", 4_000) or 4_000,
+            steady_half_spread_ticks=_optional_int("A_STEADY_HALF_SPREAD_TICKS", 1) or 1,
+            opening_quote_size=_optional_int("A_OPENING_QUOTE_SIZE", 1) or 1,
+            opening_max_position=_optional_int("A_OPENING_MAX_POSITION", 8) or 8,
+            opening_half_spread_ticks=_optional_int("A_OPENING_HALF_SPREAD_TICKS", 4) or 4,
+            opening_min_book_spread=_optional_int("A_OPENING_MIN_BOOK_SPREAD", 10) or 10,
+            steady_quote_size=_optional_int("A_STEADY_QUOTE_SIZE", 2) or 2,
+            steady_max_position=_optional_int("A_STEADY_MAX_POSITION", 24) or 24,
+            steady_inventory_skew=_optional_float("A_STEADY_INVENTORY_SKEW", 0.75) or 0.75,
+            unwind_inventory_skew=_optional_float("A_UNWIND_INVENTORY_SKEW", 1.50) or 1.50,
+            unwind_flatten_threshold=_optional_int("A_UNWIND_FLATTEN_THRESHOLD", 2) or 2,
+            shock_quote_size=_optional_int("A_SHOCK_QUOTE_SIZE", 12) or 12,
+            shock_max_position=_optional_int("A_SHOCK_MAX_POSITION", 80) or 80,
+            shock_window_ms=_optional_int("A_SHOCK_WINDOW_MS", 3_000) or 3_000,
+            shock_take_fraction=_optional_float("A_SHOCK_TAKE_FRACTION", 0.25) or 0.25,
+            shock_take_min_edge=_optional_int("A_SHOCK_TAKE_MIN_EDGE", 4) or 4,
         ),
         risk=RiskConfig(
-            max_position=_optional_int("A_MAX_POSITION", 80) or 80,
-            quote_size=_optional_int("A_QUOTE_SIZE", 4) or 4,
-            min_edge=_optional_int("A_MIN_EDGE", 2) or 2,
-            take_edge=_optional_int("A_TAKE_EDGE", 4) or 4,
-            inventory_skew=_optional_float("A_INVENTORY_SKEW", 0.35),
-            reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 750) or 750,
+            reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
         ),
         paths=BotPaths(
             base_dir=base_path,
             journal_path=journal_path,
         ),
-        trading_enabled=trading_enabled,
-        trading_disabled_reason=trading_disabled_reason,
     )

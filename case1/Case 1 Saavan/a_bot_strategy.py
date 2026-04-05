@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import ceil, floor
-from statistics import median
 import time
 from typing import Iterable, Literal
 
@@ -10,6 +9,19 @@ from a_bot_config import AConfig, RiskConfig
 
 
 SideName = Literal["BUY", "SELL"]
+ModeName = Literal[
+    "OPENING_MICRO_MM",
+    "PRE_NEWS_PULLBACK",
+    "POST_NEWS_SHOCK",
+    "UNWIND",
+    "STEADY_MM",
+]
+
+TICKS_PER_SECOND = 5
+DAY_TICKS = 450
+DAY_MS = 90_000
+EARNINGS_TICKS = (110, 440)
+TICK_MS = 200
 
 
 @dataclass(frozen=True)
@@ -33,6 +45,18 @@ class BookSnapshot:
         best_ask = None if best_ask_level is None else BookLevel(px=best_ask_level[0], qty=best_ask_level[1])
         return cls(best_bid=best_bid, best_ask=best_ask)
 
+    @property
+    def mid(self) -> float | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return (self.best_bid.px + self.best_ask.px) / 2.0
+
+    @property
+    def spread(self) -> int | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return self.best_ask.px - self.best_bid.px
+
 
 @dataclass(frozen=True)
 class DesiredOrder:
@@ -45,6 +69,7 @@ class DesiredOrder:
 
 @dataclass(frozen=True)
 class QuotePlan:
+    mode: ModeName
     bid: DesiredOrder | None
     ask: DesiredOrder | None
     aggressive_actions: tuple[DesiredOrder, ...]
@@ -90,225 +115,73 @@ class SyncActions:
     placements: tuple[PlaceCommand, ...]
 
 
-@dataclass
-class PECalibrationJob:
-    earnings_value: float
-    started_ms: int
-    sample_start_ms: int
-    finalize_ms: int
-    samples: list[float] = field(default_factory=list)
-
-
 @dataclass(frozen=True)
 class NewsReaction:
     relevant: bool
     fair_value_updated: bool
-    started_pe_calibration: bool
     earnings_value: float | None = None
-
-
-@dataclass(frozen=True)
-class LearnedPEUpdate:
-    status: str
-    implied_pe: float
-    trusted_pe: float
-    trusted_confidence: int
-    candidate_pe: float | None
-    candidate_confidence: int
-    reference_price: float
-    sample_count: int
-    trading_ready: bool
+    old_fair_value: int | None = None
+    new_fair_value: int | None = None
+    shock_direction: int = 0
+    shock_threshold: int | None = None
+    tick: int | None = None
 
 
 class AValuationModel:
-    """Keeps the latest fair value estimate for A and learns a hidden constant P/E ratio."""
+    """Deterministic A valuation from earnings, fixed P/E, and exchange price scaling."""
 
     def __init__(
         self,
         a_config: AConfig,
         *,
-        learned_pe_ratio: float | None = None,
-        learned_pe_confidence: int = 0,
         initial_fair_value: int | None = None,
+        initial_earnings_value: float | None = None,
     ):
-        self.configured_pe_ratio = a_config.pe_ratio
-        self.trusted_pe_ratio = learned_pe_ratio
-        self.trusted_pe_confidence = max(0, int(learned_pe_confidence))
-        self.min_learned_confidence = max(1, int(a_config.pe_learning_min_confidence))
-        self.consistency_tolerance = max(0.0, float(a_config.pe_learning_consistency_tolerance))
-        self.replacement_confirmations = max(1, int(a_config.pe_replacement_confirmations))
-        self.candidate_pe_ratio: float | None = None
-        self.candidate_pe_confidence = 0
+        self.pe_ratio = float(a_config.pe_ratio)
+        self.price_scale = int(a_config.price_scale)
         self.fair_value = initial_fair_value
-        self.last_earnings_value: float | None = None
-        self.last_source = "config" if initial_fair_value is not None else "none"
+        self.last_earnings_value = initial_earnings_value
+        self.last_source = "journal" if initial_fair_value is not None else "none"
 
     @property
     def has_fair_value(self) -> bool:
         return self.fair_value is not None
 
-    def set_fair_value(self, fair_value: int, source: str) -> None:
-        self.fair_value = int(fair_value)
-        self.last_source = source
+    def fair_from_earnings(self, earnings_value: float) -> int:
+        return round(float(earnings_value) * self.pe_ratio * self.price_scale)
 
-    @property
-    def effective_pe_ratio(self) -> float | None:
-        if self.configured_pe_ratio is not None:
-            return self.configured_pe_ratio
-        return self.trusted_pe_ratio
-
-    @property
-    def can_trade_from_pe(self) -> bool:
-        if self.configured_pe_ratio is not None:
-            return True
-        return self.trusted_pe_ratio is not None and self.trusted_pe_confidence >= self.min_learned_confidence
-
-    @property
-    def pe_status_reason(self) -> str | None:
-        if self.configured_pe_ratio is not None:
-            return None
-        if self.trusted_pe_ratio is None:
-            return "No learned A P/E ratio yet; waiting for A earnings to calibrate."
-        if self.trusted_pe_confidence < self.min_learned_confidence:
-            return (
-                f"Learned A P/E={self.trusted_pe_ratio:.4f} "
-                f"with confidence {self.trusted_pe_confidence}/{self.min_learned_confidence}; waiting for another confirming earnings event."
-            )
-        return None
-
-    def on_earnings_release(self, earnings_value: float) -> bool:
+    def on_earnings_release(self, earnings_value: float) -> tuple[int | None, int]:
+        old_fair = self.fair_value
         self.last_earnings_value = float(earnings_value)
-        pe_ratio = self.effective_pe_ratio
-        if pe_ratio is None:
-            return False
-        self.set_fair_value(round(pe_ratio * self.last_earnings_value), source="earnings")
-        return True
-
-    def apply_learned_pe(
-        self,
-        implied_pe: float,
-        *,
-        reference_price: float,
-        sample_count: int,
-    ) -> LearnedPEUpdate:
-        implied_pe = float(implied_pe)
-        if self.configured_pe_ratio is not None:
-            trusted_pe = self.configured_pe_ratio
-            trusted_confidence = self.min_learned_confidence
-            status = "configured"
-        else:
-            if not self.can_trade_from_pe:
-                if self.trusted_pe_ratio is None:
-                    self.trusted_pe_ratio = implied_pe
-                    self.trusted_pe_confidence = 1
-                    status = "bootstrap_started"
-                else:
-                    relative_diff = self._relative_difference(implied_pe, self.trusted_pe_ratio)
-                    if relative_diff <= self.consistency_tolerance:
-                        weight = min(max(self.trusted_pe_confidence, 1), 5)
-                        self.trusted_pe_ratio = ((self.trusted_pe_ratio * weight) + implied_pe) / (weight + 1)
-                        self.trusted_pe_confidence = min(self.trusted_pe_confidence + 1, 10)
-                        status = "bootstrap_confirmed"
-                    else:
-                        self.trusted_pe_ratio = implied_pe
-                        self.trusted_pe_confidence = 1
-                        status = "bootstrap_reset"
-                self.candidate_pe_ratio = None
-                self.candidate_pe_confidence = 0
-            else:
-                relative_diff = self._relative_difference(implied_pe, self.trusted_pe_ratio)
-                if relative_diff <= self.consistency_tolerance:
-                    weight = min(max(self.trusted_pe_confidence, 1), 5)
-                    self.trusted_pe_ratio = ((self.trusted_pe_ratio * weight) + implied_pe) / (weight + 1)
-                    self.trusted_pe_confidence = min(self.trusted_pe_confidence + 1, 10)
-                    self.candidate_pe_ratio = None
-                    self.candidate_pe_confidence = 0
-                    status = "trusted_confirmed"
-                else:
-                    if self.candidate_pe_ratio is None:
-                        self.candidate_pe_ratio = implied_pe
-                        self.candidate_pe_confidence = 1
-                        status = "candidate_started"
-                    else:
-                        candidate_diff = self._relative_difference(implied_pe, self.candidate_pe_ratio)
-                        if candidate_diff <= self.consistency_tolerance:
-                            weight = min(max(self.candidate_pe_confidence, 1), 5)
-                            self.candidate_pe_ratio = ((self.candidate_pe_ratio * weight) + implied_pe) / (weight + 1)
-                            self.candidate_pe_confidence += 1
-                            status = "candidate_confirmed"
-                            if self.candidate_pe_confidence >= self.replacement_confirmations:
-                                self.trusted_pe_ratio = self.candidate_pe_ratio
-                                self.trusted_pe_confidence = max(
-                                    self.min_learned_confidence,
-                                    self.candidate_pe_confidence,
-                                )
-                                self.candidate_pe_ratio = None
-                                self.candidate_pe_confidence = 0
-                                status = "candidate_promoted"
-                        else:
-                            self.candidate_pe_ratio = implied_pe
-                            self.candidate_pe_confidence = 1
-                            status = "candidate_restarted"
-            trusted_pe = float(self.trusted_pe_ratio)
-            trusted_confidence = int(self.trusted_pe_confidence)
-
-        if trusted_pe is not None and self.last_earnings_value is not None:
-            source = "learned_pe" if self.configured_pe_ratio is None else "configured"
-            self.set_fair_value(round(trusted_pe * self.last_earnings_value), source=source)
-
-        return LearnedPEUpdate(
-            status=status,
-            implied_pe=implied_pe,
-            trusted_pe=float(trusted_pe),
-            trusted_confidence=int(trusted_confidence),
-            candidate_pe=self.candidate_pe_ratio,
-            candidate_confidence=int(self.candidate_pe_confidence),
-            reference_price=float(reference_price),
-            sample_count=int(sample_count),
-            trading_ready=self.can_trade_from_pe,
-        )
-
-    @property
-    def learned_pe_ratio(self) -> float | None:
-        return self.trusted_pe_ratio
-
-    @property
-    def learned_pe_confidence(self) -> int:
-        return self.trusted_pe_confidence
-
-    @staticmethod
-    def _relative_difference(left: float, right: float) -> float:
-        return abs(left - right) / max(abs(right), 1e-9)
-
-    def handles_news(self, news_release: dict) -> bool:
-        if news_release.get("kind") != "structured":
-            return False
-        new_data = news_release.get("new_data") or {}
-        if new_data.get("structured_subtype") != "earnings":
-            return False
-        asset = str(new_data.get("asset") or news_release.get("symbol") or "").upper()
-        return asset == "A"
+        self.fair_value = self.fair_from_earnings(self.last_earnings_value)
+        self.last_source = "earnings"
+        return old_fair, self.fair_value
 
 
 class QuoteEngine:
-    """Converts the latest fair value, inventory, and book into target quotes."""
+    """Converts the current A mode, fair value, and book into desired orders."""
 
-    def __init__(self, risk: RiskConfig):
+    def __init__(self, a_config: AConfig, risk: RiskConfig):
+        self.a_config = a_config
         self.risk = risk
 
     def compute_quotes(
         self,
+        mode: ModeName,
         fair_value: int | None,
         inventory: int,
         book: BookSnapshot,
         buy_exposure: int,
         sell_exposure: int,
+        *,
         can_trade: bool,
         reason_if_blocked: str,
-        quote_size: int | None = None,
+        shock_direction: int = 0,
+        shock_threshold: int | None = None,
     ) -> QuotePlan:
         if not can_trade:
             return QuotePlan(
+                mode=mode,
                 bid=None,
                 ask=None,
                 aggressive_actions=(),
@@ -316,8 +189,22 @@ class QuoteEngine:
                 reason=reason_if_blocked,
             )
 
+        if mode == "PRE_NEWS_PULLBACK":
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=False,
+                reason="flat before scheduled A earnings",
+            )
+
+        if mode == "OPENING_MICRO_MM":
+            return self._opening_quotes(mode, inventory, book, buy_exposure, sell_exposure)
+
         if fair_value is None:
             return QuotePlan(
+                mode=mode,
                 bid=None,
                 ask=None,
                 aggressive_actions=(),
@@ -325,77 +212,332 @@ class QuoteEngine:
                 reason="Waiting for the first usable A fair value.",
             )
 
-        # Treat current inventory plus same-side resting orders as committed exposure.
-        quote_size = self.risk.quote_size if quote_size is None else int(quote_size)
-        allowed_buy = max(0, self.risk.max_position - (inventory + buy_exposure))
-        allowed_sell = max(0, self.risk.max_position + inventory - sell_exposure)
+        if mode == "POST_NEWS_SHOCK":
+            return self._shock_quotes(
+                mode,
+                fair_value,
+                inventory,
+                book,
+                buy_exposure,
+                sell_exposure,
+                shock_direction=shock_direction,
+                shock_threshold=shock_threshold or self.a_config.shock_take_min_edge,
+            )
 
-        # Positive inventory should push the reservation price lower so the bot
-        # naturally leans toward selling inventory back down, and vice versa.
-        reservation = fair_value - (self.risk.inventory_skew * inventory)
-        bid_px = int(floor(reservation - self.risk.min_edge))
-        ask_px = int(ceil(reservation + self.risk.min_edge))
+        if mode == "UNWIND":
+            return self._unwind_quotes(mode, fair_value, inventory, book, buy_exposure, sell_exposure)
 
+        return self._steady_quotes(mode, fair_value, inventory, book, buy_exposure, sell_exposure)
+
+    def _opening_quotes(
+        self,
+        mode: ModeName,
+        inventory: int,
+        book: BookSnapshot,
+        buy_exposure: int,
+        sell_exposure: int,
+    ) -> QuotePlan:
+        mid = book.mid
+        spread = book.spread
+        if mid is None or spread is None or spread < self.a_config.opening_min_book_spread:
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=False,
+                reason="waiting for a wide enough opening spread",
+            )
+
+        bid_px = int(floor(mid - self.a_config.opening_half_spread_ticks))
+        ask_px = int(ceil(mid + self.a_config.opening_half_spread_ticks))
+        bid_px, ask_px = self._clamp_inside_book(bid_px, ask_px, book)
+
+        allowed_buy, allowed_sell = self._allowed_size(
+            inventory,
+            buy_exposure,
+            sell_exposure,
+            cap=self.a_config.opening_max_position,
+        )
+        desired_bid = None
+        desired_ask = None
+        if allowed_buy > 0:
+            desired_bid = DesiredOrder(
+                side="BUY",
+                px=bid_px,
+                qty=min(self.a_config.opening_quote_size, allowed_buy),
+                aggressive=False,
+                reason="opening micro-mm bid around live mid",
+            )
+        if allowed_sell > 0:
+            desired_ask = DesiredOrder(
+                side="SELL",
+                px=ask_px,
+                qty=min(self.a_config.opening_quote_size, allowed_sell),
+                aggressive=False,
+                reason="opening micro-mm ask around live mid",
+            )
+
+        return QuotePlan(
+            mode=mode,
+            bid=desired_bid,
+            ask=desired_ask,
+            aggressive_actions=(),
+            observe_only=False,
+            reason="opening micro-mm",
+        )
+
+    def _steady_quotes(
+        self,
+        mode: ModeName,
+        fair_value: int,
+        inventory: int,
+        book: BookSnapshot,
+        buy_exposure: int,
+        sell_exposure: int,
+    ) -> QuotePlan:
+        aggressive_actions: list[DesiredOrder] = []
+        allowed_buy, allowed_sell = self._allowed_size(
+            inventory,
+            buy_exposure,
+            sell_exposure,
+            cap=self.a_config.steady_max_position,
+        )
+        take_edge = max(2, self.a_config.steady_half_spread_ticks + 1)
+
+        if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - take_edge:
+            aggressive_actions.append(
+                DesiredOrder(
+                    side="BUY",
+                    px=book.best_ask.px,
+                    qty=min(self.a_config.steady_quote_size, allowed_buy, book.best_ask.qty),
+                    aggressive=True,
+                    reason="steady-state buy through stale ask below fair",
+                )
+            )
+        if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + take_edge:
+            aggressive_actions.append(
+                DesiredOrder(
+                    side="SELL",
+                    px=book.best_bid.px,
+                    qty=min(self.a_config.steady_quote_size, allowed_sell, book.best_bid.qty),
+                    aggressive=True,
+                    reason="steady-state sell through stale bid above fair",
+                )
+            )
+
+        reservation = fair_value - (self.a_config.steady_inventory_skew * inventory)
+        bid_px = int(floor(reservation - self.a_config.steady_half_spread_ticks))
+        ask_px = int(ceil(reservation + self.a_config.steady_half_spread_ticks))
+        bid_px, ask_px = self._clamp_inside_book(bid_px, ask_px, book)
+
+        aggressive_sides = {action.side for action in aggressive_actions}
+        desired_bid = None
+        desired_ask = None
+        if allowed_buy > 0 and "BUY" not in aggressive_sides:
+            desired_bid = DesiredOrder(
+                side="BUY",
+                px=bid_px,
+                qty=min(self.a_config.steady_quote_size, allowed_buy),
+                aggressive=False,
+                reason="steady-state bid around exact fair",
+            )
+        if allowed_sell > 0 and "SELL" not in aggressive_sides:
+            desired_ask = DesiredOrder(
+                side="SELL",
+                px=ask_px,
+                qty=min(self.a_config.steady_quote_size, allowed_sell),
+                aggressive=False,
+                reason="steady-state ask around exact fair",
+            )
+
+        return QuotePlan(
+            mode=mode,
+            bid=desired_bid,
+            ask=desired_ask,
+            aggressive_actions=tuple(aggressive_actions),
+            observe_only=False,
+            reason="steady mm",
+        )
+
+    def _shock_quotes(
+        self,
+        mode: ModeName,
+        fair_value: int,
+        inventory: int,
+        book: BookSnapshot,
+        buy_exposure: int,
+        sell_exposure: int,
+        *,
+        shock_direction: int,
+        shock_threshold: int,
+    ) -> QuotePlan:
+        aggressive_actions: list[DesiredOrder] = []
+        allowed_buy, allowed_sell = self._allowed_size(
+            inventory,
+            buy_exposure,
+            sell_exposure,
+            cap=self.a_config.shock_max_position,
+        )
+
+        desired_bid = None
+        desired_ask = None
+        half_spread = self.a_config.steady_half_spread_ticks
+
+        if shock_direction > 0:
+            if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - shock_threshold:
+                aggressive_actions.append(
+                    DesiredOrder(
+                        side="BUY",
+                        px=book.best_ask.px,
+                        qty=min(self.a_config.shock_quote_size, allowed_buy, book.best_ask.qty),
+                        aggressive=True,
+                        reason="earnings upside shock buy through stale asks",
+                    )
+                )
+            if allowed_sell > 0:
+                ask_px = int(ceil(fair_value + half_spread))
+                _, ask_px = self._clamp_inside_book(fair_value - 1, ask_px, book)
+                desired_ask = DesiredOrder(
+                    side="SELL",
+                    px=ask_px,
+                    qty=min(self.a_config.shock_quote_size, allowed_sell),
+                    aggressive=False,
+                    reason="post-shock ask to unwind long inventory",
+                )
+        elif shock_direction < 0:
+            if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + shock_threshold:
+                aggressive_actions.append(
+                    DesiredOrder(
+                        side="SELL",
+                        px=book.best_bid.px,
+                        qty=min(self.a_config.shock_quote_size, allowed_sell, book.best_bid.qty),
+                        aggressive=True,
+                        reason="earnings downside shock sell through stale bids",
+                    )
+                )
+            if allowed_buy > 0:
+                bid_px = int(floor(fair_value - half_spread))
+                bid_px, _ = self._clamp_inside_book(bid_px, fair_value + 1, book)
+                desired_bid = DesiredOrder(
+                    side="BUY",
+                    px=bid_px,
+                    qty=min(self.a_config.shock_quote_size, allowed_buy),
+                    aggressive=False,
+                    reason="post-shock bid to unwind short inventory",
+                )
+        else:
+            return self._steady_quotes("STEADY_MM", fair_value, inventory, book, buy_exposure, sell_exposure)
+
+        return QuotePlan(
+            mode=mode,
+            bid=desired_bid,
+            ask=desired_ask,
+            aggressive_actions=tuple(aggressive_actions),
+            observe_only=False,
+            reason="post-news shock",
+        )
+
+    def _unwind_quotes(
+        self,
+        mode: ModeName,
+        fair_value: int,
+        inventory: int,
+        book: BookSnapshot,
+        buy_exposure: int,
+        sell_exposure: int,
+    ) -> QuotePlan:
+        aggressive_actions: list[DesiredOrder] = []
+        allowed_buy, allowed_sell = self._allowed_size(
+            inventory,
+            buy_exposure,
+            sell_exposure,
+            cap=self.a_config.steady_max_position,
+        )
+
+        if inventory > 0:
+            if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value:
+                aggressive_actions.append(
+                    DesiredOrder(
+                        side="SELL",
+                        px=book.best_bid.px,
+                        qty=min(self.a_config.steady_quote_size, allowed_sell, book.best_bid.qty),
+                        aggressive=True,
+                        reason="unwind long inventory into rich bid",
+                    )
+                )
+            ask_px = int(ceil((fair_value - (self.a_config.unwind_inventory_skew * inventory)) + 1))
+            _, ask_px = self._clamp_inside_book(fair_value - 1, ask_px, book)
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=DesiredOrder(
+                    side="SELL",
+                    px=ask_px,
+                    qty=min(self.a_config.steady_quote_size, allowed_sell),
+                    aggressive=False,
+                    reason="unwind ask to reduce long inventory",
+                )
+                if allowed_sell > 0
+                else None,
+                aggressive_actions=tuple(aggressive_actions),
+                observe_only=False,
+                reason="unwind long inventory",
+            )
+
+        if inventory < 0:
+            if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value:
+                aggressive_actions.append(
+                    DesiredOrder(
+                        side="BUY",
+                        px=book.best_ask.px,
+                        qty=min(self.a_config.steady_quote_size, allowed_buy, book.best_ask.qty),
+                        aggressive=True,
+                        reason="unwind short inventory into cheap ask",
+                    )
+                )
+            bid_px = int(floor((fair_value - (self.a_config.unwind_inventory_skew * inventory)) - 1))
+            bid_px, _ = self._clamp_inside_book(bid_px, fair_value + 1, book)
+            return QuotePlan(
+                mode=mode,
+                bid=DesiredOrder(
+                    side="BUY",
+                    px=bid_px,
+                    qty=min(self.a_config.steady_quote_size, allowed_buy),
+                    aggressive=False,
+                    reason="unwind bid to reduce short inventory",
+                )
+                if allowed_buy > 0
+                else None,
+                ask=None,
+                aggressive_actions=tuple(aggressive_actions),
+                observe_only=False,
+                reason="unwind short inventory",
+            )
+
+        return self._steady_quotes("STEADY_MM", fair_value, inventory, book, buy_exposure, sell_exposure)
+
+    @staticmethod
+    def _allowed_size(
+        inventory: int,
+        buy_exposure: int,
+        sell_exposure: int,
+        *,
+        cap: int,
+    ) -> tuple[int, int]:
+        allowed_buy = max(0, cap - (inventory + buy_exposure))
+        allowed_sell = max(0, cap + inventory - sell_exposure)
+        return allowed_buy, allowed_sell
+
+    @staticmethod
+    def _clamp_inside_book(bid_px: int, ask_px: int, book: BookSnapshot) -> tuple[int, int]:
         if book.best_ask is not None:
             bid_px = min(bid_px, book.best_ask.px - 1)
         if book.best_bid is not None:
             ask_px = max(ask_px, book.best_bid.px + 1)
         if bid_px >= ask_px:
             bid_px = ask_px - 1
-
-        aggressive_actions: list[DesiredOrder] = []
-        desired_bid: DesiredOrder | None = None
-        desired_ask: DesiredOrder | None = None
-
-        if book.best_ask is not None and allowed_buy > 0:
-            if book.best_ask.px <= fair_value - self.risk.take_edge:
-                aggressive_actions.append(
-                    DesiredOrder(
-                        side="BUY",
-                        px=book.best_ask.px,
-                        qty=min(quote_size, allowed_buy, book.best_ask.qty),
-                        aggressive=True,
-                        reason="best ask is cheap versus fair value",
-                    )
-                )
-
-        if book.best_bid is not None and allowed_sell > 0:
-            if book.best_bid.px >= fair_value + self.risk.take_edge:
-                aggressive_actions.append(
-                    DesiredOrder(
-                        side="SELL",
-                        px=book.best_bid.px,
-                        qty=min(quote_size, allowed_sell, book.best_bid.qty),
-                        aggressive=True,
-                        reason="best bid is rich versus fair value",
-                    )
-                )
-
-        aggressive_sides = {action.side for action in aggressive_actions}
-        if allowed_buy > 0 and "BUY" not in aggressive_sides:
-            desired_bid = DesiredOrder(
-                side="BUY",
-                px=bid_px,
-                qty=min(quote_size, allowed_buy),
-                aggressive=False,
-                reason="passive buy quote around reservation price",
-            )
-        if allowed_sell > 0 and "SELL" not in aggressive_sides:
-            desired_ask = DesiredOrder(
-                side="SELL",
-                px=ask_px,
-                qty=min(quote_size, allowed_sell),
-                aggressive=False,
-                reason="passive sell quote around reservation price",
-            )
-
-        return QuotePlan(
-            bid=desired_bid,
-            ask=desired_ask,
-            aggressive_actions=tuple(aggressive_actions),
-            observe_only=False,
-            reason="ready",
-        )
+        return bid_px, ask_px
 
 
 class OrderManager:
@@ -566,7 +708,7 @@ class OrderManager:
 
 
 class MarketAStrategy:
-    """Owns the valuation model, quote engine, and order manager for market A."""
+    """Owns the valuation model, schedule tracking, quote engine, and order manager for A."""
 
     def __init__(
         self,
@@ -574,8 +716,7 @@ class MarketAStrategy:
         risk: RiskConfig,
         restored_orders: Iterable[ManagedOrder] = (),
         recovered_fair_value: int | None = None,
-        learned_pe_ratio: float | None = None,
-        learned_pe_confidence: int = 0,
+        recovered_earnings_value: float | None = None,
     ):
         starting_fair = recovered_fair_value
         if starting_fair is None:
@@ -585,19 +726,24 @@ class MarketAStrategy:
         self.risk = risk
         self.valuation = AValuationModel(
             a_config=a_config,
-            learned_pe_ratio=learned_pe_ratio,
-            learned_pe_confidence=learned_pe_confidence,
             initial_fair_value=starting_fair,
+            initial_earnings_value=recovered_earnings_value,
         )
-        if recovered_fair_value is not None:
-            self.valuation.last_source = "journal"
-
-        self.quote_engine = QuoteEngine(risk)
+        self.quote_engine = QuoteEngine(a_config, risk)
         self.order_manager = OrderManager(symbol="A", risk=risk)
         self.inventory = 0
         self.book = BookSnapshot()
-        self.current_round_earnings_seen = False
-        self.pending_pe_calibration: PECalibrationJob | None = None
+        self.mode: ModeName = "OPENING_MICRO_MM"
+        self.startup_ms = self._now_ms()
+        self.tick_anchor_tick: int | None = None
+        self.tick_anchor_ms: int | None = None
+        self.last_news_tick: int | None = None
+        self.current_round_earnings_seen = recovered_fair_value is not None
+        self.shock_started_ms: int | None = None
+        self.shock_reference_fair: int | None = None
+        self.shock_target_fair: int | None = None
+        self.shock_direction = 0
+        self.shock_threshold: int | None = None
         self.recovery_pending: set[str] = set()
         self.recovery_active = False
 
@@ -613,16 +759,8 @@ class MarketAStrategy:
         return self.valuation.fair_value
 
     @property
-    def effective_pe_ratio(self) -> float | None:
-        return self.valuation.effective_pe_ratio
-
-    @property
-    def learned_pe_ratio(self) -> float | None:
-        return self.valuation.learned_pe_ratio
-
-    @property
-    def learned_pe_confidence(self) -> int:
-        return self.valuation.learned_pe_confidence
+    def last_earnings_value(self) -> float | None:
+        return self.valuation.last_earnings_value
 
     def set_inventory(self, inventory: int) -> None:
         self.inventory = int(inventory)
@@ -634,57 +772,52 @@ class MarketAStrategy:
         if symbol != "A":
             return False
         self.book = BookSnapshot.from_order_book(book)
-        self._capture_mid_sample(now_ms)
+        self.mode = self._determine_mode(now_ms)
         return True
 
     def on_news(self, news_release: dict, now_ms: int) -> NewsReaction:
-        if not self.valuation.handles_news(news_release):
-            return NewsReaction(relevant=False, fair_value_updated=False, started_pe_calibration=False)
+        tick = news_release.get("tick")
+        if isinstance(tick, int):
+            self.tick_anchor_tick = tick
+            self.tick_anchor_ms = now_ms
+            self.last_news_tick = tick
+
+        if not self._handles_a_earnings(news_release):
+            self.mode = self._determine_mode(now_ms)
+            return NewsReaction(relevant=False, fair_value_updated=False, tick=tick if isinstance(tick, int) else None)
 
         earnings_value = float(news_release["new_data"]["value"])
         self.current_round_earnings_seen = True
-        fair_updated = self.valuation.on_earnings_release(earnings_value)
-        started_pe_calibration = False
+        old_fair, new_fair = self.valuation.on_earnings_release(earnings_value)
+        reference_fair = old_fair
+        if reference_fair is None:
+            mid = self.book.mid
+            if mid is not None:
+                reference_fair = round(mid)
+        if reference_fair is None:
+            reference_fair = new_fair
 
-        if self.valuation.configured_pe_ratio is None:
-            self.pending_pe_calibration = PECalibrationJob(
-                earnings_value=earnings_value,
-                started_ms=now_ms,
-                sample_start_ms=now_ms + self.a_config.pe_learning_delay_ms,
-                finalize_ms=now_ms + self.a_config.pe_learning_delay_ms + self.a_config.pe_learning_sample_window_ms,
-            )
-            started_pe_calibration = True
+        move_size = abs(new_fair - reference_fair)
+        self.shock_reference_fair = reference_fair
+        self.shock_target_fair = new_fair
+        self.shock_direction = 1 if new_fair > reference_fair else -1 if new_fair < reference_fair else 0
+        self.shock_threshold = max(
+            self.a_config.shock_take_min_edge,
+            round(self.a_config.shock_take_fraction * move_size),
+        )
+        self.shock_started_ms = now_ms
+        self.mode = self._determine_mode(now_ms)
 
         return NewsReaction(
             relevant=True,
-            fair_value_updated=fair_updated,
-            started_pe_calibration=started_pe_calibration,
+            fair_value_updated=True,
             earnings_value=earnings_value,
+            old_fair_value=old_fair,
+            new_fair_value=new_fair,
+            shock_direction=self.shock_direction,
+            shock_threshold=self.shock_threshold,
+            tick=tick if isinstance(tick, int) else None,
         )
-
-    def maybe_finalize_pe_learning(self, now_ms: int) -> LearnedPEUpdate | None:
-        if self.pending_pe_calibration is None:
-            return None
-
-        self._capture_mid_sample(now_ms)
-        pending = self.pending_pe_calibration
-        if now_ms < pending.finalize_ms:
-            return None
-        if len(pending.samples) < self.a_config.pe_learning_min_samples:
-            return None
-        if pending.earnings_value == 0:
-            self.pending_pe_calibration = None
-            return None
-
-        reference_price = float(median(pending.samples))
-        implied_pe = reference_price / pending.earnings_value
-        update = self.valuation.apply_learned_pe(
-            implied_pe,
-            reference_price=reference_price,
-            sample_count=len(pending.samples),
-        )
-        self.pending_pe_calibration = None
-        return update
 
     def on_fill(self, order_id: str, qty: int, price: int) -> ManagedOrder | None:
         order = self.order_manager.handle_fill(order_id, qty)
@@ -730,19 +863,17 @@ class MarketAStrategy:
             if order.order_id in self.recovery_pending and not order.cancel_pending
         ]
 
-    def compute_quotes(self) -> QuotePlan:
-        if not self.valuation.can_trade_from_pe:
-            return self.quote_engine.compute_quotes(
-                fair_value=None,
-                inventory=self.inventory,
-                book=self.book,
-                buy_exposure=self.order_manager.buy_exposure(),
-                sell_exposure=self.order_manager.sell_exposure(),
-                can_trade=False,
-                reason_if_blocked=self.valuation.pe_status_reason or "A valuation is not ready yet.",
-            )
+    def _maybe_finish_recovery(self) -> None:
+        if self.recovery_active and not self.recovery_pending:
+            self.on_recovery_complete()
+
+    def compute_quotes(self, now_ms: int | None = None) -> QuotePlan:
+        if now_ms is None:
+            now_ms = self._now_ms()
+        self.mode = self._determine_mode(now_ms)
         reason_if_blocked = "Waiting for recovered A orders to be cancelled."
         return self.quote_engine.compute_quotes(
+            mode=self.mode,
             fair_value=self.valuation.fair_value,
             inventory=self.inventory,
             book=self.book,
@@ -750,38 +881,85 @@ class MarketAStrategy:
             sell_exposure=self.order_manager.sell_exposure(),
             can_trade=not self.recovery_active,
             reason_if_blocked=reason_if_blocked,
-            quote_size=self._active_quote_size(),
+            shock_direction=self.shock_direction,
+            shock_threshold=self.shock_threshold,
         )
 
-    def _maybe_finish_recovery(self) -> None:
-        if self.recovery_active and not self.recovery_pending:
-            self.on_recovery_complete()
-
-    def _active_quote_size(self) -> int:
-        if self.valuation.configured_pe_ratio is not None:
-            return self.risk.quote_size
-        if self.current_round_earnings_seen:
-            return self.risk.quote_size
-        if self.valuation.can_trade_from_pe:
-            return max(1, self.risk.quote_size // 2)
-        return self.risk.quote_size
-
-    def _capture_mid_sample(self, now_ms: int | None = None) -> None:
-        if self.pending_pe_calibration is None:
-            return
+    def ms_until_next_scheduled_earnings(self, now_ms: int | None = None) -> int | None:
         if now_ms is None:
             now_ms = self._now_ms()
-        if now_ms < self.pending_pe_calibration.sample_start_ms:
-            return
-        current_mid = self._current_mid()
-        if current_mid is None:
-            return
-        self.pending_pe_calibration.samples.append(current_mid)
+        if self.tick_anchor_tick is not None and self.tick_anchor_ms is not None:
+            estimated_day_tick = self._estimated_day_tick(now_ms)
+            if estimated_day_tick is None:
+                return None
+            next_tick = self._next_earnings_day_tick(estimated_day_tick)
+            delta_ticks = (next_tick - estimated_day_tick) % DAY_TICKS
+            if delta_ticks == 0:
+                return 0
+            return round(delta_ticks * TICK_MS)
 
-    def _current_mid(self) -> float | None:
-        if self.book.best_bid is None or self.book.best_ask is None:
+        if not self.a_config.startup_assume_fresh_round:
             return None
-        return (self.book.best_bid.px + self.book.best_ask.px) / 2.0
+
+        day_elapsed_ms = max(0, (now_ms - self.startup_ms) % DAY_MS)
+        for earnings_ms in (22_000, 88_000):
+            if day_elapsed_ms <= earnings_ms:
+                return earnings_ms - day_elapsed_ms
+        return DAY_MS - day_elapsed_ms + 22_000
+
+    def _determine_mode(self, now_ms: int) -> ModeName:
+        if self._shock_active(now_ms):
+            return "POST_NEWS_SHOCK"
+
+        until_next_earnings = self.ms_until_next_scheduled_earnings(now_ms)
+        if until_next_earnings is not None and until_next_earnings <= self.a_config.pre_news_pullback_ms:
+            return "PRE_NEWS_PULLBACK"
+
+        if self.valuation.fair_value is None:
+            return "OPENING_MICRO_MM"
+
+        if self._should_unwind():
+            return "UNWIND"
+
+        return "STEADY_MM"
+
+    def _shock_active(self, now_ms: int) -> bool:
+        if self.shock_started_ms is None or self.shock_target_fair is None:
+            return False
+        if now_ms - self.shock_started_ms < self.a_config.shock_window_ms:
+            return True
+        return False
+
+    def _should_unwind(self) -> bool:
+        if self.shock_started_ms is None:
+            return False
+        if self.inventory == 0:
+            return False
+        return abs(self.inventory) > self.a_config.unwind_flatten_threshold
+
+    @staticmethod
+    def _handles_a_earnings(news_release: dict) -> bool:
+        if news_release.get("kind") != "structured":
+            return False
+        new_data = news_release.get("new_data") or {}
+        if new_data.get("structured_subtype") != "earnings":
+            return False
+        asset = str(new_data.get("asset") or news_release.get("symbol") or "").upper()
+        return asset == "A"
+
+    @staticmethod
+    def _next_earnings_day_tick(current_day_tick: float) -> int:
+        for earnings_tick in EARNINGS_TICKS:
+            if current_day_tick < earnings_tick:
+                return earnings_tick
+        return EARNINGS_TICKS[0]
+
+    def _estimated_day_tick(self, now_ms: int) -> float | None:
+        if self.tick_anchor_tick is None or self.tick_anchor_ms is None:
+            return None
+        elapsed_ms = max(0, now_ms - self.tick_anchor_ms)
+        elapsed_ticks = elapsed_ms / TICK_MS
+        return (self.tick_anchor_tick + elapsed_ticks) % DAY_TICKS
 
     @staticmethod
     def _now_ms() -> int:
