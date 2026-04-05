@@ -6,9 +6,11 @@ from typing import Any
 
 
 class AppendSafeCsvWriter:
-    def __init__(self, path: Path, fieldnames: list[str]):
+    def __init__(self, path: Path, fieldnames: list[str], *, flush_every: int = 1):
         self.path = path
         self.fieldnames = fieldnames
+        self.flush_every = max(1, int(flush_every))
+        self._rows_since_flush = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         file_exists = self.path.exists()
         needs_header = (not file_exists) or self.path.stat().st_size == 0
@@ -20,10 +22,14 @@ class AppendSafeCsvWriter:
 
     def write_row(self, row: dict[str, Any]) -> None:
         self._writer.writerow(row)
-        self._handle.flush()
+        self._rows_since_flush += 1
+        if self._rows_since_flush >= self.flush_every:
+            self._handle.flush()
+            self._rows_since_flush = 0
 
     def close(self) -> None:
         self._handle.flush()
+        self._rows_since_flush = 0
         self._handle.close()
 
     def __enter__(self) -> "AppendSafeCsvWriter":

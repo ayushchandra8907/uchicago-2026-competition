@@ -14,11 +14,6 @@ DEFAULT_PLOT_SYMBOLS = ("A", "B", "C", "ETF")
 DEFAULT_DIRECT_EARNINGS_SYMBOLS = ("A", "C")
 DEFAULT_ETF_NEWS_ASSETS = ("A", "C")
 DEFAULT_PE_CONSTANTS = {"A": 10.0}
-DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 1.0
-DEFAULT_TOP_K_DEPTH = 3
-DEFAULT_TOP_N_LEVELS = 5
-DEFAULT_POST_NEWS_WINDOW_SECONDS = 5.0
-DEFAULT_HISTORY_MAXLEN = 20_000
 
 
 @dataclass
@@ -31,11 +26,6 @@ class ResearchLoggerConfig:
     direct_earnings_symbols: list[str] = field(default_factory=lambda: list(DEFAULT_DIRECT_EARNINGS_SYMBOLS))
     etf_news_assets: list[str] = field(default_factory=lambda: list(DEFAULT_ETF_NEWS_ASSETS))
     pe_constants: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_PE_CONSTANTS))
-    heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS
-    top_k_depth: int = DEFAULT_TOP_K_DEPTH
-    top_n_levels: int = DEFAULT_TOP_N_LEVELS
-    post_news_window_seconds: float = DEFAULT_POST_NEWS_WINDOW_SECONDS
-    history_maxlen: int = DEFAULT_HISTORY_MAXLEN
     log_root: Path = DEFAULT_LOG_ROOT
     run_label: str | None = None
     config_path: Path | None = None
@@ -115,11 +105,6 @@ def load_config() -> ResearchLoggerConfig:
         direct_earnings_symbols=_read_list(json_data, "direct_earnings_symbols", DEFAULT_DIRECT_EARNINGS_SYMBOLS),
         etf_news_assets=_read_list(json_data, "etf_news_assets", DEFAULT_ETF_NEWS_ASSETS),
         pe_constants=_read_float_dict(json_data, "pe_constants", DEFAULT_PE_CONSTANTS),
-        heartbeat_interval_seconds=float(json_data.get("heartbeat_interval_seconds", DEFAULT_HEARTBEAT_INTERVAL_SECONDS)),
-        top_k_depth=int(json_data.get("top_k_depth", DEFAULT_TOP_K_DEPTH)),
-        top_n_levels=int(json_data.get("top_n_levels", DEFAULT_TOP_N_LEVELS)),
-        post_news_window_seconds=float(json_data.get("post_news_window_seconds", DEFAULT_POST_NEWS_WINDOW_SECONDS)),
-        history_maxlen=int(json_data.get("history_maxlen", DEFAULT_HISTORY_MAXLEN)),
         log_root=log_root,
         run_label=json_data.get("run_label"),
         config_path=config_path,
