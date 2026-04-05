@@ -129,6 +129,26 @@ Important columns:
 - `inferred_fair_price_after`
 - `raw_content`, `normalized_content`
 
+### `raw_all_news_callbacks.csv`
+
+Debug file that logs every inbound news callback before symbol filtering.
+
+Use this file when a headline appears in the exchange UI but not in `raw_news_events.csv`.
+
+Important columns:
+
+- `kind`
+- `symbol`
+- `message_type`
+- `structured_subtype`
+- `raw_content`, `normalized_content`
+- `affected_symbols_json`
+- `kept_in_raw_news_events`
+- `kept_news_id`
+- `drop_reason`
+
+If a headline is present here but missing from `raw_news_events.csv`, then the logger received it and filtered it out. If it is missing from both files, the callback never reached this logger run.
+
 ### `derived_feature_rows.csv`
 
 A research-friendly aligned feature table for all monitored symbols. Each row is tied to one symbol and is built from either a book event or a news event.
@@ -179,7 +199,8 @@ Expected files:
 Each plot shows:
 
 - the symbol mid-price over time
-- earnings markers where applicable
+- red dashed earnings markers where applicable
+- a separate lower news lane with green dashed non-earnings news markers when that same symbol is actually mentioned or tagged by the logged news, labeled with the logged headline/content text
 - EPS change labels such as `A EPS 0.95 -> 1.03` or `C EPS START -> 0.88`
 
 ### `session_metadata.json`
@@ -208,11 +229,13 @@ The default setup already matches the workflow you asked for, so in practice you
 
 ## Manual Re-Analysis
 
-If you ever want to regenerate summaries or plots for an old run:
+If you ever want to regenerate summaries or plots for an old run, you can point the analyzer directly at the saved run folder:
 
 ```bash
-python3 data_scraping/analyze_logs.py --run-dir data_scraping/data/market_research_YYYY-MM-DD_HH-MM-SS --plot
+python3 data_scraping/analyze_logs.py --plot data_scraping/data/market_research_YYYY-MM-DD_HH-MM-SS_live_round
 ```
+
+You can also pass any file inside a run folder and the analyzer will use that file's parent folder.
 
 ## Notes
 

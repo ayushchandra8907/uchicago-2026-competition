@@ -6,7 +6,6 @@ import math
 import os
 from pathlib import Path
 import re
-from statistics import median
 import sys
 import time
 from typing import Optional
@@ -21,6 +20,7 @@ from utcxchangelib import Side, XChangeClient
 
 
 OPTION_RE = re.compile(r"^B_(C|P)_(\d+)$")
+DEFAULT_STRIKES = (950, 1000, 1050)
 
 
 def env_str(name: str, default: str) -> str:
@@ -47,33 +47,24 @@ class BotConfig:
     host: str
     username: str
     password: str
-    max_b_position: int
-    max_hedge_position: int
-    max_option_position: int
-    max_outstanding_qty: int
-    base_quote_size: int
-    take_size: int
-    option_arb_size: int
-    basket_arb_size: int
-    quote_half_spread: int
-    take_edge: int
-    parity_edge: int
-    box_edge: int
-    etf_edge: int
-    inventory_skew_ticks: float
-    swap_fee: int
-    strategy_poll_sec: float
-    reprice_sec: float
-    stale_quote_sec: float
-    hedge_cooldown_sec: float
+    risk_free_rate: float
+    time_to_expiry_years: float
+    max_position_per_option: int
+    max_total_outstanding: int
+    max_trade_qty: int
+    parity_entry_edge: float
+    parity_exit_band: float
+    per_strike_cooldown_sec: float
+    order_ttl_sec: float
+    poll_sec: float
     status_sec: float
 
 
-@dataclass
-class PriceBand:
-    lower: Optional[float] = None
-    upper: Optional[float] = None
-    mid: Optional[float] = None
+@dataclass(frozen=True)
+class OptionPair:
+    strike: int
+    call_symbol: str
+    put_symbol: str
 
 
 @dataclass
@@ -83,8 +74,28 @@ class OrderMeta:
     price: int
     qty: int
     purpose: str
+    strike: int
     created_at: float
     cancel_pending: bool = False
+
+
+@dataclass(frozen=True)
+class ParitySnapshot:
+    strike: int
+    spot: float
+    discounted_strike: float
+    theoretical_cp_diff: float
+    call_bid: Optional[int]
+    call_bid_qty: int
+    call_ask: Optional[int]
+    call_ask_qty: int
+    put_bid: Optional[int]
+    put_bid_qty: int
+    put_ask: Optional[int]
+    put_ask_qty: int
+    mid_gap: Optional[float]
+    long_synth_edge: Optional[float]
+    short_synth_edge: Optional[float]
 
 
 def load_config() -> BotConfig:
@@ -92,26 +103,17 @@ def load_config() -> BotConfig:
         host=env_str("UTC_HOST", "34.197.188.76:3333"),
         username=env_str("UTC_USERNAME", "uiuc"),
         password=env_str("UTC_PASSWORD", "mesa-lynx-octopus"),
-        max_b_position=env_int("B_MAX_POSITION", 50),
-        max_hedge_position=env_int("B_MAX_HEDGE_POSITION", 20),
-        max_option_position=env_int("B_MAX_OPTION_POSITION", 10),
-        max_outstanding_qty=env_int("B_MAX_OUTSTANDING_QTY", 120),
-        base_quote_size=env_int("B_QUOTE_SIZE", 3),
-        take_size=env_int("B_TAKE_SIZE", 4),
-        option_arb_size=env_int("B_OPTION_ARB_SIZE", 1),
-        basket_arb_size=env_int("B_BASKET_ARB_SIZE", 1),
-        quote_half_spread=env_int("B_QUOTE_HALF_SPREAD", 4),
-        take_edge=env_int("B_TAKE_EDGE", 5),
-        parity_edge=env_int("B_PARITY_EDGE", 2),
-        box_edge=env_int("B_BOX_EDGE", 2),
-        etf_edge=env_int("B_ETF_EDGE", 2),
-        inventory_skew_ticks=env_float("B_INVENTORY_SKEW_TICKS", 0.20),
-        swap_fee=env_int("B_SWAP_FEE", 5),
-        strategy_poll_sec=env_float("B_STRATEGY_POLL_SEC", 0.20),
-        reprice_sec=env_float("B_REPRICE_SEC", 0.45),
-        stale_quote_sec=env_float("B_STALE_QUOTE_SEC", 1.50),
-        hedge_cooldown_sec=env_float("B_HEDGE_COOLDOWN_SEC", 0.60),
-        status_sec=env_float("B_STATUS_SEC", 5.00),
+        risk_free_rate=env_float("B_RISK_FREE_RATE", 0.0),
+        time_to_expiry_years=env_float("B_TIME_TO_EXPIRY_YEARS", 1.0),
+        max_position_per_option=env_int("B_MAX_OPTION_POSITION", 6),
+        max_total_outstanding=env_int("B_MAX_TOTAL_OUTSTANDING", 18),
+        max_trade_qty=env_int("B_MAX_TRADE_QTY", 1),
+        parity_entry_edge=env_float("B_PARITY_ENTRY_EDGE", 3.0),
+        parity_exit_band=env_float("B_PARITY_EXIT_BAND", 1.0),
+        per_strike_cooldown_sec=env_float("B_STRIKE_COOLDOWN_SEC", 0.75),
+        order_ttl_sec=env_float("B_ORDER_TTL_SEC", 0.75),
+        poll_sec=env_float("B_POLL_SEC", 0.25),
+        status_sec=env_float("B_STATUS_SEC", 5.0),
     )
 
 
@@ -129,7 +131,7 @@ def live_ask(book) -> tuple[Optional[int], int]:
     return min(levels, key=lambda level: level[0])
 
 
-def mid_price(book, fallback: Optional[float] = None) -> Optional[float]:
+def mid_from_book(book, fallback: Optional[float] = None) -> Optional[float]:
     bid, _ = live_bid(book)
     ask, _ = live_ask(book)
     if bid is not None and ask is not None:
@@ -145,48 +147,34 @@ class MarketBBot(XChangeClient):
     def __init__(self, config: BotConfig):
         super().__init__(config.host, config.username, config.password, silent=False)
         self.cfg = config
-
-        self.option_chain: list[tuple[int, str, str]] = []
+        self.option_pairs: list[OptionPair] = []
         self.last_trade: dict[str, int] = {}
         self.order_meta: dict[str, OrderMeta] = {}
-        self.quote_order_ids: dict[str, Optional[str]] = {"BUY": None, "SELL": None}
-        self.last_quote_refresh = 0.0
+        self.last_action_at: dict[int, float] = {}
         self.last_status = 0.0
-        self.last_hedge_action: dict[str, float] = {}
-        self.last_swap_request = 0.0
-        self.swap_in_flight: Optional[str] = None
         self._book_event = asyncio.Event()
         self._strategy_lock = asyncio.Lock()
-        self._running = False
-        self.discover_option_chain()
+        self.discover_option_pairs()
 
     def now(self) -> float:
         return time.monotonic()
 
-    def symbol_limit(self, symbol: str) -> int:
-        if symbol == "B":
-            return self.cfg.max_b_position
-        if symbol in {"A", "C", "ETF"}:
-            return self.cfg.max_hedge_position
-        if OPTION_RE.match(symbol):
-            return self.cfg.max_option_position
-        return self.cfg.max_hedge_position
-
-    def discover_option_chain(self) -> None:
-        strikes: dict[int, dict[str, str]] = {}
+    def discover_option_pairs(self) -> None:
+        discovered: dict[int, dict[str, str]] = {}
         for symbol in set(self.symbols) | set(self.order_books.keys()):
             match = OPTION_RE.fullmatch(symbol)
             if not match:
                 continue
             side, strike_raw = match.groups()
-            strike = int(strike_raw)
-            strikes.setdefault(strike, {})[side] = symbol
+            discovered.setdefault(int(strike_raw), {})[side] = symbol
 
-        chain: list[tuple[int, str, str]] = []
-        for strike in sorted(strikes):
-            if "C" in strikes[strike] and "P" in strikes[strike]:
-                chain.append((strike, strikes[strike]["C"], strikes[strike]["P"]))
-        self.option_chain = chain
+        pairs: list[OptionPair] = []
+        for strike in DEFAULT_STRIKES:
+            symbols = discovered.get(strike, {})
+            call_symbol = symbols.get("C", f"B_C_{strike}")
+            put_symbol = symbols.get("P", f"B_P_{strike}")
+            pairs.append(OptionPair(strike=strike, call_symbol=call_symbol, put_symbol=put_symbol))
+        self.option_pairs = pairs
 
     def get_book(self, symbol: str):
         return self.order_books.get(symbol)
@@ -203,7 +191,13 @@ class MarketBBot(XChangeClient):
         book = self.get_book(symbol)
         if book is None:
             return self.last_trade.get(symbol)
-        return mid_price(book, fallback=self.last_trade.get(symbol))
+        return mid_from_book(book, fallback=self.last_trade.get(symbol))
+
+    def extract_spot(self) -> Optional[float]:
+        return self.mid("B")
+
+    def discounted_strike(self, strike: int) -> float:
+        return float(strike) * math.exp(-self.cfg.risk_free_rate * self.cfg.time_to_expiry_years)
 
     def position(self, symbol: str) -> int:
         return int(self.positions.get(symbol, 0))
@@ -236,16 +230,16 @@ class MarketBBot(XChangeClient):
     def can_submit(self, symbol: str, side: Side, qty: int) -> bool:
         if qty <= 0:
             return False
-        if self.outstanding_qty() + qty > self.cfg.max_outstanding_qty:
+        if not OPTION_RE.fullmatch(symbol):
             return False
-
+        if self.outstanding_qty() + qty > self.cfg.max_total_outstanding:
+            return False
         projected = self.signed_exposure(symbol) + (qty if side == Side.BUY else -qty)
-        return abs(projected) <= self.symbol_limit(symbol)
+        return abs(projected) <= self.cfg.max_position_per_option
 
-    async def submit_limit(self, symbol: str, qty: int, side: Side, price: int, purpose: str) -> Optional[str]:
+    async def submit_cross(self, symbol: str, side: Side, qty: int, price: int, purpose: str, strike: int) -> Optional[str]:
         if not self.can_submit(symbol, side, qty):
             return None
-
         try:
             order_id = await self.place_order(symbol, int(qty), side, int(price))
         except Exception as exc:
@@ -258,449 +252,314 @@ class MarketBBot(XChangeClient):
             price=int(price),
             qty=int(qty),
             purpose=purpose,
+            strike=int(strike),
             created_at=self.now(),
         )
-        if purpose == "quote" and symbol == "B":
-            self.quote_order_ids["BUY" if side == Side.BUY else "SELL"] = order_id
         return order_id
 
-    async def cancel_if_needed(self, order_id: Optional[str]) -> None:
-        if not order_id:
+    async def cancel_stale_orders(self) -> None:
+        now = self.now()
+        for order_id, meta in list(self.order_meta.items()):
+            if meta.cancel_pending:
+                continue
+            if order_id not in self.open_orders:
+                self.order_meta.pop(order_id, None)
+                continue
+            if now - meta.created_at < self.cfg.order_ttl_sec:
+                continue
+            meta.cancel_pending = True
+            try:
+                await self.cancel_order(order_id)
+            except Exception as exc:
+                meta.cancel_pending = False
+                print(f"[CANCEL-ERROR] {order_id}: {exc}")
+
+    def paired_inventory(self, pair: OptionPair) -> tuple[int, int, int]:
+        call_pos = self.position(pair.call_symbol)
+        put_pos = self.position(pair.put_symbol)
+        synthetic_long = min(max(call_pos, 0), max(-put_pos, 0))
+        synthetic_short = min(max(-call_pos, 0), max(put_pos, 0))
+        imbalance = abs(call_pos + put_pos)
+        return synthetic_long, synthetic_short, imbalance
+
+    def parity_snapshot(self, pair: OptionPair, spot: float) -> Optional[ParitySnapshot]:
+        call_bid, call_bid_qty, call_ask, call_ask_qty = self.top(pair.call_symbol)
+        put_bid, put_bid_qty, put_ask, put_ask_qty = self.top(pair.put_symbol)
+
+        call_mid = self.mid(pair.call_symbol)
+        put_mid = self.mid(pair.put_symbol)
+        discounted = self.discounted_strike(pair.strike)
+        theoretical = spot - discounted
+
+        mid_gap = None
+        if call_mid is not None and put_mid is not None:
+            mid_gap = (call_mid - put_mid) - theoretical
+
+        long_edge = None
+        if call_ask is not None and put_bid is not None:
+            long_edge = theoretical - (call_ask - put_bid)
+
+        short_edge = None
+        if call_bid is not None and put_ask is not None:
+            short_edge = (call_bid - put_ask) - theoretical
+
+        return ParitySnapshot(
+            strike=pair.strike,
+            spot=float(spot),
+            discounted_strike=float(discounted),
+            theoretical_cp_diff=float(theoretical),
+            call_bid=call_bid,
+            call_bid_qty=call_bid_qty,
+            call_ask=call_ask,
+            call_ask_qty=call_ask_qty,
+            put_bid=put_bid,
+            put_bid_qty=put_bid_qty,
+            put_ask=put_ask,
+            put_ask_qty=put_ask_qty,
+            mid_gap=mid_gap,
+            long_synth_edge=long_edge,
+            short_synth_edge=short_edge,
+        )
+
+    def cooldown_ready(self, strike: int) -> bool:
+        return self.now() - self.last_action_at.get(strike, 0.0) >= self.cfg.per_strike_cooldown_sec
+
+    def trade_size_for_open(self, pair: OptionPair, snapshot: ParitySnapshot) -> int:
+        if snapshot.call_ask is None or snapshot.call_bid is None or snapshot.put_ask is None or snapshot.put_bid is None:
+            return 0
+        call_pos = abs(self.position(pair.call_symbol))
+        put_pos = abs(self.position(pair.put_symbol))
+        call_capacity = max(0, self.cfg.max_position_per_option - call_pos)
+        put_capacity = max(0, self.cfg.max_position_per_option - put_pos)
+        size = min(
+            self.cfg.max_trade_qty,
+            call_capacity,
+            put_capacity,
+        )
+        return int(size)
+
+    async def open_synthetic_long(self, pair: OptionPair, snapshot: ParitySnapshot) -> None:
+        if snapshot.call_ask is None or snapshot.put_bid is None:
             return
-        meta = self.order_meta.get(order_id)
-        if meta is None or meta.cancel_pending:
+        size = min(
+            self.trade_size_for_open(pair, snapshot),
+            snapshot.call_ask_qty or self.cfg.max_trade_qty,
+            snapshot.put_bid_qty or self.cfg.max_trade_qty,
+        )
+        if size <= 0:
             return
-        if order_id not in self.open_orders:
+
+        results = await asyncio.gather(
+            self.submit_cross(pair.call_symbol, Side.BUY, size, snapshot.call_ask, "pcp-open-long", pair.strike),
+            self.submit_cross(pair.put_symbol, Side.SELL, size, snapshot.put_bid, "pcp-open-long", pair.strike),
+        )
+        if any(results):
+            self.last_action_at[pair.strike] = self.now()
+            print(
+                f"[TRADE] strike={pair.strike} action=BUY_CALL_SELL_PUT "
+                f"edge={snapshot.long_synth_edge:.2f} spot={snapshot.spot:.2f}"
+            )
+
+    async def open_synthetic_short(self, pair: OptionPair, snapshot: ParitySnapshot) -> None:
+        if snapshot.call_bid is None or snapshot.put_ask is None:
             return
-        meta.cancel_pending = True
-        try:
-            await self.cancel_order(order_id)
-        except Exception as exc:
-            meta.cancel_pending = False
-            print(f"[CANCEL-ERROR] {order_id}: {exc}")
+        size = min(
+            self.trade_size_for_open(pair, snapshot),
+            snapshot.call_bid_qty or self.cfg.max_trade_qty,
+            snapshot.put_ask_qty or self.cfg.max_trade_qty,
+        )
+        if size <= 0:
+            return
+
+        results = await asyncio.gather(
+            self.submit_cross(pair.call_symbol, Side.SELL, size, snapshot.call_bid, "pcp-open-short", pair.strike),
+            self.submit_cross(pair.put_symbol, Side.BUY, size, snapshot.put_ask, "pcp-open-short", pair.strike),
+        )
+        if any(results):
+            self.last_action_at[pair.strike] = self.now()
+            print(
+                f"[TRADE] strike={pair.strike} action=SELL_CALL_BUY_PUT "
+                f"edge={snapshot.short_synth_edge:.2f} spot={snapshot.spot:.2f}"
+            )
+
+    async def close_synthetic_long(self, pair: OptionPair, snapshot: ParitySnapshot, qty: int) -> None:
+        if qty <= 0 or snapshot.call_bid is None or snapshot.put_ask is None:
+            return
+        qty = min(qty, snapshot.call_bid_qty or qty, snapshot.put_ask_qty or qty, self.cfg.max_trade_qty)
+        if qty <= 0:
+            return
+
+        results = await asyncio.gather(
+            self.submit_cross(pair.call_symbol, Side.SELL, qty, snapshot.call_bid, "pcp-close-long", pair.strike),
+            self.submit_cross(pair.put_symbol, Side.BUY, qty, snapshot.put_ask, "pcp-close-long", pair.strike),
+        )
+        if any(results):
+            self.last_action_at[pair.strike] = self.now()
+            print(f"[REDUCE] strike={pair.strike} action=CLOSE_SYNTH_LONG gap={snapshot.mid_gap}")
+
+    async def close_synthetic_short(self, pair: OptionPair, snapshot: ParitySnapshot, qty: int) -> None:
+        if qty <= 0 or snapshot.call_ask is None or snapshot.put_bid is None:
+            return
+        qty = min(qty, snapshot.call_ask_qty or qty, snapshot.put_bid_qty or qty, self.cfg.max_trade_qty)
+        if qty <= 0:
+            return
+
+        results = await asyncio.gather(
+            self.submit_cross(pair.call_symbol, Side.BUY, qty, snapshot.call_ask, "pcp-close-short", pair.strike),
+            self.submit_cross(pair.put_symbol, Side.SELL, qty, snapshot.put_bid, "pcp-close-short", pair.strike),
+        )
+        if any(results):
+            self.last_action_at[pair.strike] = self.now()
+            print(f"[REDUCE] strike={pair.strike} action=CLOSE_SYNTH_SHORT gap={snapshot.mid_gap}")
+
+    async def maybe_reduce_when_normalized(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
+        synthetic_long, synthetic_short, _ = self.paired_inventory(pair)
+        if snapshot.mid_gap is None:
+            return False
+        if abs(snapshot.mid_gap) > self.cfg.parity_exit_band:
+            return False
+        if not self.cooldown_ready(pair.strike):
+            return False
+
+        if synthetic_long > 0:
+            executable_close = None
+            if snapshot.call_bid is not None and snapshot.put_ask is not None:
+                executable_close = snapshot.call_bid - snapshot.put_ask
+            if executable_close is not None and executable_close >= snapshot.theoretical_cp_diff - self.cfg.parity_exit_band:
+                await self.close_synthetic_long(pair, snapshot, synthetic_long)
+                return True
+
+        if synthetic_short > 0:
+            executable_close = None
+            if snapshot.call_ask is not None and snapshot.put_bid is not None:
+                executable_close = snapshot.call_ask - snapshot.put_bid
+            if executable_close is not None and executable_close <= snapshot.theoretical_cp_diff + self.cfg.parity_exit_band:
+                await self.close_synthetic_short(pair, snapshot, synthetic_short)
+                return True
+
+        return False
+
+    async def maybe_reduce_unpaired_inventory(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
+        call_pos = self.position(pair.call_symbol)
+        put_pos = self.position(pair.put_symbol)
+        if snapshot.mid_gap is None:
+            return False
+        if abs(snapshot.mid_gap) > self.cfg.parity_exit_band:
+            return False
+        if not self.cooldown_ready(pair.strike):
+            return False
+
+        if call_pos > 0 and snapshot.call_bid is not None:
+            qty = min(call_pos, snapshot.call_bid_qty or call_pos, self.cfg.max_trade_qty)
+            if qty > 0:
+                order_id = await self.submit_cross(pair.call_symbol, Side.SELL, qty, snapshot.call_bid, "pcp-cleanup", pair.strike)
+                if order_id:
+                    self.last_action_at[pair.strike] = self.now()
+                    return True
+        if call_pos < 0 and snapshot.call_ask is not None:
+            qty = min(abs(call_pos), snapshot.call_ask_qty or abs(call_pos), self.cfg.max_trade_qty)
+            if qty > 0:
+                order_id = await self.submit_cross(pair.call_symbol, Side.BUY, qty, snapshot.call_ask, "pcp-cleanup", pair.strike)
+                if order_id:
+                    self.last_action_at[pair.strike] = self.now()
+                    return True
+        if put_pos > 0 and snapshot.put_bid is not None:
+            qty = min(put_pos, snapshot.put_bid_qty or put_pos, self.cfg.max_trade_qty)
+            if qty > 0:
+                order_id = await self.submit_cross(pair.put_symbol, Side.SELL, qty, snapshot.put_bid, "pcp-cleanup", pair.strike)
+                if order_id:
+                    self.last_action_at[pair.strike] = self.now()
+                    return True
+        if put_pos < 0 and snapshot.put_ask is not None:
+            qty = min(abs(put_pos), snapshot.put_ask_qty or abs(put_pos), self.cfg.max_trade_qty)
+            if qty > 0:
+                order_id = await self.submit_cross(pair.put_symbol, Side.BUY, qty, snapshot.put_ask, "pcp-cleanup", pair.strike)
+                if order_id:
+                    self.last_action_at[pair.strike] = self.now()
+                    return True
+
+        return False
+
+    async def maybe_open_parity_trade(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
+        synthetic_long, synthetic_short, imbalance = self.paired_inventory(pair)
+        if imbalance > 0:
+            return False
+        if not self.cooldown_ready(pair.strike):
+            return False
+        if synthetic_long > 0 or synthetic_short > 0:
+            return False
+
+        if snapshot.long_synth_edge is not None and snapshot.long_synth_edge >= self.cfg.parity_entry_edge:
+            await self.open_synthetic_long(pair, snapshot)
+            return True
+
+        if snapshot.short_synth_edge is not None and snapshot.short_synth_edge >= self.cfg.parity_entry_edge:
+            await self.open_synthetic_short(pair, snapshot)
+            return True
+
+        return False
 
     def prune_order_meta(self) -> None:
-        live_quotes = {order_id for order_id in self.quote_order_ids.values() if order_id}
-        stale_ids = [order_id for order_id in self.order_meta if order_id not in self.open_orders and order_id not in live_quotes]
-        for order_id in stale_ids:
-            self.order_meta.pop(order_id, None)
+        for order_id in list(self.order_meta):
+            if order_id not in self.open_orders:
+                self.order_meta.pop(order_id, None)
 
-    def option_parity_band(self) -> PriceBand:
-        lowers: list[float] = []
-        uppers: list[float] = []
-        mids: list[float] = []
-
-        for strike, call_sym, put_sym in self.option_chain:
-            call_book = self.get_book(call_sym)
-            put_book = self.get_book(put_sym)
-            if call_book is None or put_book is None:
-                continue
-
-            call_bid, _, call_ask, _ = self.top(call_sym)
-            put_bid, _, put_ask, _ = self.top(put_sym)
-            call_mid = self.mid(call_sym)
-            put_mid = self.mid(put_sym)
-
-            if call_bid is not None and put_ask is not None:
-                lowers.append(call_bid - put_ask + strike)
-            if call_ask is not None and put_bid is not None:
-                uppers.append(call_ask - put_bid + strike)
-            if call_mid is not None and put_mid is not None:
-                mids.append(call_mid - put_mid + strike)
-
-        band = PriceBand()
-        if lowers:
-            band.lower = max(lowers)
-        if uppers:
-            band.upper = min(uppers)
-        if mids:
-            band.mid = float(median(mids))
-        elif band.lower is not None and band.upper is not None:
-            band.mid = (band.lower + band.upper) / 2.0
-        return band
-
-    def etf_b_band(self) -> PriceBand:
-        a_bid, _, a_ask, _ = self.top("A")
-        c_bid, _, c_ask, _ = self.top("C")
-        etf_bid, _, etf_ask, _ = self.top("ETF")
-
-        band = PriceBand()
-        if etf_bid is not None and a_ask is not None and c_ask is not None:
-            band.lower = etf_bid - self.cfg.swap_fee - a_ask - c_ask
-        if etf_ask is not None and a_bid is not None and c_bid is not None:
-            band.upper = etf_ask + self.cfg.swap_fee - a_bid - c_bid
-        if band.lower is not None and band.upper is not None:
-            band.mid = (band.lower + band.upper) / 2.0
-        return band
-
-    def combined_b_band(self) -> PriceBand:
-        option_band = self.option_parity_band()
-        etf_band = self.etf_b_band()
-        direct_mid = self.mid("B")
-
-        lowers = [value for value in (option_band.lower, etf_band.lower) if value is not None]
-        uppers = [value for value in (option_band.upper, etf_band.upper) if value is not None]
-        mids = [value for value in (option_band.mid, etf_band.mid, direct_mid) if value is not None]
-
-        band = PriceBand()
-        if lowers:
-            band.lower = max(lowers)
-        if uppers:
-            band.upper = min(uppers)
-        if mids:
-            fair = float(median(mids))
-            if band.lower is not None:
-                fair = max(fair, band.lower)
-            if band.upper is not None:
-                fair = min(fair, band.upper)
-            band.mid = fair
-        elif band.lower is not None and band.upper is not None:
-            band.mid = (band.lower + band.upper) / 2.0
-        return band
-
-    async def direct_b_take(self, band: PriceBand) -> None:
-        bid, bid_qty, ask, ask_qty = self.top("B")
-        if bid is None and ask is None:
-            return
-
-        if ask is not None:
-            buy_target = band.lower if band.lower is not None else band.mid
-            if buy_target is not None and ask <= math.floor(buy_target - self.cfg.take_edge):
-                qty = min(self.cfg.take_size, ask_qty or self.cfg.take_size)
-                await self.submit_limit("B", qty, Side.BUY, ask, "take")
-
-        if bid is not None:
-            sell_target = band.upper if band.upper is not None else band.mid
-            if sell_target is not None and bid >= math.ceil(sell_target + self.cfg.take_edge):
-                qty = min(self.cfg.take_size, bid_qty or self.cfg.take_size)
-                await self.submit_limit("B", qty, Side.SELL, bid, "take")
-
-    def quote_targets(self, fair: float) -> tuple[Optional[int], int, Optional[int], int]:
-        bid, _, ask, _ = self.top("B")
-        inv = self.position("B")
-        reservation = fair - (inv * self.cfg.inventory_skew_ticks)
-        target_bid = math.floor(reservation - self.cfg.quote_half_spread)
-        target_ask = math.ceil(reservation + self.cfg.quote_half_spread)
-
-        if bid is not None:
-            target_bid = max(target_bid, bid)
-        if ask is not None:
-            target_ask = min(target_ask, ask)
-
-        if bid is not None and ask is not None:
-            if ask - bid > 1:
-                target_bid = min(max(target_bid, bid + 1), ask - 1)
-                target_ask = max(min(target_ask, ask - 1), target_bid + 1)
-            else:
-                target_bid = bid
-                target_ask = ask
-
-        if target_bid >= target_ask:
-            target_bid = math.floor(fair) - 1
-            target_ask = math.ceil(fair) + 1
-
-        bid_qty = self.cfg.base_quote_size
-        ask_qty = self.cfg.base_quote_size
-        if inv > 0:
-            bid_qty = max(0, self.cfg.base_quote_size - inv // 4)
-            ask_qty = min(self.cfg.take_size, self.cfg.base_quote_size + max(1, inv // 4))
-        elif inv < 0:
-            ask_qty = max(0, self.cfg.base_quote_size - abs(inv) // 4)
-            bid_qty = min(self.cfg.take_size, self.cfg.base_quote_size + max(1, abs(inv) // 4))
-
-        soft_limit = int(self.cfg.max_b_position * 0.8)
-        if inv >= soft_limit:
-            bid_qty = 0
-        if inv <= -soft_limit:
-            ask_qty = 0
-
-        return int(target_bid), int(bid_qty), int(target_ask), int(ask_qty)
-
-    async def refresh_b_quotes(self, band: PriceBand) -> None:
-        if band.mid is None:
-            await self.cancel_if_needed(self.quote_order_ids["BUY"])
-            await self.cancel_if_needed(self.quote_order_ids["SELL"])
-            return
-
-        now = self.now()
-        if now - self.last_quote_refresh < self.cfg.reprice_sec:
-            return
-
-        desired_bid, bid_qty, desired_ask, ask_qty = self.quote_targets(band.mid)
-        self.last_quote_refresh = now
-
-        await self.sync_quote_side("BUY", desired_bid, bid_qty)
-        await self.sync_quote_side("SELL", desired_ask, ask_qty)
-
-    async def sync_quote_side(self, side_name: str, desired_price: int, desired_qty: int) -> None:
-        current_id = self.quote_order_ids[side_name]
-        current_meta = self.order_meta.get(current_id) if current_id else None
-        side = Side.BUY if side_name == "BUY" else Side.SELL
-
-        if desired_qty <= 0:
-            await self.cancel_if_needed(current_id)
-            return
-
-        if current_id and current_id in self.open_orders and current_meta is not None:
-            age = self.now() - current_meta.created_at
-            if (
-                current_meta.price == desired_price
-                and current_meta.qty == desired_qty
-                and age <= self.cfg.stale_quote_sec
-                and not current_meta.cancel_pending
-            ):
-                return
-            await self.cancel_if_needed(current_id)
-            return
-
-        order_id = await self.submit_limit("B", desired_qty, side, desired_price, "quote")
-        if order_id:
-            self.quote_order_ids[side_name] = order_id
-
-    async def execute_parity_arbs(self) -> None:
-        stock_bid, stock_bid_qty, stock_ask, stock_ask_qty = self.top("B")
-        if stock_bid is None or stock_ask is None:
-            return
-
-        for strike, call_sym, put_sym in self.option_chain:
-            call_bid, call_bid_qty, call_ask, call_ask_qty = self.top(call_sym)
-            put_bid, put_bid_qty, put_ask, put_ask_qty = self.top(put_sym)
-
-            if call_bid is not None and put_ask is not None:
-                conversion_edge = call_bid - put_ask - stock_ask + strike
-                if conversion_edge >= self.cfg.parity_edge:
-                    qty = min(self.cfg.option_arb_size, stock_ask_qty, call_bid_qty, put_ask_qty)
-                    if qty > 0:
-                        await asyncio.gather(
-                            self.submit_limit("B", qty, Side.BUY, stock_ask, "parity"),
-                            self.submit_limit(call_sym, qty, Side.SELL, call_bid, "parity"),
-                            self.submit_limit(put_sym, qty, Side.BUY, put_ask, "parity"),
-                        )
-
-            if call_ask is not None and put_bid is not None:
-                reversal_edge = stock_bid - strike - call_ask + put_bid
-                if reversal_edge >= self.cfg.parity_edge:
-                    qty = min(self.cfg.option_arb_size, stock_bid_qty, call_ask_qty, put_bid_qty)
-                    if qty > 0:
-                        await asyncio.gather(
-                            self.submit_limit("B", qty, Side.SELL, stock_bid, "parity"),
-                            self.submit_limit(call_sym, qty, Side.BUY, call_ask, "parity"),
-                            self.submit_limit(put_sym, qty, Side.SELL, put_bid, "parity"),
-                        )
-
-    async def execute_box_arbs(self) -> None:
-        for index, (k1, c1_sym, p1_sym) in enumerate(self.option_chain):
-            for k2, c2_sym, p2_sym in self.option_chain[index + 1 :]:
-                c1_bid, c1_bid_qty, c1_ask, c1_ask_qty = self.top(c1_sym)
-                c2_bid, c2_bid_qty, c2_ask, c2_ask_qty = self.top(c2_sym)
-                p1_bid, p1_bid_qty, p1_ask, p1_ask_qty = self.top(p1_sym)
-                p2_bid, p2_bid_qty, p2_ask, p2_ask_qty = self.top(p2_sym)
-
-                theoretical = k2 - k1
-
-                if None not in (c1_ask, c2_bid, p2_ask, p1_bid):
-                    buy_cost = c1_ask - c2_bid + p2_ask - p1_bid
-                    buy_edge = theoretical - buy_cost
-                    if buy_edge >= self.cfg.box_edge:
-                        qty = min(
-                            self.cfg.option_arb_size,
-                            c1_ask_qty,
-                            c2_bid_qty,
-                            p2_ask_qty,
-                            p1_bid_qty,
-                        )
-                        if qty > 0:
-                            await asyncio.gather(
-                                self.submit_limit(c1_sym, qty, Side.BUY, c1_ask, "box"),
-                                self.submit_limit(c2_sym, qty, Side.SELL, c2_bid, "box"),
-                                self.submit_limit(p2_sym, qty, Side.BUY, p2_ask, "box"),
-                                self.submit_limit(p1_sym, qty, Side.SELL, p1_bid, "box"),
-                            )
-
-                if None not in (c1_bid, c2_ask, p2_bid, p1_ask):
-                    sell_net = c1_bid - c2_ask + p2_bid - p1_ask
-                    sell_edge = sell_net - theoretical
-                    if sell_edge >= self.cfg.box_edge:
-                        qty = min(
-                            self.cfg.option_arb_size,
-                            c1_bid_qty,
-                            c2_ask_qty,
-                            p2_bid_qty,
-                            p1_ask_qty,
-                        )
-                        if qty > 0:
-                            await asyncio.gather(
-                                self.submit_limit(c1_sym, qty, Side.SELL, c1_bid, "box"),
-                                self.submit_limit(c2_sym, qty, Side.BUY, c2_ask, "box"),
-                                self.submit_limit(p2_sym, qty, Side.SELL, p2_bid, "box"),
-                                self.submit_limit(p1_sym, qty, Side.BUY, p1_ask, "box"),
-                            )
-
-    async def execute_etf_b_arbs(self) -> None:
-        a_bid, a_bid_qty, a_ask, a_ask_qty = self.top("A")
-        b_bid, b_bid_qty, b_ask, b_ask_qty = self.top("B")
-        c_bid, c_bid_qty, c_ask, c_ask_qty = self.top("C")
-        etf_bid, etf_bid_qty, etf_ask, etf_ask_qty = self.top("ETF")
-        etf_band = self.etf_b_band()
-
-        if etf_band.upper is not None and b_bid is not None and b_bid >= etf_band.upper + self.cfg.etf_edge:
-            if None not in (a_bid, c_bid, etf_ask):
-                qty = min(self.cfg.basket_arb_size, a_bid_qty, b_bid_qty, c_bid_qty, etf_ask_qty)
-                if qty > 0:
-                    await asyncio.gather(
-                        self.submit_limit("ETF", qty, Side.BUY, etf_ask, "basket"),
-                        self.submit_limit("A", qty, Side.SELL, a_bid, "basket"),
-                        self.submit_limit("B", qty, Side.SELL, b_bid, "basket"),
-                        self.submit_limit("C", qty, Side.SELL, c_bid, "basket"),
-                    )
-
-        if etf_band.lower is not None and b_ask is not None and b_ask <= etf_band.lower - self.cfg.etf_edge:
-            if None not in (a_ask, c_ask, etf_bid):
-                qty = min(self.cfg.basket_arb_size, a_ask_qty, b_ask_qty, c_ask_qty, etf_bid_qty)
-                if qty > 0:
-                    await asyncio.gather(
-                        self.submit_limit("ETF", qty, Side.SELL, etf_bid, "basket"),
-                        self.submit_limit("A", qty, Side.BUY, a_ask, "basket"),
-                        self.submit_limit("B", qty, Side.BUY, b_ask, "basket"),
-                        self.submit_limit("C", qty, Side.BUY, c_ask, "basket"),
-                    )
-
-    async def maybe_swap_spreads(self) -> None:
-        now = self.now()
-        if self.swap_in_flight is not None or now - self.last_swap_request < self.cfg.hedge_cooldown_sec:
-            return
-
-        to_etf_qty = min(
-            max(0, self.position("A")),
-            max(0, self.position("B")),
-            max(0, self.position("C")),
-            max(0, -self.position("ETF")),
-        )
-        from_etf_qty = min(
-            max(0, self.position("ETF")),
-            max(0, -self.position("A")),
-            max(0, -self.position("B")),
-            max(0, -self.position("C")),
-        )
-
-        if to_etf_qty > 0:
-            self.swap_in_flight = "toETF"
-            self.last_swap_request = now
-            await self.place_swap_order("toETF", int(to_etf_qty))
-            return
-
-        if from_etf_qty > 0:
-            self.swap_in_flight = "fromETF"
-            self.last_swap_request = now
-            await self.place_swap_order("fromETF", int(from_etf_qty))
-
-    async def reduce_unwanted_hedges(self) -> None:
-        for symbol in ("A", "C", "ETF"):
-            pos = self.position(symbol)
-            if pos == 0:
-                continue
-            last_action = self.last_hedge_action.get(symbol, 0.0)
-            if self.now() - last_action < self.cfg.hedge_cooldown_sec:
-                continue
-
-            bid, bid_qty, ask, ask_qty = self.top(symbol)
-            if pos > 0 and bid is not None:
-                qty = min(abs(pos), self.cfg.take_size, bid_qty or self.cfg.take_size)
-                if qty > 0:
-                    self.last_hedge_action[symbol] = self.now()
-                    await self.submit_limit(symbol, qty, Side.SELL, bid, "hedge-flatten")
-            elif pos < 0 and ask is not None:
-                qty = min(abs(pos), self.cfg.take_size, ask_qty or self.cfg.take_size)
-                if qty > 0:
-                    self.last_hedge_action[symbol] = self.now()
-                    await self.submit_limit(symbol, qty, Side.BUY, ask, "hedge-flatten")
-
-    async def reduce_extreme_option_inventory(self) -> None:
-        threshold = max(2, self.cfg.max_option_position // 2)
-        for _, call_sym, put_sym in self.option_chain:
-            for symbol in (call_sym, put_sym):
-                pos = self.position(symbol)
-                if abs(pos) < threshold:
-                    continue
-                last_action = self.last_hedge_action.get(symbol, 0.0)
-                if self.now() - last_action < self.cfg.hedge_cooldown_sec:
-                    continue
-
-                bid, bid_qty, ask, ask_qty = self.top(symbol)
-                if pos > 0 and bid is not None:
-                    qty = min(abs(pos), self.cfg.option_arb_size, bid_qty or self.cfg.option_arb_size)
-                    if qty > 0:
-                        self.last_hedge_action[symbol] = self.now()
-                        await self.submit_limit(symbol, qty, Side.SELL, bid, "option-flatten")
-                elif pos < 0 and ask is not None:
-                    qty = min(abs(pos), self.cfg.option_arb_size, ask_qty or self.cfg.option_arb_size)
-                    if qty > 0:
-                        self.last_hedge_action[symbol] = self.now()
-                        await self.submit_limit(symbol, qty, Side.BUY, ask, "option-flatten")
-
-    async def emergency_b_flatten(self) -> None:
-        pos = self.position("B")
-        soft_limit = int(self.cfg.max_b_position * 0.9)
-        if abs(pos) < soft_limit:
-            return
-        bid, bid_qty, ask, ask_qty = self.top("B")
-        if pos > 0 and bid is not None:
-            qty = min(pos - soft_limit + 1, self.cfg.take_size, bid_qty or self.cfg.take_size)
-            if qty > 0:
-                await self.submit_limit("B", qty, Side.SELL, bid, "emergency")
-        elif pos < 0 and ask is not None:
-            qty = min(abs(pos) - soft_limit + 1, self.cfg.take_size, ask_qty or self.cfg.take_size)
-            if qty > 0:
-                await self.submit_limit("B", qty, Side.BUY, ask, "emergency")
-
-    def print_status(self, band: PriceBand) -> None:
+    def print_status(self, spot: Optional[float]) -> None:
         now = self.now()
         if now - self.last_status < self.cfg.status_sec:
             return
         self.last_status = now
 
-        b_bid, _, b_ask, _ = self.top("B")
-        fair = f"{band.mid:.2f}" if band.mid is not None else "NA"
-        lower = f"{band.lower:.2f}" if band.lower is not None else "NA"
-        upper = f"{band.upper:.2f}" if band.upper is not None else "NA"
+        parts: list[str] = []
+        for pair in self.option_pairs:
+            call_pos = self.position(pair.call_symbol)
+            put_pos = self.position(pair.put_symbol)
+            if call_pos or put_pos:
+                parts.append(f"{pair.strike}:C={call_pos},P={put_pos}")
+
         print(
             "[STATUS]",
-            f"Bpos={self.position('B')}",
-            f"A={self.position('A')}",
-            f"C={self.position('C')}",
-            f"ETF={self.position('ETF')}",
-            f"Bbook={b_bid}/{b_ask}",
-            f"fair={fair}",
-            f"band={lower}..{upper}",
-            f"options={len(self.option_chain)}",
+            f"spot={spot:.2f}" if spot is not None else "spot=NA",
+            f"pairs={len(self.option_pairs)}",
+            f"positions={' | '.join(parts) if parts else 'flat'}",
             f"outstanding={self.outstanding_qty()}",
         )
 
     async def run_strategy(self) -> None:
         async with self._strategy_lock:
             self.prune_order_meta()
-            self.discover_option_chain()
-            band = self.combined_b_band()
+            await self.cancel_stale_orders()
+            self.discover_option_pairs()
 
-            await self.maybe_swap_spreads()
-            await self.execute_parity_arbs()
-            await self.execute_box_arbs()
-            await self.execute_etf_b_arbs()
-            await self.direct_b_take(band)
-            await self.refresh_b_quotes(band)
-            await self.emergency_b_flatten()
-            await self.reduce_unwanted_hedges()
-            await self.reduce_extreme_option_inventory()
-            self.print_status(band)
+            spot = self.extract_spot()
+            if spot is None:
+                return
+
+            for pair in self.option_pairs:
+                snapshot = self.parity_snapshot(pair, spot)
+                if snapshot is None:
+                    continue
+                reduced = await self.maybe_reduce_when_normalized(pair, snapshot)
+                if reduced:
+                    continue
+                cleaned = await self.maybe_reduce_unpaired_inventory(pair, snapshot)
+                if cleaned:
+                    continue
+                await self.maybe_open_parity_trade(pair, snapshot)
+
+            self.print_status(spot)
 
     async def strategy_loop(self) -> None:
         await asyncio.sleep(1.0)
-        print(f"[INIT] host={self.cfg.host} user={self.cfg.username} option_chain={self.option_chain}")
-        self._running = True
+        print(
+            f"[INIT] host={self.cfg.host} user={self.cfg.username} "
+            f"r={self.cfg.risk_free_rate} T={self.cfg.time_to_expiry_years} "
+            f"entry_edge={self.cfg.parity_entry_edge}"
+        )
         while True:
             try:
                 try:
-                    await asyncio.wait_for(self._book_event.wait(), timeout=self.cfg.strategy_poll_sec)
+                    await asyncio.wait_for(self._book_event.wait(), timeout=self.cfg.poll_sec)
                 except TimeoutError:
                     pass
                 self._book_event.clear()
@@ -710,33 +569,24 @@ class MarketBBot(XChangeClient):
                 await asyncio.sleep(0.25)
 
     async def bot_handle_book_update(self, symbol: str) -> None:
-        if symbol == "B" or symbol in {"A", "C", "ETF"} or OPTION_RE.match(symbol):
+        if symbol == "B" or OPTION_RE.fullmatch(symbol):
             self._book_event.set()
 
-    async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int) -> None:
+    async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int):
         self.last_trade[symbol] = int(price)
-        if symbol == "B" or symbol in {"A", "C", "ETF"} or OPTION_RE.match(symbol):
+        if symbol == "B" or OPTION_RE.fullmatch(symbol):
             self._book_event.set()
 
     async def bot_handle_order_fill(self, order_id: str, qty: int, price: int):
         meta = self.order_meta.get(order_id)
         if meta:
-            remaining = int(self.open_orders.get(order_id, [None, 0])[1]) if order_id in self.open_orders else 0
-            if meta.purpose == "quote" and meta.symbol == "B":
-                if remaining <= 0:
-                    key = "BUY" if meta.side == Side.BUY else "SELL"
-                    self.quote_order_ids[key] = None
-            if remaining <= 0:
-                self.order_meta.pop(order_id, None)
             print(f"[FILL] {meta.purpose} {meta.symbol} {meta.side.name} {qty}@{price}")
+            if order_id not in self.open_orders:
+                self.order_meta.pop(order_id, None)
         self._book_event.set()
 
     async def bot_handle_order_rejected(self, order_id: str, reason: str) -> None:
-        meta = self.order_meta.pop(order_id, None)
-        if meta and meta.purpose == "quote" and meta.symbol == "B":
-            key = "BUY" if meta.side == Side.BUY else "SELL"
-            if self.quote_order_ids[key] == order_id:
-                self.quote_order_ids[key] = None
+        self.order_meta.pop(order_id, None)
         print(f"[REJECT] {order_id}: {reason}")
         self._book_event.set()
 
@@ -745,19 +595,13 @@ class MarketBBot(XChangeClient):
         if meta:
             meta.cancel_pending = False
         if success:
-            if meta and meta.purpose == "quote" and meta.symbol == "B":
-                key = "BUY" if meta.side == Side.BUY else "SELL"
-                if self.quote_order_ids[key] == order_id:
-                    self.quote_order_ids[key] = None
             self.order_meta.pop(order_id, None)
         else:
             print(f"[CANCEL-FAIL] {order_id}: {error}")
         self._book_event.set()
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool):
-        print(f"[SWAP] {swap} qty={qty} success={success}")
-        self.swap_in_flight = None
-        self._book_event.set()
+        return
 
     async def bot_handle_news(self, news_release: dict):
         return

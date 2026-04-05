@@ -133,6 +133,31 @@ RAW_NEWS_FIELDNAMES = [
     "note",
 ]
 
+RAW_ALL_NEWS_CALLBACK_FIELDNAMES = [
+    "news_callback_id",
+    "session_id",
+    "run_id",
+    "wall_time_iso",
+    "wall_time_ns",
+    "monotonic_ns",
+    "exchange_tick",
+    "round",
+    "day",
+    "kind",
+    "symbol",
+    "message_type",
+    "structured_subtype",
+    "earnings_asset",
+    "earnings_value",
+    "affected_symbols_json",
+    "raw_content",
+    "normalized_content",
+    "kept_in_raw_news_events",
+    "kept_news_id",
+    "drop_reason",
+    "note",
+]
+
 DERIVED_FIELDNAMES = [
     "derived_row_id",
     "source_event_type",
@@ -225,6 +250,7 @@ class MarketResearchLogger(BaseXChangeClient):  # type: ignore[misc, valid-type]
         self.run_id = uuid.uuid4().hex
         self.event_index = 0
         self.news_index = 0
+        self.news_callback_index = 0
         self.derived_row_index = 0
         self.latest_exchange_tick: int | None = None
         self.latest_known_eps_by_asset: dict[str, float] = {}
@@ -257,6 +283,10 @@ class MarketResearchLogger(BaseXChangeClient):  # type: ignore[misc, valid-type]
             for symbol in self.monitored_symbols
         }
         self.news_writer = AppendSafeCsvWriter(run_dir / "raw_news_events.csv", RAW_NEWS_FIELDNAMES)
+        self.all_news_callbacks_writer = AppendSafeCsvWriter(
+            run_dir / "raw_all_news_callbacks.csv",
+            RAW_ALL_NEWS_CALLBACK_FIELDNAMES,
+        )
         self.derived_writer = AppendSafeCsvWriter(run_dir / "derived_feature_rows.csv", DERIVED_FIELDNAMES)
 
     async def start(self) -> None:
@@ -295,6 +325,7 @@ class MarketResearchLogger(BaseXChangeClient):  # type: ignore[misc, valid-type]
         for writer in self.trade_writers_by_symbol.values():
             writer.close()
         self.news_writer.close()
+        self.all_news_callbacks_writer.close()
         self.derived_writer.close()
 
     def run_post_analysis(self) -> None:
@@ -338,6 +369,10 @@ class MarketResearchLogger(BaseXChangeClient):  # type: ignore[misc, valid-type]
     def _next_event_index(self) -> int:
         self.event_index += 1
         return self.event_index
+
+    def _next_news_callback_id(self) -> str:
+        self.news_callback_index += 1
+        return f"{self.session_id}-news-callback-{self.news_callback_index}"
 
     def _next_news_id(self) -> str:
         self.news_index += 1
@@ -645,17 +680,45 @@ class MarketResearchLogger(BaseXChangeClient):  # type: ignore[misc, valid-type]
 
     async def bot_handle_news(self, news_release: dict) -> None:
         self.latest_exchange_tick = news_release.get("tick")
-        affected_symbols, note = self._affected_symbols_for_news(news_release)
-        if not affected_symbols:
-            return
 
         now_ns = time.monotonic_ns()
         wall_iso, wall_time_ns = utc_now()
-        news_id = self._next_news_id()
         new_data = news_release.get("new_data", {})
+        message_type = new_data.get("type")
         structured_subtype = new_data.get("structured_subtype")
         earnings_asset = new_data.get("asset") if structured_subtype == "earnings" else None
         earnings_value = float(new_data.get("value")) if structured_subtype == "earnings" and new_data.get("value") is not None else None
+        raw_content: str | None = None
+        normalized_content = json.dumps(new_data, sort_keys=True, separators=(",", ":"))
+        if news_release["kind"] == "unstructured":
+            raw_content = new_data.get("content")
+
+        affected_symbols, note = self._affected_symbols_for_news(news_release)
+        news_callback_id = self._next_news_callback_id()
+        debug_row = {
+            "news_callback_id": news_callback_id,
+            **self._common_state(now_ns=now_ns, wall_iso=wall_iso, wall_time_ns=wall_time_ns),
+            "kind": news_release["kind"],
+            "symbol": news_release.get("symbol"),
+            "message_type": message_type,
+            "structured_subtype": structured_subtype,
+            "earnings_asset": earnings_asset,
+            "earnings_value": earnings_value,
+            "affected_symbols_json": json.dumps(sorted(affected_symbols), separators=(",", ":")),
+            "raw_content": raw_content,
+            "normalized_content": normalized_content,
+            "kept_in_raw_news_events": bool(affected_symbols),
+            "kept_news_id": None,
+            "drop_reason": None if affected_symbols else note,
+            "note": note,
+        }
+        if not affected_symbols:
+            self.all_news_callbacks_writer.write_row(debug_row)
+            return
+
+        news_id = self._next_news_id()
+        debug_row["kept_news_id"] = news_id
+        self.all_news_callbacks_writer.write_row(debug_row)
 
         previous_eps = self.latest_known_eps_by_asset.get(earnings_asset) if earnings_asset else None
         new_eps = previous_eps
@@ -665,11 +728,6 @@ class MarketResearchLogger(BaseXChangeClient):  # type: ignore[misc, valid-type]
 
         for symbol in affected_symbols:
             self.last_news_by_symbol[symbol] = {"news_id": news_id, "monotonic_ns": now_ns}
-
-        raw_content: str | None = None
-        normalized_content = json.dumps(new_data, sort_keys=True, separators=(",", ":"))
-        if news_release["kind"] == "unstructured":
-            raw_content = new_data.get("content")
 
         fair_before = None
         fair_after = None
