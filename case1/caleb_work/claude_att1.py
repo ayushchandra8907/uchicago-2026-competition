@@ -68,8 +68,10 @@ MAX_OUTSTANDING_VOLUME = 200
 MAX_ABSOLUTE_POSITION = 100
 
 # ---- Avellaneda-Stoikov parameters ----
+# NOTE: Time is normalized to [0,1] (fraction of round remaining).
+# Sigma is in dollars-per-sqrt(round).  All A-S terms are consistent.
 GAMMA = 0.1               # Risk aversion (tune: higher = tighter inventory, lower profit)
-SIGMA_DEFAULT = 2.0        # Default volatility if not enough data
+SIGMA_DEFAULT = 5.0        # Default per-round dollar volatility (~$100 stock, ~5% per round)
 SIGMA_WINDOW = 60          # Rolling window size for realized vol estimation
 MM_QUOTE_SIZE = 5          # Size of each market-making quote
 MM_REFRESH_INTERVAL = 0.5  # Seconds between quote refreshes
@@ -86,7 +88,8 @@ ARB_SIZE = 5                # Size of arb trades
 SECONDS_PER_DAY = 90
 DAYS_PER_ROUND = 10
 TICKS_PER_SECOND = 5
-TOTAL_SECONDS_PER_ROUND = SECONDS_PER_DAY * DAYS_PER_ROUND
+TOTAL_SECONDS_PER_ROUND = SECONDS_PER_DAY * DAYS_PER_ROUND  # 900
+TOTAL_TICKS_PER_ROUND = TICKS_PER_SECOND * TOTAL_SECONDS_PER_ROUND  # 4500
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -94,16 +97,20 @@ TOTAL_SECONDS_PER_ROUND = SECONDS_PER_DAY * DAYS_PER_ROUND
 # ═══════════════════════════════════════════════════════════════════
 
 def best_bid(order_book) -> Optional[float]:
-    """Return the highest bid price, or None if book is empty."""
+    """Return the highest bid price, or None if book is empty.
+    Filters out stale zero-quantity levels."""
     if order_book.bids:
-        return max(order_book.bids.keys())
+        live = [px for px, qty in order_book.bids.items() if qty and qty > 0]
+        return max(live) if live else None
     return None
 
 
 def best_ask(order_book) -> Optional[float]:
-    """Return the lowest ask price, or None if book is empty."""
+    """Return the lowest ask price, or None if book is empty.
+    Filters out stale zero-quantity levels."""
     if order_book.asks:
-        return min(order_book.asks.keys())
+        live = [px for px, qty in order_book.asks.items() if qty and qty > 0]
+        return min(live) if live else None
     return None
 
 
@@ -137,12 +144,7 @@ class BStockBot(XChangeClient):
     """
 
     def __init__(self, host, username, password):
-        # Collect all symbols we need to track
-        all_symbols = [STOCK_SYMBOL]
-        for strike, call_sym, put_sym in OPTION_STRIKES:
-            all_symbols.extend([call_sym, put_sym])
-
-        super().__init__(host, username, password, silent=True, symbols=all_symbols)
+        super().__init__(host, username, password)
 
         # ---- Strategy state ----
         self.fair_value: Optional[float] = None       # Option-implied fair value Ŝ
@@ -161,6 +163,10 @@ class BStockBot(XChangeClient):
         self.total_arb_profit: float = 0.0
         self.total_mm_fills: int = 0
         self.total_convergence_trades: int = 0
+
+        # ---- Throttle counters ----
+        self._tick_counter: int = 0          # counts book updates
+        self._sigma_update_freq: int = 10    # recompute sigma every N ticks
 
     # ───────────────────────────────────────────────────────────
     # FAIR VALUE COMPUTATION
@@ -207,54 +213,68 @@ class BStockBot(XChangeClient):
 
     def update_sigma(self):
         """
-        Update volatility estimate from recent tick-to-tick returns.
-        Uses realized vol from B's stock price history.
+        Update volatility estimate from recent tick-to-tick log returns.
+
+        Since time_remaining() is normalized to [0,1], sigma must be the
+        per-ROUND dollar standard deviation so that  gamma * sigma^2 * T
+        produces a dollar-scale reservation price adjustment.
+
+        Scaling:
+          sigma_per_tick (in $)  =  std(log returns) * current_price
+          sigma_per_round (in $) =  sigma_per_tick * sqrt(total_ticks_per_round)
         """
         if len(self.price_history) < 5:
             self.sigma = SIGMA_DEFAULT
             return
 
         prices = list(self.price_history)
-        returns = []
+        log_returns = []
         for i in range(1, len(prices)):
-            if prices[i - 1] > 0:
-                ret = (prices[i] - prices[i - 1]) / prices[i - 1]
-                returns.append(ret)
+            if prices[i - 1] > 0 and prices[i] > 0:
+                log_returns.append(math.log(prices[i] / prices[i - 1]))
 
-        if len(returns) < 3:
+        if len(log_returns) < 3:
             self.sigma = SIGMA_DEFAULT
             return
 
-        mean_r = sum(returns) / len(returns)
-        var_r = sum((r - mean_r) ** 2 for r in returns) / len(returns)
-        std_r = math.sqrt(var_r) if var_r > 0 else 0.001
+        # Realized variance: sum-of-squared-returns (no mean subtraction
+        # needed — at tick frequency the drift is negligible)
+        realized_var = sum(r * r for r in log_returns) / len(log_returns)
+        std_r = math.sqrt(realized_var) if realized_var > 0 else 0.001
 
-        # Scale to per-second volatility (each tick is 0.2 seconds)
-        # then to the price level
         current_price = prices[-1] if prices[-1] > 0 else 100
-        self.sigma = max(std_r * current_price * math.sqrt(TICKS_PER_SECOND), 0.5)
+
+        # Scale from per-tick return vol → per-round dollar vol
+        self.sigma = max(std_r * current_price * math.sqrt(TOTAL_TICKS_PER_ROUND), 1.0)
 
     # ───────────────────────────────────────────────────────────
     # TIME MANAGEMENT
     # ───────────────────────────────────────────────────────────
 
     def time_remaining(self) -> float:
-        """Estimate seconds remaining in current round."""
+        """Fraction of round remaining, normalized to [0, 1].
+
+        Must be normalized so the A-S terms  gamma * sigma^2 * T  produce
+        dollar-scale adjustments rather than exploding with raw seconds.
+        """
         elapsed = time.time() - self.round_start_time
         remaining = TOTAL_SECONDS_PER_ROUND - elapsed
-        return max(remaining, 1.0)  # Floor at 1 to avoid division by zero
+        return max(remaining / TOTAL_SECONDS_PER_ROUND, 0.001)
 
     def effective_gamma(self) -> float:
         """
         Increase risk aversion as round approaches end.
         Encourages inventory flattening near settlement.
+
+        time_remaining() is normalized to [0, 1].
+        1 day = 1/10 of round = 0.1 in normalized time.
         """
-        remaining = self.time_remaining()
-        # In the last 90 seconds (last day), ramp up gamma 3x
-        if remaining < SECONDS_PER_DAY:
+        t_frac = self.time_remaining()
+        # Last day (< 10% of round remaining): ramp gamma 3x
+        if t_frac < 0.10:
             return GAMMA * 3.0
-        # In the last 2 days, ramp up 1.5x
-        elif remaining < SECONDS_PER_DAY * 2:
+        # Last 2 days (< 20% remaining): ramp gamma 1.5x
+        elif t_frac < 0.20:
             return GAMMA * 1.5
         return GAMMA
 
@@ -285,8 +305,9 @@ class BStockBot(XChangeClient):
             return False
 
         # Check outstanding volume
+        # open_orders values are order objects — use getattr for safe qty access
         outstanding = sum(
-            order[1]  # remaining qty
+            getattr(order, 'qty', 0)
             for order in self.open_orders.values()
         )
         if outstanding + qty > MAX_OUTSTANDING_VOLUME:
@@ -425,15 +446,8 @@ class BStockBot(XChangeClient):
 
                 # Cost to SELL box: sell C_K1 at bid, buy C_K2 at ask,
                 #                   sell P_K2 at bid, buy P_K1 at ask
-                sell_box_revenue = c1_bb - c2_ba + p1_ba  # wait, let me redo
-                # Revenue from selling box = sell C_K1 bid + buy C_K2 ask
-                #   + sell P_K2 bid + buy P_K1 ask
-                # Actually: sell box means take opposite of buy box
-                sell_box_revenue = c1_bb - c2_ba + p1_bb - p2_ba
-                # We receive sell_box_revenue now, pay back theoretical_value at expiry
-                # Wait — with cash settlement, selling the box means:
-                # sell C_K1 (receive c1_bb), buy C_K2 (pay c2_ba),
-                # sell P_K2 (receive p2_bb), buy P_K1 (pay p1_ba)
+                # Sell box: sell C_K1 (receive c1_bb), buy C_K2 (pay c2_ba),
+                #           sell P_K2 (receive p2_bb), buy P_K1 (pay p1_ba)
                 sell_box_net = c1_bb - c2_ba + p2_bb - p1_ba
                 sell_box_profit = sell_box_net - theoretical_value
 
@@ -542,6 +556,10 @@ class BStockBot(XChangeClient):
         """
         If B's stock mid-price deviates significantly from the
         option-implied fair value, trade aggressively toward convergence.
+
+        Critical fix: check the actual edge AFTER crossing the spread,
+        not just the deviation from mid.  If deviation=2.0 but spread=3.0
+        you'd lose money buying at the ask.
         """
         if self.fair_value is None:
             return
@@ -550,36 +568,32 @@ class BStockBot(XChangeClient):
         if stock_book is None:
             return
 
-        stock_mid = mid_price(stock_book)
-        if stock_mid is None:
+        stock_bb = best_bid(stock_book)
+        stock_ba = best_ask(stock_book)
+        if stock_bb is None or stock_ba is None:
             return
 
-        deviation = self.fair_value - stock_mid
+        # Stock is cheap relative to options → buy at ask
+        # Actual edge = fair_value - ask_price  (what we pay to cross)
+        buy_edge = self.fair_value - stock_ba
+        if buy_edge > CONVERGENCE_THRESHOLD:
+            size = min(CONVERGENCE_SIZE, MAX_ORDER_SIZE)
+            if self.can_place_order(STOCK_SYMBOL, size, Side.BUY):
+                print(f"[CONV] BUY B: ask={stock_ba}, "
+                      f"fair={self.fair_value:.1f}, edge={buy_edge:.2f}")
+                await self.place_order(STOCK_SYMBOL, size, Side.BUY, int(stock_ba))
+                self.total_convergence_trades += 1
 
-        if abs(deviation) < CONVERGENCE_THRESHOLD:
-            return
-
-        # Stock is cheap relative to options → buy stock
-        if deviation > CONVERGENCE_THRESHOLD:
-            stock_ba = best_ask(stock_book)
-            if stock_ba is not None:
-                size = min(CONVERGENCE_SIZE, MAX_ORDER_SIZE)
-                if self.can_place_order(STOCK_SYMBOL, size, Side.BUY):
-                    print(f"[CONV] BUY B: stock_mid={stock_mid:.1f}, "
-                          f"fair={self.fair_value:.1f}, dev={deviation:.2f}")
-                    await self.place_order(STOCK_SYMBOL, size, Side.BUY, int(stock_ba))
-                    self.total_convergence_trades += 1
-
-        # Stock is expensive relative to options → sell stock
-        elif deviation < -CONVERGENCE_THRESHOLD:
-            stock_bb = best_bid(stock_book)
-            if stock_bb is not None:
-                size = min(CONVERGENCE_SIZE, MAX_ORDER_SIZE)
-                if self.can_place_order(STOCK_SYMBOL, size, Side.SELL):
-                    print(f"[CONV] SELL B: stock_mid={stock_mid:.1f}, "
-                          f"fair={self.fair_value:.1f}, dev={deviation:.2f}")
-                    await self.place_order(STOCK_SYMBOL, size, Side.SELL, int(stock_bb))
-                    self.total_convergence_trades += 1
+        # Stock is expensive relative to options → sell at bid
+        # Actual edge = bid_price - fair_value  (what we receive minus fair)
+        sell_edge = stock_bb - self.fair_value
+        if sell_edge > CONVERGENCE_THRESHOLD:
+            size = min(CONVERGENCE_SIZE, MAX_ORDER_SIZE)
+            if self.can_place_order(STOCK_SYMBOL, size, Side.SELL):
+                print(f"[CONV] SELL B: bid={stock_bb}, "
+                      f"fair={self.fair_value:.1f}, edge={sell_edge:.2f}")
+                await self.place_order(STOCK_SYMBOL, size, Side.SELL, int(stock_bb))
+                self.total_convergence_trades += 1
 
     # ───────────────────────────────────────────────────────────
     # CALLBACK HANDLERS
@@ -602,12 +616,15 @@ class BStockBot(XChangeClient):
         )
 
         if symbol == STOCK_SYMBOL or is_option_update:
+            self._tick_counter += 1
+
             new_fv = self.compute_option_implied_fair_value()
             if new_fv is not None:
                 self.fair_value = new_fv
 
-            # Update sigma periodically
-            self.update_sigma()
+            # Update sigma periodically (not every tick — expensive and noisy)
+            if self._tick_counter % self._sigma_update_freq == 0:
+                self.update_sigma()
 
             # Check arb opportunities (highest priority — run on every update)
             await self.check_pcp_arb()
@@ -616,26 +633,31 @@ class BStockBot(XChangeClient):
             # Check convergence trades
             await self.check_convergence()
 
-    async def bot_handle_trade_msg(self, symbol: str, price: float, qty: int):
+    async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int):
         """
         React to trade prints — look for smart money signals.
         Large trades far from fair value may indicate informed flow.
+
+        Case packet warns: "some 'smart' and 'dumb' money bots on the
+        exchange."  We must be conservative here — a large trade at a
+        bad price is more likely to be dumb money.  Only nudge by a
+        tiny amount to avoid being gamed, and cap cumulative drift
+        away from the PCP-derived fair value.
         """
         if symbol != STOCK_SYMBOL or self.fair_value is None:
             return
 
         deviation = price - self.fair_value
 
-        # If a large trade prints significantly away from our fair value,
-        # shade our fair value slightly in that direction
-        if qty >= 20 and abs(deviation) > 1.0:
-            # Nudge fair value 10% of the way toward the trade price
-            adjustment = deviation * 0.10
+        # Only react to very large trades well away from fair value
+        if qty >= 30 and abs(deviation) > 2.0:
+            # Tiny 3% nudge — the PCP oracle is our primary source of truth
+            adjustment = deviation * 0.03
             self.fair_value += adjustment
             print(f"[SMART] Large trade at {price} (qty={qty}), "
                   f"nudged fair value by {adjustment:.2f} to {self.fair_value:.2f}")
 
-    async def bot_handle_order_fill(self, order_id: str, qty: int, price: float):
+    async def bot_handle_order_fill(self, order_id: str, qty: int, price: int):
         """Track fills for logging and inventory awareness."""
         # Check if this was a market-making fill
         if order_id == self.mm_bid_order_id or order_id == self.mm_ask_order_id:
@@ -654,9 +676,13 @@ class BStockBot(XChangeClient):
         elif order_id == self.mm_ask_order_id:
             self.mm_ask_order_id = None
 
+    async def bot_handle_swap_response(self, swap: str, qty: int, success: bool):
+        """Handle ETF swap responses (required by exchange)."""
+        pass
+
     async def bot_handle_cancel_response(self, order_id: str,
                                           success: bool,
-                                          error: Optional[str]):
+                                          error: Optional[str] = None):
         """Track cancel results."""
         if not success and error:
             # Order may have already been filled — that's fine
