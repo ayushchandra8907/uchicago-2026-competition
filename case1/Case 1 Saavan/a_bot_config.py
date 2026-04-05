@@ -20,6 +20,7 @@ class ExchangeConfig:
 class AConfig:
     initial_multiplier: float | None = None
     initial_fair_value: int | None = None
+    recover_pricing_state: bool = False
     startup_assume_fresh_round: bool = True
     pre_news_pullback_ms: int = 4_000
     calibration_min_delay_ms: int = 5_000
@@ -29,22 +30,33 @@ class AConfig:
     calibration_tolerance_fraction: float = 0.10
     calibration_min_tolerance_fraction: float = 0.03
     candidate_confirmations: int = 2
+    discovery_quote_size: int = 1
+    discovery_max_position: int = 6
+    discovery_half_spread_ticks: int = 6
     news_caution_quote_size: int = 1
     news_caution_max_position: int = 8
-    news_caution_half_spread_ticks: int = 5
+    news_caution_half_spread_ticks: int = 6
     steady_half_spread_ticks: int = 1
-    steady_take_min_edge: int = 1
+    steady_take_min_edge: int = 2
+    steady_take_large_inventory_edge: int = 4
     opening_quote_size: int = 1
     opening_max_position: int = 8
     opening_half_spread_ticks: int = 4
     opening_min_book_spread: int = 10
-    steady_quote_size: int = 2
-    steady_max_position: int = 24
+    steady_quote_size: int = 3
+    steady_max_position: int = 32
     steady_inventory_skew: float = 0.75
+    steady_take_inventory_guard: int = 8
+    steady_passive_reduce_start: int = 8
+    steady_passive_reduce_full: int = 20
     unwind_inventory_skew: float = 1.50
     unwind_flatten_threshold: int = 2
+    unwind_entry_position: int = 24
+    unwind_exit_position: int = 12
+    unwind_aggressive_entry: int = 24
+    unwind_aggressive_exit: int = 16
     shock_quote_size: int = 12
-    shock_max_position: int = 80
+    shock_max_position: int = 100
     shock_window_ms: int = 3_000
     shock_take_fraction: float = 0.25
     shock_take_min_edge: int = 4
@@ -69,11 +81,22 @@ class BotPaths:
 
 
 @dataclass(frozen=True)
+class TraceConfig:
+    trace_enabled: bool = False
+    trace_root: Path | None = None
+    trace_snapshot_interval_ms: int = 500
+    trace_book_depth_levels: int = 10
+    trace_markout_windows_ms: tuple[int, ...] = (250, 1_000, 5_000)
+    trace_write_summary_on_shutdown: bool = True
+
+
+@dataclass(frozen=True)
 class BotConfig:
     exchange: ExchangeConfig
     market_a: AConfig
     risk: RiskConfig
     paths: BotPaths
+    trace: TraceConfig
     trading_enabled: bool = True
     trading_disabled_reason: str | None = None
 
@@ -121,6 +144,24 @@ def _optional_bool(name: str, default: bool) -> bool:
     raise ConfigError(f"Environment variable {name} must be a boolean.")
 
 
+def _optional_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    parts = []
+    for item in value.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        try:
+            parts.append(int(stripped))
+        except ValueError as exc:
+            raise ConfigError(f"Environment variable {name} must be a comma-separated list of integers.") from exc
+    if not parts:
+        raise ConfigError(f"Environment variable {name} must include at least one integer.")
+    return tuple(parts)
+
+
 def load_bot_config(
     base_dir: str | Path,
     *,
@@ -144,6 +185,14 @@ def load_bot_config(
     else:
         journal_path = base_path / "runtime" / "a_bot_journal.jsonl"
 
+    trace_root_env = os.getenv("TRACE_ROOT")
+    if trace_root_env and trace_root_env.strip():
+        trace_root = Path(trace_root_env).expanduser()
+        if not trace_root.is_absolute():
+            trace_root = (base_path / trace_root).resolve()
+    else:
+        trace_root = base_path / "analysis_runs"
+
     return BotConfig(
         exchange=ExchangeConfig(
             host=host,
@@ -153,6 +202,7 @@ def load_bot_config(
         market_a=AConfig(
             initial_multiplier=_optional_float("A_INITIAL_MULTIPLIER", default=default_initial_multiplier),
             initial_fair_value=_optional_int("A_INITIAL_FAIR_VALUE", default_initial_fair_value),
+            recover_pricing_state=_optional_bool("A_RECOVER_PRICING_STATE", False),
             startup_assume_fresh_round=_optional_bool("A_STARTUP_ASSUME_FRESH_ROUND", True),
             pre_news_pullback_ms=_optional_int("A_PRE_NEWS_PULLBACK_MS", 4_000) or 4_000,
             calibration_min_delay_ms=_optional_int("A_CALIBRATION_MIN_DELAY_MS", 5_000) or 5_000,
@@ -162,22 +212,33 @@ def load_bot_config(
             calibration_tolerance_fraction=_optional_float("A_CALIBRATION_TOLERANCE_FRACTION", 0.10) or 0.10,
             calibration_min_tolerance_fraction=_optional_float("A_CALIBRATION_MIN_TOLERANCE_FRACTION", 0.03) or 0.03,
             candidate_confirmations=_optional_int("A_CANDIDATE_CONFIRMATIONS", 2) or 2,
+            discovery_quote_size=_optional_int("A_DISCOVERY_QUOTE_SIZE", 1) or 1,
+            discovery_max_position=_optional_int("A_DISCOVERY_MAX_POSITION", 6) or 6,
+            discovery_half_spread_ticks=_optional_int("A_DISCOVERY_HALF_SPREAD_TICKS", 6) or 6,
             news_caution_quote_size=_optional_int("A_NEWS_CAUTION_QUOTE_SIZE", 1) or 1,
             news_caution_max_position=_optional_int("A_NEWS_CAUTION_MAX_POSITION", 8) or 8,
-            news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 5) or 5,
+            news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 6) or 6,
             steady_half_spread_ticks=_optional_int("A_STEADY_HALF_SPREAD_TICKS", 1) or 1,
-            steady_take_min_edge=_optional_int("A_STEADY_TAKE_MIN_EDGE", 1) or 1,
+            steady_take_min_edge=_optional_int("A_STEADY_TAKE_MIN_EDGE", 2) or 2,
+            steady_take_large_inventory_edge=_optional_int("A_STEADY_TAKE_LARGE_INVENTORY_EDGE", 4) or 4,
             opening_quote_size=_optional_int("A_OPENING_QUOTE_SIZE", 1) or 1,
             opening_max_position=_optional_int("A_OPENING_MAX_POSITION", 8) or 8,
             opening_half_spread_ticks=_optional_int("A_OPENING_HALF_SPREAD_TICKS", 4) or 4,
             opening_min_book_spread=_optional_int("A_OPENING_MIN_BOOK_SPREAD", 10) or 10,
-            steady_quote_size=_optional_int("A_STEADY_QUOTE_SIZE", 2) or 2,
-            steady_max_position=_optional_int("A_STEADY_MAX_POSITION", 24) or 24,
+            steady_quote_size=_optional_int("A_STEADY_QUOTE_SIZE", 3) or 3,
+            steady_max_position=_optional_int("A_STEADY_MAX_POSITION", 32) or 32,
             steady_inventory_skew=_optional_float("A_STEADY_INVENTORY_SKEW", 0.75) or 0.75,
+            steady_take_inventory_guard=_optional_int("A_STEADY_TAKE_INVENTORY_GUARD", 8) or 8,
+            steady_passive_reduce_start=_optional_int("A_STEADY_PASSIVE_REDUCE_START", 8) or 8,
+            steady_passive_reduce_full=_optional_int("A_STEADY_PASSIVE_REDUCE_FULL", 20) or 20,
             unwind_inventory_skew=_optional_float("A_UNWIND_INVENTORY_SKEW", 1.50) or 1.50,
             unwind_flatten_threshold=_optional_int("A_UNWIND_FLATTEN_THRESHOLD", 2) or 2,
+            unwind_entry_position=_optional_int("A_UNWIND_ENTRY_POSITION", 24) or 24,
+            unwind_exit_position=_optional_int("A_UNWIND_EXIT_POSITION", 12) or 12,
+            unwind_aggressive_entry=_optional_int("A_UNWIND_AGGRESSIVE_ENTRY", 24) or 24,
+            unwind_aggressive_exit=_optional_int("A_UNWIND_AGGRESSIVE_EXIT", 16) or 16,
             shock_quote_size=_optional_int("A_SHOCK_QUOTE_SIZE", 12) or 12,
-            shock_max_position=_optional_int("A_SHOCK_MAX_POSITION", 80) or 80,
+            shock_max_position=_optional_int("A_SHOCK_MAX_POSITION", 100) or 100,
             shock_window_ms=_optional_int("A_SHOCK_WINDOW_MS", 3_000) or 3_000,
             shock_take_fraction=_optional_float("A_SHOCK_TAKE_FRACTION", 0.25) or 0.25,
             shock_take_min_edge=_optional_int("A_SHOCK_TAKE_MIN_EDGE", 4) or 4,
@@ -190,5 +251,13 @@ def load_bot_config(
         paths=BotPaths(
             base_dir=base_path,
             journal_path=journal_path,
+        ),
+        trace=TraceConfig(
+            trace_enabled=_optional_bool("TRACE_ENABLED", False),
+            trace_root=trace_root,
+            trace_snapshot_interval_ms=_optional_int("TRACE_SNAPSHOT_INTERVAL_MS", 500) or 500,
+            trace_book_depth_levels=_optional_int("TRACE_BOOK_DEPTH_LEVELS", 10) or 10,
+            trace_markout_windows_ms=_optional_int_tuple("TRACE_MARKOUT_WINDOWS_MS", (250, 1_000, 5_000)),
+            trace_write_summary_on_shutdown=_optional_bool("TRACE_WRITE_SUMMARY_ON_SHUTDOWN", True),
         ),
     )

@@ -52,22 +52,34 @@ class MarketABotTests(unittest.TestCase):
                 calibration_tolerance_fraction=0.10,
                 calibration_min_tolerance_fraction=0.03,
                 candidate_confirmations=2,
+                discovery_quote_size=1,
+                discovery_max_position=6,
+                discovery_half_spread_ticks=6,
+                recover_pricing_state=False,
                 news_caution_quote_size=1,
                 news_caution_max_position=8,
-                news_caution_half_spread_ticks=5,
+                news_caution_half_spread_ticks=6,
                 steady_half_spread_ticks=1,
-                steady_take_min_edge=1,
+                steady_take_min_edge=2,
+                steady_take_large_inventory_edge=4,
                 opening_quote_size=1,
                 opening_max_position=8,
                 opening_half_spread_ticks=4,
                 opening_min_book_spread=10,
-                steady_quote_size=2,
-                steady_max_position=24,
+                steady_quote_size=3,
+                steady_max_position=32,
                 steady_inventory_skew=0.75,
+                steady_take_inventory_guard=8,
+                steady_passive_reduce_start=8,
+                steady_passive_reduce_full=20,
                 unwind_inventory_skew=1.50,
                 unwind_flatten_threshold=2,
+                unwind_entry_position=24,
+                unwind_exit_position=12,
+                unwind_aggressive_entry=24,
+                unwind_aggressive_exit=16,
                 shock_quote_size=12,
-                shock_max_position=80,
+                shock_max_position=100,
                 shock_window_ms=3_000,
                 shock_take_fraction=0.25,
                 shock_take_min_edge=4,
@@ -290,6 +302,81 @@ class MarketABotTests(unittest.TestCase):
         self.assertGreater(short_inventory.bid.px, neutral.bid.px)
         self.assertGreater(short_inventory.ask.px, neutral.ask.px)
 
+    def test_unwind_uses_hysteresis_before_returning_to_steady_mm(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=45_000)
+
+        strategy.set_inventory(30)
+        self.assertEqual(strategy.compute_quotes(now_ms=45_000).mode, "UNWIND")
+
+        strategy.set_inventory(13)
+        self.assertEqual(strategy.compute_quotes(now_ms=45_100).mode, "UNWIND")
+
+        strategy.set_inventory(12)
+        self.assertEqual(strategy.compute_quotes(now_ms=45_200).mode, "STEADY_MM")
+
+    def test_steady_mode_suppresses_directional_takes_when_inventory_is_loaded(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1090: 10}, asks={1098: 10}), now_ms=45_000)
+        strategy.set_inventory(10)
+        long_inventory_plan = strategy.compute_quotes(now_ms=45_000)
+        self.assertEqual(long_inventory_plan.mode, "STEADY_MM")
+        self.assertEqual(long_inventory_plan.aggressive_actions, ())
+        self.assertIsNotNone(long_inventory_plan.bid)
+        self.assertIsNotNone(long_inventory_plan.ask)
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1102: 10}, asks={1110: 10}), now_ms=45_500)
+        strategy.set_inventory(-10)
+        short_inventory_plan = strategy.compute_quotes(now_ms=45_500)
+        self.assertEqual(short_inventory_plan.mode, "STEADY_MM")
+        self.assertEqual(short_inventory_plan.aggressive_actions, ())
+        self.assertIsNotNone(short_inventory_plan.bid)
+        self.assertIsNotNone(short_inventory_plan.ask)
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1090: 10}, asks={1098: 10}), now_ms=46_000)
+        strategy.set_inventory(15)
+        passive_only_plan = strategy.compute_quotes(now_ms=46_000)
+        self.assertEqual(passive_only_plan.mode, "STEADY_MM")
+        self.assertEqual(passive_only_plan.aggressive_actions, ())
+        self.assertIsNotNone(passive_only_plan.bid)
+        self.assertIsNotNone(passive_only_plan.ask)
+
+    def test_steady_mode_shrinks_inventory_worsening_passive_side(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=45_000)
+
+        strategy.set_inventory(10)
+        long_inventory_plan = strategy.compute_quotes(now_ms=45_000)
+        self.assertEqual(long_inventory_plan.mode, "STEADY_MM")
+        self.assertEqual(long_inventory_plan.bid.qty, 2)
+        self.assertEqual(long_inventory_plan.ask.qty, 3)
+
+        strategy.set_inventory(12)
+        more_loaded_long_plan = strategy.compute_quotes(now_ms=45_100)
+        self.assertEqual(more_loaded_long_plan.bid.qty, 1)
+        self.assertEqual(more_loaded_long_plan.ask.qty, 3)
+
+        strategy.set_inventory(-10)
+        short_inventory_plan = strategy.compute_quotes(now_ms=45_200)
+        self.assertEqual(short_inventory_plan.bid.qty, 3)
+        self.assertEqual(short_inventory_plan.ask.qty, 2)
+
     def test_order_manager_keeps_passive_quote_for_one_tick_move(self) -> None:
         manager = OrderManager(
             symbol="A",
@@ -312,6 +399,32 @@ class MarketABotTests(unittest.TestCase):
         actions = manager.build_actions(plan, now_ms=2_000)
         self.assertEqual(actions.cancels, ())
         self.assertEqual(actions.placements, ())
+
+    def test_unwind_aggression_steps_down_before_unwind_exits(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1100: 10}, asks={1105: 10}), now_ms=45_000)
+
+        strategy.set_inventory(30)
+        self.assertTrue(strategy.unwind_active)
+        self.assertTrue(strategy.unwind_aggressive_active)
+
+        strategy.set_inventory(18)
+        self.assertTrue(strategy.unwind_active)
+        self.assertTrue(strategy.unwind_aggressive_active)
+
+        strategy.set_inventory(16)
+        self.assertTrue(strategy.unwind_active)
+        self.assertFalse(strategy.unwind_aggressive_active)
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1101: 10}, asks={1105: 10}), now_ms=45_100)
+        moderate_unwind_plan = strategy.compute_quotes(now_ms=45_100)
+        self.assertEqual(moderate_unwind_plan.mode, "UNWIND")
+        self.assertEqual(moderate_unwind_plan.aggressive_actions, ())
 
     def test_recovery_blocks_until_restored_order_is_resolved(self) -> None:
         restored = ManagedOrder(

@@ -36,16 +36,20 @@ class BookLevel:
 class BookSnapshot:
     best_bid: BookLevel | None = None
     best_ask: BookLevel | None = None
+    bid_levels: tuple[BookLevel, ...] = ()
+    ask_levels: tuple[BookLevel, ...] = ()
 
     @classmethod
-    def from_order_book(cls, book) -> "BookSnapshot":
+    def from_order_book(cls, book, depth_levels: int = 10) -> "BookSnapshot":
         bids = [(int(px), int(qty)) for px, qty in book.bids.items() if qty > 0]
         asks = [(int(px), int(qty)) for px, qty in book.asks.items() if qty > 0]
         best_bid_level = max(bids, key=lambda level: level[0]) if bids else None
         best_ask_level = min(asks, key=lambda level: level[0]) if asks else None
         best_bid = None if best_bid_level is None else BookLevel(px=best_bid_level[0], qty=best_bid_level[1])
         best_ask = None if best_ask_level is None else BookLevel(px=best_ask_level[0], qty=best_ask_level[1])
-        return cls(best_bid=best_bid, best_ask=best_ask)
+        sorted_bids = tuple(BookLevel(px=px, qty=qty) for px, qty in sorted(bids, key=lambda level: level[0], reverse=True)[:depth_levels])
+        sorted_asks = tuple(BookLevel(px=px, qty=qty) for px, qty in sorted(asks, key=lambda level: level[0])[:depth_levels])
+        return cls(best_bid=best_bid, best_ask=best_ask, bid_levels=sorted_bids, ask_levels=sorted_asks)
 
     @property
     def mid(self) -> float | None:
@@ -59,6 +63,24 @@ class BookSnapshot:
             return None
         return self.best_ask.px - self.best_bid.px
 
+    @property
+    def microprice(self) -> float | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        total_qty = self.best_bid.qty + self.best_ask.qty
+        if total_qty <= 0:
+            return None
+        return ((self.best_ask.px * self.best_bid.qty) + (self.best_bid.px * self.best_ask.qty)) / total_qty
+
+    @property
+    def top_of_book_imbalance(self) -> float | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        total_qty = self.best_bid.qty + self.best_ask.qty
+        if total_qty <= 0:
+            return None
+        return (self.best_bid.qty - self.best_ask.qty) / total_qty
+
 
 @dataclass(frozen=True)
 class DesiredOrder:
@@ -67,6 +89,9 @@ class DesiredOrder:
     qty: int
     aggressive: bool = False
     reason: str = ""
+    intent: str = ""
+    mode_at_submit: str = ""
+    evaluation_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,9 @@ class ManagedOrder:
     aggressive: bool = False
     cancel_pending: bool = False
     restored: bool = False
+    intent: str = ""
+    mode_at_submit: str = ""
+    evaluation_reason: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -100,6 +128,7 @@ class ManagedOrder:
 class CancelCommand:
     order_id: str
     side: SideName
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -109,6 +138,9 @@ class PlaceCommand:
     qty: int
     aggressive: bool
     reason: str
+    intent: str
+    mode_at_submit: str
+    evaluation_reason: str
 
 
 @dataclass(frozen=True)
@@ -318,6 +350,7 @@ class QuoteEngine:
         reason_if_blocked: str,
         shock_direction: int = 0,
         shock_threshold: int | None = None,
+        unwind_aggressive: bool = False,
     ) -> QuotePlan:
         if not can_trade:
             return QuotePlan(mode=mode, bid=None, ask=None, aggressive_actions=(), observe_only=True, reason=reason_if_blocked)
@@ -361,9 +394,64 @@ class QuoteEngine:
             )
 
         if mode == "UNWIND":
-            return self._unwind_quotes(mode, fair_value, inventory, book, buy_exposure, sell_exposure)
+            return self._unwind_quotes(
+                mode,
+                fair_value,
+                inventory,
+                book,
+                buy_exposure,
+                sell_exposure,
+                aggressive_allowed=unwind_aggressive,
+            )
 
         return self._steady_quotes(mode, fair_value, inventory, book, buy_exposure, sell_exposure)
+
+    @staticmethod
+    def _desired(
+        *,
+        side: SideName,
+        px: int,
+        qty: int,
+        aggressive: bool,
+        reason: str,
+        intent: str,
+        mode: ModeName,
+    ) -> DesiredOrder:
+        return DesiredOrder(
+            side=side,
+            px=px,
+            qty=qty,
+            aggressive=aggressive,
+            reason=reason,
+            intent=intent,
+            mode_at_submit=mode,
+            evaluation_reason=reason,
+        )
+
+    def cap_for_mode(self, mode: ModeName) -> int:
+        if mode == "OPENING_MICRO_MM":
+            return self.a_config.opening_max_position
+        if mode == "MULTIPLIER_DISCOVERY":
+            return self.a_config.discovery_max_position
+        if mode == "NEWS_CAUTIOUS_MM":
+            return self.a_config.news_caution_max_position
+        if mode == "POST_EARNINGS_SHOCK":
+            return self.a_config.shock_max_position
+        if mode == "PRE_NEWS_PULLBACK":
+            return 0
+        return self.a_config.steady_max_position
+
+    def allowed_size_for_mode(
+        self,
+        mode: ModeName,
+        inventory: int,
+        buy_exposure: int,
+        sell_exposure: int,
+    ) -> tuple[int, int]:
+        cap = self.cap_for_mode(mode)
+        if cap <= 0:
+            return 0, 0
+        return self._allowed_size(inventory, buy_exposure, sell_exposure, cap=cap)
 
     def _opening_quotes(
         self,
@@ -392,21 +480,25 @@ class QuoteEngine:
 
         return QuotePlan(
             mode=mode,
-            bid=DesiredOrder(
+            bid=self._desired(
                 side="BUY",
                 px=bid_px,
                 qty=min(self.a_config.opening_quote_size, allowed_buy),
                 aggressive=False,
                 reason="opening micro-mm bid around live mid",
+                intent="opening_mm",
+                mode=mode,
             )
             if allowed_buy > 0
             else None,
-            ask=DesiredOrder(
+            ask=self._desired(
                 side="SELL",
                 px=ask_px,
                 qty=min(self.a_config.opening_quote_size, allowed_sell),
                 aggressive=False,
                 reason="opening micro-mm ask around live mid",
+                intent="opening_mm",
+                mode=mode,
             )
             if allowed_sell > 0
             else None,
@@ -437,8 +529,21 @@ class QuoteEngine:
                 reason="waiting for a usable A anchor during cautious quoting",
             )
 
-        bid_px = int(floor(anchor - self.a_config.news_caution_half_spread_ticks))
-        ask_px = int(ceil(anchor + self.a_config.news_caution_half_spread_ticks))
+        if mode == "MULTIPLIER_DISCOVERY":
+            half_spread_ticks = self.a_config.discovery_half_spread_ticks
+            quote_size = self.a_config.discovery_quote_size
+            max_position = self.a_config.discovery_max_position
+            intent = "multiplier_discovery_mm"
+            reason = "tiny quotes while the post-earnings multiplier is still settling"
+        else:
+            half_spread_ticks = self.a_config.news_caution_half_spread_ticks
+            quote_size = self.a_config.news_caution_quote_size
+            max_position = self.a_config.news_caution_max_position
+            intent = "news_cautious_mm"
+            reason = "tiny quotes while A-specific news risk is elevated"
+
+        bid_px = int(floor(anchor - half_spread_ticks))
+        ask_px = int(ceil(anchor + half_spread_ticks))
         if book.best_bid is not None:
             bid_px = min(bid_px, book.best_bid.px - 1)
         if book.best_ask is not None:
@@ -450,29 +555,30 @@ class QuoteEngine:
             inventory,
             buy_exposure,
             sell_exposure,
-            cap=self.a_config.news_caution_max_position,
+            cap=max_position,
         )
-        reason = "tiny quotes while A-specific news risk is elevated"
-        if mode == "MULTIPLIER_DISCOVERY":
-            reason = "tiny quotes while the post-earnings multiplier is still settling"
 
         return QuotePlan(
             mode=mode,
-            bid=DesiredOrder(
+            bid=self._desired(
                 side="BUY",
                 px=bid_px,
-                qty=min(self.a_config.news_caution_quote_size, allowed_buy),
+                qty=min(quote_size, allowed_buy),
                 aggressive=False,
                 reason=reason,
+                intent=intent,
+                mode=mode,
             )
             if allowed_buy > 0
             else None,
-            ask=DesiredOrder(
+            ask=self._desired(
                 side="SELL",
                 px=ask_px,
-                qty=min(self.a_config.news_caution_quote_size, allowed_sell),
+                qty=min(quote_size, allowed_sell),
                 aggressive=False,
                 reason=reason,
+                intent=intent,
+                mode=mode,
             )
             if allowed_sell > 0
             else None,
@@ -480,6 +586,25 @@ class QuoteEngine:
             observe_only=False,
             reason="cautious quoting",
         )
+
+    def _steady_passive_qty(self, side: SideName, inventory: int, allowed: int) -> int:
+        if allowed <= 0:
+            return 0
+        qty = min(self.a_config.steady_quote_size, allowed)
+        worsening_side: SideName | None = None
+        if inventory > 0:
+            worsening_side = "BUY"
+        elif inventory < 0:
+            worsening_side = "SELL"
+        if side != worsening_side:
+            return qty
+
+        abs_inventory = abs(inventory)
+        if abs_inventory >= self.a_config.unwind_exit_position or abs_inventory >= self.a_config.steady_passive_reduce_full:
+            return min(1, allowed)
+        if abs_inventory >= self.a_config.steady_passive_reduce_start:
+            return min(max(1, self.a_config.steady_quote_size - 1), allowed)
+        return qty
 
     def _steady_quotes(
         self,
@@ -489,7 +614,7 @@ class QuoteEngine:
         book: BookSnapshot,
         buy_exposure: int,
         sell_exposure: int,
-    ) -> QuotePlan:
+        ) -> QuotePlan:
         aggressive_actions: list[DesiredOrder] = []
         allowed_buy, allowed_sell = self._allowed_size(
             inventory,
@@ -499,24 +624,34 @@ class QuoteEngine:
         )
 
         take_edge = max(self.a_config.steady_take_min_edge, self.a_config.steady_half_spread_ticks)
-        if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - take_edge:
+        if abs(inventory) >= self.a_config.steady_take_inventory_guard:
+            take_edge = max(take_edge, self.a_config.steady_take_large_inventory_edge)
+        allow_aggressive_takes = abs(inventory) < self.a_config.unwind_exit_position
+        can_take_buy = allow_aggressive_takes and inventory < self.a_config.steady_take_inventory_guard
+        can_take_sell = allow_aggressive_takes and inventory > -self.a_config.steady_take_inventory_guard
+
+        if can_take_buy and book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - take_edge:
             aggressive_actions.append(
-                DesiredOrder(
+                self._desired(
                     side="BUY",
                     px=book.best_ask.px,
                     qty=min(self.a_config.steady_quote_size, allowed_buy, book.best_ask.qty),
                     aggressive=True,
                     reason="steady-state buy through stale ask below fair",
+                    intent="steady_take",
+                    mode=mode,
                 )
             )
-        if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + take_edge:
+        if can_take_sell and book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + take_edge:
             aggressive_actions.append(
-                DesiredOrder(
+                self._desired(
                     side="SELL",
                     px=book.best_bid.px,
                     qty=min(self.a_config.steady_quote_size, allowed_sell, book.best_bid.qty),
                     aggressive=True,
                     reason="steady-state sell through stale bid above fair",
+                    intent="steady_take",
+                    mode=mode,
                 )
             )
 
@@ -525,26 +660,32 @@ class QuoteEngine:
         ask_px = int(ceil(reservation + self.a_config.steady_half_spread_ticks))
         bid_px, ask_px = self._clamp_inside_book(bid_px, ask_px, book)
         aggressive_sides = {action.side for action in aggressive_actions}
+        passive_bid_qty = self._steady_passive_qty("BUY", inventory, allowed_buy)
+        passive_ask_qty = self._steady_passive_qty("SELL", inventory, allowed_sell)
 
         return QuotePlan(
             mode=mode,
-            bid=DesiredOrder(
+            bid=self._desired(
                 side="BUY",
                 px=bid_px,
-                qty=min(self.a_config.steady_quote_size, allowed_buy),
+                qty=passive_bid_qty,
                 aggressive=False,
                 reason="steady-state bid around learned fair",
+                intent="steady_mm_passive",
+                mode=mode,
             )
-            if allowed_buy > 0 and "BUY" not in aggressive_sides
+            if passive_bid_qty > 0 and "BUY" not in aggressive_sides
             else None,
-            ask=DesiredOrder(
+            ask=self._desired(
                 side="SELL",
                 px=ask_px,
-                qty=min(self.a_config.steady_quote_size, allowed_sell),
+                qty=passive_ask_qty,
                 aggressive=False,
                 reason="steady-state ask around learned fair",
+                intent="steady_mm_passive",
+                mode=mode,
             )
-            if allowed_sell > 0 and "SELL" not in aggressive_sides
+            if passive_ask_qty > 0 and "SELL" not in aggressive_sides
             else None,
             aggressive_actions=tuple(aggressive_actions),
             observe_only=False,
@@ -577,44 +718,52 @@ class QuoteEngine:
         if shock_direction > 0:
             if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - shock_threshold:
                 aggressive_actions.append(
-                    DesiredOrder(
+                    self._desired(
                         side="BUY",
                         px=book.best_ask.px,
                         qty=min(self.a_config.shock_quote_size, allowed_buy, book.best_ask.qty),
                         aggressive=True,
                         reason="earnings upside shock buy through stale asks",
+                        intent="post_earnings_shock_take",
+                        mode=mode,
                     )
                 )
             if allowed_sell > 0:
                 ask_px = int(ceil(fair_value + half_spread))
                 _, ask_px = self._clamp_inside_book(fair_value - 1, ask_px, book)
-                desired_ask = DesiredOrder(
+                desired_ask = self._desired(
                     side="SELL",
                     px=ask_px,
                     qty=min(self.a_config.shock_quote_size, allowed_sell),
                     aggressive=False,
                     reason="post-earnings ask to unwind long inventory",
+                    intent="post_earnings_shock_unwind",
+                    mode=mode,
                 )
         elif shock_direction < 0:
             if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + shock_threshold:
                 aggressive_actions.append(
-                    DesiredOrder(
+                    self._desired(
                         side="SELL",
                         px=book.best_bid.px,
                         qty=min(self.a_config.shock_quote_size, allowed_sell, book.best_bid.qty),
                         aggressive=True,
                         reason="earnings downside shock sell through stale bids",
+                        intent="post_earnings_shock_take",
+                        mode=mode,
                     )
                 )
             if allowed_buy > 0:
                 bid_px = int(floor(fair_value - half_spread))
                 bid_px, _ = self._clamp_inside_book(bid_px, fair_value + 1, book)
-                desired_bid = DesiredOrder(
+                desired_bid = self._desired(
                     side="BUY",
                     px=bid_px,
                     qty=min(self.a_config.shock_quote_size, allowed_buy),
                     aggressive=False,
                     reason="post-earnings bid to unwind short inventory",
+                    intent="post_earnings_shock_unwind",
+                    mode=mode,
                 )
         else:
             return self._steady_quotes("STEADY_MM", fair_value, inventory, book, buy_exposure, sell_exposure)
@@ -636,6 +785,8 @@ class QuoteEngine:
         book: BookSnapshot,
         buy_exposure: int,
         sell_exposure: int,
+        *,
+        aggressive_allowed: bool,
     ) -> QuotePlan:
         aggressive_actions: list[DesiredOrder] = []
         allowed_buy, allowed_sell = self._allowed_size(
@@ -644,16 +795,26 @@ class QuoteEngine:
             sell_exposure,
             cap=self.a_config.steady_max_position,
         )
+        passive_take_edge = max(self.a_config.steady_take_large_inventory_edge, self.a_config.steady_half_spread_ticks)
 
         if inventory > 0:
-            if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value:
+            if (
+                book.best_bid is not None
+                and allowed_sell > 0
+                and (
+                    (aggressive_allowed and book.best_bid.px >= fair_value)
+                    or (not aggressive_allowed and book.best_bid.px >= fair_value + passive_take_edge)
+                )
+            ):
                 aggressive_actions.append(
-                    DesiredOrder(
+                    self._desired(
                         side="SELL",
                         px=book.best_bid.px,
                         qty=min(self.a_config.steady_quote_size, allowed_sell, book.best_bid.qty),
                         aggressive=True,
                         reason="unwind long inventory into rich bid",
+                        intent="unwind",
+                        mode=mode,
                     )
                 )
             ask_px = int(ceil((fair_value - (self.a_config.unwind_inventory_skew * inventory)) + 1))
@@ -661,12 +822,14 @@ class QuoteEngine:
             return QuotePlan(
                 mode=mode,
                 bid=None,
-                ask=DesiredOrder(
+                ask=self._desired(
                     side="SELL",
                     px=ask_px,
                     qty=min(self.a_config.steady_quote_size, allowed_sell),
                     aggressive=False,
                     reason="unwind ask to reduce long inventory",
+                    intent="unwind",
+                    mode=mode,
                 )
                 if allowed_sell > 0
                 else None,
@@ -676,26 +839,37 @@ class QuoteEngine:
             )
 
         if inventory < 0:
-            if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value:
+            if (
+                book.best_ask is not None
+                and allowed_buy > 0
+                and (
+                    (aggressive_allowed and book.best_ask.px <= fair_value)
+                    or (not aggressive_allowed and book.best_ask.px <= fair_value - passive_take_edge)
+                )
+            ):
                 aggressive_actions.append(
-                    DesiredOrder(
+                    self._desired(
                         side="BUY",
                         px=book.best_ask.px,
                         qty=min(self.a_config.steady_quote_size, allowed_buy, book.best_ask.qty),
                         aggressive=True,
                         reason="unwind short inventory into cheap ask",
+                        intent="unwind",
+                        mode=mode,
                     )
                 )
             bid_px = int(floor((fair_value - (self.a_config.unwind_inventory_skew * inventory)) - 1))
             bid_px, _ = self._clamp_inside_book(bid_px, fair_value + 1, book)
             return QuotePlan(
                 mode=mode,
-                bid=DesiredOrder(
+                bid=self._desired(
                     side="BUY",
                     px=bid_px,
                     qty=min(self.a_config.steady_quote_size, allowed_buy),
                     aggressive=False,
                     reason="unwind bid to reduce short inventory",
+                    intent="unwind",
+                    mode=mode,
                 )
                 if allowed_buy > 0
                 else None,
@@ -753,6 +927,9 @@ class OrderManager:
         now_ms: int,
         aggressive: bool = False,
         restored: bool = False,
+        intent: str = "",
+        mode_at_submit: str = "",
+        evaluation_reason: str = "",
     ) -> ManagedOrder:
         order = ManagedOrder(
             order_id=order_id,
@@ -763,6 +940,9 @@ class OrderManager:
             submitted_ms=now_ms,
             aggressive=aggressive,
             restored=restored,
+            intent=intent,
+            mode_at_submit=mode_at_submit,
+            evaluation_reason=evaluation_reason,
         )
         self.orders[order_id] = order
         self.live_by_side[side] = order_id
@@ -790,6 +970,30 @@ class OrderManager:
         order.cancel_pending = True
         self.last_action_ms[order.side] = now_ms
         return order
+
+    def live_orders_snapshot(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for side in ("BUY", "SELL"):
+            order = self.live_order(side)
+            if order is None:
+                continue
+            rows.append(
+                {
+                    "order_id": order.order_id,
+                    "side": order.side,
+                    "px": order.px,
+                    "qty": order.qty,
+                    "remaining_qty": order.remaining_qty,
+                    "submitted_ms": order.submitted_ms,
+                    "aggressive": order.aggressive,
+                    "cancel_pending": order.cancel_pending,
+                    "restored": order.restored,
+                    "intent": order.intent,
+                    "mode_at_submit": order.mode_at_submit,
+                    "evaluation_reason": order.evaluation_reason,
+                }
+            )
+        return rows
 
     def handle_fill(self, order_id: str, qty: int) -> ManagedOrder | None:
         order = self.orders.get(order_id)
@@ -852,7 +1056,7 @@ class OrderManager:
 
             if live is not None and desired is None:
                 if now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms:
-                    cancels.append(CancelCommand(order_id=live.order_id, side=side))
+                    cancels.append(CancelCommand(order_id=live.order_id, side=side, reason="desired order removed for this side"))
                 continue
 
             if live is not None and desired is not None:
@@ -867,7 +1071,26 @@ class OrderManager:
                     or price_gap >= self.risk.passive_reprice_threshold_ticks
                 )
                 if needs_reprice and now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms:
-                    cancels.append(CancelCommand(order_id=live.order_id, side=side))
+                    cancel_reasons: list[str] = []
+                    if live.remaining_qty != desired.qty:
+                        cancel_reasons.append("qty changed")
+                    if live.aggressive != desired.aggressive:
+                        cancel_reasons.append("aggressiveness changed")
+                    if stale:
+                        cancel_reasons.append("quote became stale")
+                    if price_gap >= self.risk.passive_reprice_threshold_ticks:
+                        cancel_reasons.append(f"desired price moved by {price_gap} ticks")
+                    if live.aggressive:
+                        cancel_reasons.append("existing order is aggressive")
+                    if desired.aggressive:
+                        cancel_reasons.append("new order is aggressive")
+                    cancels.append(
+                        CancelCommand(
+                            order_id=live.order_id,
+                            side=side,
+                            reason=", ".join(cancel_reasons) if cancel_reasons else "reprice",
+                        )
+                    )
                 continue
 
             if live is None and desired is not None:
@@ -879,6 +1102,9 @@ class OrderManager:
                             qty=desired.qty,
                             aggressive=desired.aggressive,
                             reason=desired.reason,
+                            intent=desired.intent,
+                            mode_at_submit=desired.mode_at_submit,
+                            evaluation_reason=desired.evaluation_reason,
                         )
                     )
 
@@ -907,11 +1133,13 @@ class MarketAStrategy:
         recovered_multiplier_confidence: int = 0,
         recovered_fair_value: int | None = None,
         recovered_earnings_value: float | None = None,
+        book_depth_levels: int = 10,
     ):
         starting_fair = recovered_fair_value if recovered_fair_value is not None else a_config.initial_fair_value
         starting_multiplier = recovered_multiplier if recovered_multiplier is not None else a_config.initial_multiplier
         self.a_config = a_config
         self.risk = risk
+        self.book_depth_levels = max(1, book_depth_levels)
         self.valuation = AValuationModel(
             a_config=a_config,
             initial_multiplier=starting_multiplier,
@@ -934,9 +1162,14 @@ class MarketAStrategy:
         self.shock_direction = 0
         self.shock_threshold: int | None = None
         self.shock_target_fair: int | None = None
+        self.last_trade_px: int | None = None
+        self.last_trade_qty: int | None = None
+        self.last_trade_ms: int | None = None
         self.learning_events: list[LearningEvent] = []
         self.recovery_pending: set[str] = set()
         self.recovery_active = False
+        self.unwind_active = False
+        self.unwind_aggressive_active = False
 
         for order in restored_orders:
             self.order_manager.restore_order(order)
@@ -962,6 +1195,7 @@ class MarketAStrategy:
 
     def set_inventory(self, inventory: int) -> None:
         self.inventory = int(inventory)
+        self._refresh_unwind_state()
 
     def drain_learning_events(self) -> list[LearningEvent]:
         events = list(self.learning_events)
@@ -974,7 +1208,7 @@ class MarketAStrategy:
     def on_book_update_at(self, symbol: str, book, now_ms: int) -> bool:
         if symbol != "A":
             return False
-        self.book = BookSnapshot.from_order_book(book)
+        self.book = BookSnapshot.from_order_book(book, depth_levels=self.book_depth_levels)
         self._advance_discovery(now_ms)
         self.mode = self._determine_mode(now_ms)
         return True
@@ -1060,10 +1294,19 @@ class MarketAStrategy:
         if order is None:
             return None
         self.inventory += qty if order.side == "BUY" else -qty
+        self._refresh_unwind_state()
+        self.last_trade_px = int(price)
+        self.last_trade_qty = int(qty)
+        self.last_trade_ms = self._now_ms()
         if order_id in self.recovery_pending and order.remaining_qty == 0:
             self.recovery_pending.discard(order_id)
             self._maybe_finish_recovery()
         return order
+
+    def on_market_trade(self, price: int, qty: int, now_ms: int | None = None) -> None:
+        self.last_trade_px = int(price)
+        self.last_trade_qty = int(qty)
+        self.last_trade_ms = self._now_ms() if now_ms is None else int(now_ms)
 
     def on_cancel_response(self, order_id: str, success: bool) -> ManagedOrder | None:
         order = self.order_manager.handle_cancel_response(order_id, success)
@@ -1112,7 +1355,70 @@ class MarketAStrategy:
             reason_if_blocked="Waiting for recovered A orders to be cancelled.",
             shock_direction=self.shock_direction,
             shock_threshold=self.shock_threshold,
+            unwind_aggressive=self.unwind_aggressive_active,
         )
+
+    def trace_state(self, now_ms: int) -> dict[str, object]:
+        mode = self.mode
+        buy_exposure = self.order_manager.buy_exposure()
+        sell_exposure = self.order_manager.sell_exposure()
+        allowed_buy, allowed_sell = self.quote_engine.allowed_size_for_mode(
+            mode,
+            self.inventory,
+            buy_exposure,
+            sell_exposure,
+        )
+        discovery = None
+        if self.discovery_window is not None:
+            discovery = {
+                "started_ms": self.discovery_window.started_ms,
+                "min_lock_ms": self.discovery_window.min_lock_ms,
+                "max_lock_ms": self.discovery_window.max_lock_ms,
+                "next_sample_ms": self.discovery_window.next_sample_ms,
+                "earnings_value": self.discovery_window.earnings_value,
+                "sample_count": len(self.discovery_window.samples),
+                "latest_sample": self.discovery_window.samples[-1] if self.discovery_window.samples else None,
+                "invalidated_reason": self.discovery_window.invalidated_reason,
+            }
+        return {
+            "mode": mode,
+            "fair_value": self.valuation.fair_value,
+            "trusted_multiplier": self.valuation.trusted_multiplier,
+            "multiplier_confidence": self.valuation.multiplier_confidence,
+            "latest_earnings": self.valuation.last_earnings_value,
+            "shock_direction": self.shock_direction,
+            "shock_threshold": self.shock_threshold,
+            "shock_target_fair": self.shock_target_fair,
+            "shock_started_ms": self.shock_started_ms,
+            "discovery_window": discovery,
+            "news_caution_active": self.news_caution_active,
+            "inventory": self.inventory,
+            "unwind_active": self.unwind_active,
+            "unwind_aggressive_active": self.unwind_aggressive_active,
+            "buy_exposure": buy_exposure,
+            "sell_exposure": sell_exposure,
+            "allowed_buy_size": allowed_buy,
+            "allowed_sell_size": allowed_sell,
+            "position_cap": self.quote_engine.cap_for_mode(mode),
+            "live_orders": self.order_manager.live_orders_snapshot(),
+            "book": {
+                "best_bid_px": None if self.book.best_bid is None else self.book.best_bid.px,
+                "best_bid_qty": None if self.book.best_bid is None else self.book.best_bid.qty,
+                "best_ask_px": None if self.book.best_ask is None else self.book.best_ask.px,
+                "best_ask_qty": None if self.book.best_ask is None else self.book.best_ask.qty,
+                "spread": self.book.spread,
+                "mid": self.book.mid,
+                "microprice": self.book.microprice,
+                "top_of_book_imbalance": self.book.top_of_book_imbalance,
+                "bid_levels": [{"px": level.px, "qty": level.qty} for level in self.book.bid_levels],
+                "ask_levels": [{"px": level.px, "qty": level.qty} for level in self.book.ask_levels],
+            },
+            "last_trade_px": self.last_trade_px,
+            "last_trade_qty": self.last_trade_qty,
+            "last_trade_ms": self.last_trade_ms,
+            "exchange_tick": self.last_news_tick,
+            "ms_until_next_earnings": self.ms_until_next_scheduled_earnings(now_ms),
+        }
 
     def ms_until_next_scheduled_earnings(self, now_ms: int | None = None) -> int | None:
         if now_ms is None:
@@ -1244,7 +1550,8 @@ class MarketAStrategy:
         if self.valuation.fair_value is None:
             return "OPENING_MICRO_MM"
 
-        if self._should_unwind():
+        self._refresh_unwind_state()
+        if self.unwind_active:
             return "UNWIND"
 
         return "STEADY_MM"
@@ -1254,12 +1561,26 @@ class MarketAStrategy:
             return False
         return now_ms - self.shock_started_ms < self.a_config.shock_window_ms
 
-    def _should_unwind(self) -> bool:
-        if self.shock_started_ms is None:
-            return False
-        if self.inventory == 0:
-            return False
-        return abs(self.inventory) > self.a_config.unwind_flatten_threshold
+    def _refresh_unwind_state(self) -> None:
+        abs_inventory = abs(self.inventory)
+        if self.unwind_active:
+            if abs_inventory <= self.a_config.unwind_exit_position:
+                self.unwind_active = False
+                self.unwind_aggressive_active = False
+                return
+        elif abs_inventory >= self.a_config.unwind_entry_position:
+            self.unwind_active = True
+
+        if not self.unwind_active:
+            self.unwind_aggressive_active = False
+            return
+
+        if self.unwind_aggressive_active:
+            if abs_inventory <= self.a_config.unwind_aggressive_exit:
+                self.unwind_aggressive_active = False
+            return
+        if abs_inventory >= self.a_config.unwind_aggressive_entry:
+            self.unwind_aggressive_active = True
 
     def _maybe_finish_recovery(self) -> None:
         if self.recovery_active and not self.recovery_pending:

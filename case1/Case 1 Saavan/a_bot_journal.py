@@ -46,6 +46,9 @@ class TradingJournal:
             remaining_qty=order.remaining_qty,
             submitted_ms=order.submitted_ms,
             aggressive=order.aggressive,
+            intent=order.intent,
+            mode_at_submit=order.mode_at_submit,
+            evaluation_reason=order.evaluation_reason,
         )
 
     def record_cancel_requested(self, order_id: str) -> None:
@@ -123,6 +126,9 @@ class TradingJournal:
                         submitted_ms=int(record.get("submitted_ms", 0)),
                         aggressive=bool(record.get("aggressive", False)),
                         restored=True,
+                        intent=str(record.get("intent", "")),
+                        mode_at_submit=str(record.get("mode_at_submit", "")),
+                        evaluation_reason=str(record.get("evaluation_reason", "")),
                     )
                 elif event_type == "cancel_requested" and order_id in live_orders:
                     live_orders[order_id].cancel_pending = True
@@ -165,6 +171,9 @@ class TradingJournal:
                     aggressive=order.aggressive,
                     cancel_pending=False,
                     restored=True,
+                    intent=order.intent,
+                    mode_at_submit=order.mode_at_submit,
+                    evaluation_reason=order.evaluation_reason,
                 )
             )
 
@@ -176,3 +185,18 @@ class TradingJournal:
             inventory=inventory,
             live_orders=tuple(restored),
         )
+
+
+def select_recovered_pricing_state(
+    replay_state: JournalReplayState,
+    *,
+    recover_pricing_state: bool,
+) -> tuple[float | None, int, int | None, float | None]:
+    if not recover_pricing_state or not replay_state.live_orders:
+        return None, 0, None, None
+    return (
+        replay_state.multiplier,
+        replay_state.multiplier_confidence,
+        replay_state.fair_value,
+        replay_state.earnings_value,
+    )
