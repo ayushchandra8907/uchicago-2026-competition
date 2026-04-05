@@ -1,0 +1,81 @@
+{
+  "config": {
+    "config_path": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/data_scraping/local_config.json",
+    "direct_earnings_symbols": [
+      "A",
+      "C"
+    ],
+    "etf_news_assets": [
+      "A",
+      "C"
+    ],
+    "heartbeat_interval_seconds": 1.0,
+    "history_maxlen": 20000,
+    "host": "practice.uchicago.exchange:3333",
+    "log_root": "/Users/ayushchandra/Programming/Competitions/UchicagoTrading/uchicago-2026-competition/data_scraping/data",
+    "monitored_symbols": [
+      "A",
+      "B",
+      "C",
+      "ETF"
+    ],
+    "password": "mesa-lynx-octopus",
+    "pe_constants": {
+      "A": 10.0
+    },
+    "plot_symbols": [
+      "A",
+      "B",
+      "C",
+      "ETF"
+    ],
+    "post_news_window_seconds": 5.0,
+    "run_label": "live_round",
+    "top_k_depth": 3,
+    "top_n_levels": 5,
+    "username": "uiuc"
+  },
+  "latest_exchange_tick": 625,
+  "latest_known_eps_by_asset": {
+    "A": 0.9359610018547124,
+    "C": 2.114878261923017
+  },
+  "monitored_symbols": [
+    "A",
+    "B",
+    "C",
+    "ETF"
+  ],
+  "notes": {
+    "no_trading": "This listener never calls place_order, cancel_order, or place_swap_order.",
+    "round_day_inference": "The current utcxchangelib client does not expose round/day directly. Raw tick and timestamps are preserved for offline inference."
+  },
+  "open_orders_count": 0,
+  "plot_symbols": [
+    "A",
+    "B",
+    "C",
+    "ETF"
+  ],
+  "positions": {
+    "A": -78,
+    "B": 0,
+    "B_C_1000": 0,
+    "B_C_1050": 0,
+    "B_C_950": 0,
+    "B_P_1000": 0,
+    "B_P_1050": 0,
+    "B_P_950": 0,
+    "C": 0,
+    "ETF": 0,
+    "R_CUT": 0,
+    "R_HIKE": 0,
+    "R_HOLD": 0,
+    "cash": 80194
+  },
+  "run_id": "70c94d2d8d3b43d0a7b9b395b4b66487",
+  "session_id": "market_research_2026-04-04_23-39-25_live_round",
+  "status": "stopped",
+  "written_at_iso": "2026-04-05T04:53:18.890747+00:00",
+  "written_at_ns": 1775364798890747000
+}
