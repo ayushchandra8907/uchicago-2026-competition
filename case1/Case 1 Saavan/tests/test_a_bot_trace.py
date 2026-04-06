@@ -78,8 +78,11 @@ class TraceTests(unittest.TestCase):
         state = strategy.trace_state(45_000)
 
         self.assertEqual(state["mode"], "STEADY_MM")
-        self.assertEqual(state["allowed_buy_size"], 22)
+        self.assertEqual(state["allowed_buy_size"], 178)
         self.assertEqual(state["buy_exposure"], 2)
+        self.assertEqual(state["mm_position"], 0)
+        self.assertEqual(state["earnings_budget"], 120)
+        self.assertEqual(state["mm_budget"], 60)
         self.assertEqual(len(state["live_orders"]), 1)
         self.assertEqual(state["book"]["best_bid_px"], 1095)
         self.assertEqual(state["book"]["best_ask_px"], 1105)
@@ -146,6 +149,7 @@ class TraceTests(unittest.TestCase):
                     "px": 1099,
                     "qty": 2,
                     "remaining_qty": 2,
+                    "overlay": "mm",
                     "aggressive": False,
                     "intent": "steady_mm_passive",
                     "mode_at_submit": "STEADY_MM",
@@ -162,6 +166,7 @@ class TraceTests(unittest.TestCase):
                     "order_id": "bid-1",
                     "side": "BUY",
                     "remaining_qty": 0,
+                    "overlay": "mm",
                     "aggressive": False,
                     "intent": "steady_mm_passive",
                     "mode_at_submit": "STEADY_MM",
@@ -194,6 +199,7 @@ class TraceTests(unittest.TestCase):
                 summary = json.load(handle)
             self.assertEqual(summary["passive_fills"], 1)
             self.assertEqual(summary["aggressive_fills"], 0)
+            self.assertEqual(summary["fills_by_overlay"]["mm"], 1)
 
     def test_load_bot_config_trace_defaults_to_saavan_analysis_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

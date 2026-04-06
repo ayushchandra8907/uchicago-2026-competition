@@ -484,6 +484,91 @@ class MarketABotTests(unittest.TestCase):
             self.assertEqual(replay.live_orders[0].remaining_qty, 1)
             self.assertTrue(replay.live_orders[0].restored)
 
+    def test_overlay_fill_attribution_tracks_virtual_positions(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.order_manager.note_submitted(
+            order_id="earn-1",
+            side="BUY",
+            px=1090,
+            qty=4,
+            now_ms=1,
+            overlay="earnings",
+            intent="post_earnings_shock_take",
+            mode_at_submit="POST_EARNINGS_SHOCK",
+            evaluation_reason="test",
+        )
+        strategy.on_fill("earn-1", qty=4, price=1090)
+        self.assertEqual(strategy.inventory, 4)
+        self.assertEqual(strategy.earnings_position, 4)
+        self.assertEqual(strategy.mm_position, 0)
+
+        strategy.order_manager.note_submitted(
+            order_id="mm-1",
+            side="SELL",
+            px=1102,
+            qty=3,
+            now_ms=2,
+            overlay="mm",
+            intent="steady_mm_passive",
+            mode_at_submit="STEADY_MM",
+            evaluation_reason="test",
+        )
+        strategy.on_fill("mm-1", qty=3, price=1102)
+        self.assertEqual(strategy.inventory, 1)
+        self.assertEqual(strategy.earnings_position, 4)
+        self.assertEqual(strategy.mm_position, -3)
+
+    def test_budget_shift_applies_during_pre_news_and_shock_then_reverts(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=26_500)
+        pre_news_state = strategy.trace_state(26_500)
+        self.assertEqual(pre_news_state["mode"], "PRE_NEWS_PULLBACK")
+        self.assertEqual(pre_news_state["earnings_budget"], 180)
+        self.assertEqual(pre_news_state["mm_budget"], 0)
+        self.assertTrue(pre_news_state["budget_shift_active"])
+
+        strategy.on_news(self.a_earnings_news(1.0, tick=150), now_ms=30_000)
+        shock_state = strategy.trace_state(30_100)
+        self.assertEqual(shock_state["mode"], "POST_EARNINGS_SHOCK")
+        self.assertEqual(shock_state["earnings_budget"], 180)
+        self.assertEqual(shock_state["mm_budget"], 0)
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=33_500)
+        reverted_state = strategy.trace_state(33_500)
+        self.assertEqual(reverted_state["mode"], "MULTIPLIER_DISCOVERY")
+        self.assertEqual(reverted_state["earnings_budget"], 120)
+        self.assertEqual(reverted_state["mm_budget"], 60)
+        self.assertFalse(reverted_state["budget_shift_active"])
+
+    def test_unwind_keeps_mm_bid_live_while_earnings_overlay_reduces_inventory(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=45_000)
+        strategy.set_inventory(30)
+
+        plan = strategy.compute_quotes(now_ms=45_000)
+        self.assertEqual(plan.mode, "UNWIND")
+        self.assertIsNotNone(plan.bid)
+        self.assertIsNotNone(plan.ask)
+        self.assertEqual(plan.bid.overlay, "mm")
+        self.assertEqual(plan.bid.intent, "steady_mm_passive")
+        self.assertEqual(plan.ask.overlay, "earnings")
+        self.assertEqual(plan.ask.intent, "unwind")
+
 
 if __name__ == "__main__":
     unittest.main()
