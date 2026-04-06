@@ -45,7 +45,8 @@ class MarketABotTests(unittest.TestCase):
                 initial_multiplier=initial_multiplier,
                 initial_fair_value=initial_fair_value,
                 startup_assume_fresh_round=True,
-                pre_news_pullback_ms=4_000,
+                pre_news_pullback_ms=6_000,
+                pre_news_arrival_grace_ms=1_200,
                 calibration_min_delay_ms=5_000,
                 calibration_max_delay_ms=20_000,
                 calibration_sample_period_ms=1_000,
@@ -62,12 +63,13 @@ class MarketABotTests(unittest.TestCase):
                 discovery_max_position=2,
                 discovery_half_spread_ticks=10,
                 recover_pricing_state=False,
+                max_order_qty=39,
                 news_caution_quote_size=1,
                 news_caution_max_position=2,
                 news_caution_half_spread_ticks=10,
                 steady_half_spread_ticks=1,
-                steady_take_min_edge=3,
-                steady_take_large_inventory_edge=5,
+                steady_take_min_edge=2,
+                steady_take_large_inventory_edge=4,
                 opening_quote_size=1,
                 opening_max_position=8,
                 opening_half_spread_ticks=4,
@@ -84,26 +86,51 @@ class MarketABotTests(unittest.TestCase):
                 unwind_exit_position=12,
                 unwind_aggressive_entry=24,
                 unwind_aggressive_exit=16,
-                earnings_unwind_aggressive_entry=48,
-                earnings_unwind_aggressive_exit=24,
-                earnings_unwind_passive_exit=8,
-                earnings_unwind_passive_take_edge=8,
-                shock_quote_size=12,
+                earnings_unwind_quote_size=24,
+                earnings_unwind_aggressive_quote_size=36,
+                earnings_unwind_rapid_entry=64,
+                earnings_unwind_rapid_exit=24,
+                earnings_unwind_rapid_take_edge=1,
+                earnings_unwind_aggressive_entry=32,
+                earnings_unwind_aggressive_exit=12,
+                earnings_unwind_passive_exit=4,
+                earnings_unwind_passive_take_edge=4,
+                shock_quote_size=18,
+                shock_entry_window_ms=1_500,
+                shock_entry_quote_size=36,
+                shock_entry_min_edge=1,
+                shock_entry_threshold_scale=0.25,
+                shock_accumulate_target_position=199,
+                shock_accumulate_min_quote_size=39,
+                shock_accumulate_max_quote_size=39,
+                shock_accumulate_min_edge=0,
+                shock_accumulate_threshold_scale=0.0,
+                shock_accumulate_window_ms=2_000,
                 shock_base_max_position=100,
                 shock_shift_max_position=200,
                 shock_window_ms=3_000,
                 shock_take_fraction=0.25,
                 shock_take_min_edge=4,
+                shock_settle_min_hold_ms=1_200,
+                shock_settle_max_hold_ms=4_000,
+                shock_settle_band_ticks=8,
+                shock_settle_drift_ticks=4,
+                shock_settle_confirmations=2,
+                shock_unwind_quote_size=24,
+                shock_unwind_aggressive_quote_size=39,
+                shock_unwind_take_edge=1,
+                shock_unwind_exit_position=4,
                 prejump_enabled=True,
-                prejump_window_ms=1_200,
+                prejump_window_ms=6_000,
                 prejump_low_threshold=0.85,
                 prejump_high_threshold=1.35,
-                prejump_max_position=24,
-                prejump_quote_size=6,
-                prejump_aggressive_edge=2,
+                prejump_max_position=120,
+                prejump_quote_size=24,
+                prejump_aggressive_edge=1,
             ),
             risk=RiskConfig(
                 reprice_cooldown_ms=0,
+                passive_min_rest_ms=0,
                 passive_reprice_threshold_ticks=2,
                 passive_quote_ttl_ms=3_000,
             ),
@@ -338,7 +365,7 @@ class MarketABotTests(unittest.TestCase):
         strategy.set_inventory(12)
         self.assertEqual(strategy.compute_quotes(now_ms=45_200).mode, "UNWIND")
 
-        strategy.set_inventory(8)
+        strategy.set_inventory(4)
         self.assertEqual(strategy.compute_quotes(now_ms=45_300).mode, "STEADY_MM")
 
     def test_steady_mode_suppresses_directional_takes_when_inventory_is_loaded(self) -> None:
@@ -372,6 +399,19 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(passive_only_plan.aggressive_actions, ())
         self.assertIsNotNone(passive_only_plan.bid)
         self.assertIsNotNone(passive_only_plan.ask)
+
+    def test_steady_mode_reclaims_two_tick_stale_edge_when_inventory_is_light(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={995: 10}, asks={998: 10}), now_ms=45_000)
+
+        plan = strategy.compute_quotes(now_ms=45_000)
+        self.assertEqual(plan.mode, "STEADY_MM")
+        self.assertTrue(any(action.side == "BUY" and action.intent == "steady_take" for action in plan.aggressive_actions))
 
     def test_steady_mode_shrinks_inventory_worsening_passive_side(self) -> None:
         strategy = self.make_strategy(
@@ -438,7 +478,7 @@ class MarketABotTests(unittest.TestCase):
         self.assertTrue(strategy.unwind_active)
         self.assertTrue(strategy.unwind_aggressive_active)
 
-        strategy.set_inventory(24)
+        strategy.set_inventory(12)
         self.assertTrue(strategy.unwind_active)
         self.assertFalse(strategy.unwind_aggressive_active)
 
@@ -447,7 +487,7 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(moderate_unwind_plan.mode, "UNWIND")
         self.assertEqual(moderate_unwind_plan.aggressive_actions, ())
 
-        strategy.set_inventory(8)
+        strategy.set_inventory(4)
         exited = strategy.compute_quotes(now_ms=45_200)
         self.assertEqual(exited.mode, "STEADY_MM")
 
@@ -633,19 +673,192 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(pre_news_state["mm_budget"], 0)
         self.assertTrue(pre_news_state["budget_shift_active"])
 
-        strategy.on_news(self.a_earnings_news(1.0, tick=150), now_ms=30_000)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
         shock_state = strategy.trace_state(30_100)
         self.assertEqual(shock_state["mode"], "POST_EARNINGS_SHOCK")
         self.assertEqual(shock_state["earnings_budget"], 200)
         self.assertEqual(shock_state["mm_budget"], 0)
-        self.assertEqual(shock_state["overlay_exposures"]["earnings"]["allowed_buy"], 200)
+        self.assertEqual(shock_state["overlay_exposures"]["earnings"]["allowed_buy"], 199)
 
-        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=33_500)
-        reverted_state = strategy.trace_state(33_500)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1209: 10}, asks={1211: 10}), now_ms=32_100)
+        strategy.compute_quotes(now_ms=32_100)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1209: 10}, asks={1211: 10}), now_ms=33_400)
+        strategy.compute_quotes(now_ms=33_400)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1209: 10}, asks={1211: 10}), now_ms=33_600)
+        reverted_state = strategy.trace_state(33_600)
         self.assertEqual(reverted_state["mode"], "MULTIPLIER_DISCOVERY")
         self.assertEqual(reverted_state["earnings_budget"], 120)
         self.assertEqual(reverted_state["mm_budget"], 60)
         self.assertFalse(reverted_state["budget_shift_active"])
+
+    def test_shock_entry_relaxes_threshold_and_uses_larger_initial_size(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1076: 20}, asks={1080: 40}), now_ms=29_900)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
+
+        plan = strategy.compute_quotes(now_ms=30_100)
+        self.assertEqual(plan.mode, "POST_EARNINGS_SHOCK")
+        self.assertTrue(any(action.intent == "post_earnings_shock_take" and action.side == "BUY" for action in plan.aggressive_actions))
+        buy_action = next(action for action in plan.aggressive_actions if action.side == "BUY")
+        self.assertEqual(buy_action.qty, 39)
+
+    def test_shock_mode_posts_passive_accumulation_quote_when_not_crossing(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1088: 20}, asks={1102: 20}), now_ms=29_900)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
+
+        plan = strategy.compute_quotes(now_ms=30_100)
+        self.assertEqual(plan.mode, "POST_EARNINGS_SHOCK")
+        self.assertEqual(plan.aggressive_actions, ())
+        self.assertIsNotNone(plan.bid)
+        self.assertEqual(plan.bid.overlay, "earnings")
+        self.assertEqual(plan.bid.intent, "post_earnings_shock_take")
+        self.assertIsNone(plan.ask)
+
+    def test_shock_mode_does_not_post_unwind_quote_during_accumulate(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1088: 20}, asks={1092: 20}), now_ms=29_900)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
+        strategy.set_inventory(18)
+
+        plan = strategy.compute_quotes(now_ms=30_100)
+        self.assertEqual(plan.mode, "POST_EARNINGS_SHOCK")
+        self.assertEqual(strategy.shock_stage, "ACCUMULATE")
+        self.assertTrue(all(action.intent != "unwind" for action in plan.aggressive_actions))
+        self.assertTrue(plan.bid is None or plan.bid.intent != "unwind")
+        self.assertTrue(plan.ask is None or plan.ask.intent != "unwind")
+
+    def test_shock_accumulation_keeps_buying_toward_target_cap(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1078: 20}, asks={1080: 100}), now_ms=29_900)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
+        strategy.set_inventory(160)
+
+        plan = strategy.compute_quotes(now_ms=30_100)
+        self.assertEqual(plan.mode, "POST_EARNINGS_SHOCK")
+        self.assertEqual(strategy.shock_stage, "ACCUMULATE")
+        buy_action = next(action for action in plan.aggressive_actions if action.side == "BUY")
+        self.assertEqual(buy_action.qty, 39)
+
+    def test_shock_hold_preserves_inventory_before_settled_unwind(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1078: 20}, asks={1082: 20}), now_ms=29_900)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
+        strategy.set_inventory(100)
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 20}, asks={1102: 20}), now_ms=32_100)
+        plan = strategy.compute_quotes(now_ms=32_100)
+
+        self.assertEqual(plan.mode, "POST_EARNINGS_SHOCK")
+        self.assertEqual(strategy.shock_stage, "HOLD")
+        self.assertEqual(plan.aggressive_actions, ())
+        self.assertIsNone(plan.bid)
+        self.assertIsNone(plan.ask)
+
+    def test_shock_settle_transitions_into_fast_unwind(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1078: 20}, asks={1082: 20}), now_ms=29_900)
+        strategy.on_news(self.a_earnings_news(1.1, tick=150), now_ms=30_000)
+        strategy.set_inventory(100)
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1099: 100}, asks={1101: 20}), now_ms=32_100)
+        strategy.compute_quotes(now_ms=32_100)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1099: 100}, asks={1101: 20}), now_ms=33_400)
+        strategy.compute_quotes(now_ms=33_400)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1099: 100}, asks={1101: 20}), now_ms=33_600)
+
+        plan = strategy.compute_quotes(now_ms=33_600)
+
+        self.assertEqual(plan.mode, "UNWIND")
+        self.assertEqual(strategy.shock_stage, "SETTLED_UNWIND")
+        self.assertEqual(strategy.mm_phase, "SHIFTED_OFF")
+        sell_action = next(action for action in plan.aggressive_actions if action.side == "SELL")
+        self.assertEqual(sell_action.qty, 39)
+
+    def test_pre_news_hold_stays_active_until_grace_expires(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=26_500)
+        self.assertTrue(strategy.pre_news_hold_active)
+        self.assertEqual(strategy.earnings_phase, "PRE_NEWS_PULLBACK")
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=30_500)
+        self.assertTrue(strategy.pre_news_hold_active)
+        held_state = strategy.trace_state(30_500)
+        self.assertEqual(held_state["mode"], "PRE_NEWS_PULLBACK")
+        self.assertEqual(held_state["mm_phase"], "SHIFTED_OFF")
+
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=31_250)
+        self.assertFalse(strategy.pre_news_hold_active)
+        released_state = strategy.trace_state(31_250)
+        self.assertNotEqual(released_state["mode"], "PRE_NEWS_PULLBACK")
+
+    def test_structured_earnings_clears_pre_news_hold_into_shock(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=26_500)
+        self.assertTrue(strategy.pre_news_hold_active)
+
+        strategy.on_news(self.a_earnings_news(0.90, tick=150), now_ms=30_000)
+        self.assertFalse(strategy.pre_news_hold_active)
+        self.assertEqual(strategy.earnings_phase, "POST_EARNINGS_SHOCK")
+        self.assertEqual(strategy.mode, "POST_EARNINGS_SHOCK")
+
+    def test_pre_news_hold_keeps_mm_shifted_off_and_earnings_only(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=924,
+            recovered_earnings_value=0.84,
+        )
+        strategy.order_manager.note_submitted(order_id="mm-bid", side="BUY", px=920, qty=3, now_ms=28_000, overlay="mm")
+        strategy.order_manager.note_submitted(order_id="mm-ask", side="SELL", px=928, qty=3, now_ms=28_000, overlay="mm")
+        strategy.on_book_update_at("A", FakeOrderBook(bids={922: 10}, asks={925: 10}), now_ms=29_000)
+
+        plan = strategy.compute_quotes(now_ms=29_000)
+        self.assertEqual(plan.mode, "PRE_NEWS_PULLBACK")
+        self.assertEqual(strategy.mm_phase, "SHIFTED_OFF")
+        self.assertTrue(all(action.overlay == "earnings" for action in plan.aggressive_actions))
+        self.assertTrue(plan.bid is None or plan.bid.overlay == "earnings")
+        self.assertIsNone(plan.ask)
 
     def test_unwind_keeps_mm_bid_live_while_earnings_overlay_reduces_inventory(self) -> None:
         strategy = self.make_strategy(
@@ -665,6 +878,26 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(plan.bid.intent, "steady_mm_passive")
         self.assertEqual(plan.ask.overlay, "earnings")
         self.assertEqual(plan.ask.intent, "unwind")
+        self.assertEqual(plan.ask.qty, 24)
+
+    def test_rapid_unwind_shifts_mm_off_and_uses_large_crossing_size(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1099: 100}, asks={1105: 10}), now_ms=45_000)
+        strategy.set_inventory(100)
+
+        plan = strategy.compute_quotes(now_ms=45_000)
+        self.assertEqual(plan.mode, "UNWIND")
+        self.assertEqual(strategy.mm_phase, "SHIFTED_OFF")
+        self.assertTrue(strategy.rapid_unwind_active)
+        self.assertIsNone(plan.bid)
+        self.assertTrue(plan.ask is None or plan.ask.qty == 24)
+        sell_action = next(action for action in plan.aggressive_actions if action.side == "SELL")
+        self.assertEqual(sell_action.qty, 36)
 
     def test_news_caution_does_not_suppress_large_earnings_unwind(self) -> None:
         strategy = self.make_strategy(
@@ -674,7 +907,7 @@ class MarketABotTests(unittest.TestCase):
             recovered_earnings_value=1.0,
         )
         strategy.on_news(self.a_unstructured_news(), now_ms=40_100)
-        strategy.set_inventory(90)
+        strategy.set_inventory(40)
         strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=45_000)
 
         plan = strategy.compute_quotes(now_ms=45_000)
@@ -686,6 +919,55 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(plan.bid.overlay, "mm")
         self.assertEqual(plan.bid.intent, "news_cautious_mm")
 
+    def test_order_manager_waits_for_min_rest_before_passive_reprice(self) -> None:
+        manager = OrderManager(
+            symbol="A",
+            risk=RiskConfig(
+                reprice_cooldown_ms=0,
+                passive_min_rest_ms=500,
+                passive_reprice_threshold_ticks=3,
+                passive_quote_ttl_ms=3_000,
+            ),
+        )
+        manager.note_submitted(order_id="buy-1", side="BUY", px=1099, qty=2, now_ms=1_000)
+        plan = QuotePlan(
+            mode="STEADY_MM",
+            bid=DesiredOrder(side="BUY", px=1096, qty=2, aggressive=False, reason="test"),
+            ask=None,
+            aggressive_actions=(),
+            observe_only=False,
+            reason="test",
+        )
+
+        early_actions = manager.build_actions(plan, now_ms=1_300)
+        late_actions = manager.build_actions(plan, now_ms=1_600)
+
+        self.assertEqual(early_actions.cancels, ())
+        self.assertEqual(late_actions.cancels[0].order_id, "buy-1")
+
+    def test_order_manager_keeps_passive_quote_for_two_tick_move_under_new_threshold(self) -> None:
+        manager = OrderManager(
+            symbol="A",
+            risk=RiskConfig(
+                reprice_cooldown_ms=0,
+                passive_min_rest_ms=0,
+                passive_reprice_threshold_ticks=3,
+                passive_quote_ttl_ms=3_000,
+            ),
+        )
+        manager.note_submitted(order_id="buy-1", side="BUY", px=1099, qty=2, now_ms=1_000)
+        plan = QuotePlan(
+            mode="STEADY_MM",
+            bid=DesiredOrder(side="BUY", px=1097, qty=2, aggressive=False, reason="test"),
+            ask=None,
+            aggressive_actions=(),
+            observe_only=False,
+            reason="test",
+        )
+
+        actions = manager.build_actions(plan, now_ms=1_600)
+        self.assertEqual(actions.cancels, ())
+
     def test_discovery_does_not_suppress_large_earnings_unwind(self) -> None:
         strategy = self.make_strategy(
             recovered_multiplier=1100.0,
@@ -694,7 +976,7 @@ class MarketABotTests(unittest.TestCase):
             recovered_earnings_value=1.0,
         )
         strategy.on_news(self.a_earnings_news(1.0), now_ms=30_000)
-        strategy.set_inventory(60)
+        strategy.set_inventory(40)
         strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=33_100)
 
         plan = strategy.compute_quotes(now_ms=33_100)
@@ -733,6 +1015,24 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(plan.mode, "PRE_NEWS_PULLBACK")
         self.assertTrue(any(action.intent == "earnings_prejump" and action.side == "SELL" for action in plan.aggressive_actions))
         self.assertTrue(plan.ask is None or (plan.ask.overlay == "earnings" and plan.ask.intent == "earnings_prejump"))
+
+    def test_bearish_prejump_can_flip_through_flat_toward_target(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1496,
+            recovered_earnings_value=1.36,
+        )
+        strategy.set_inventory(60)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1495: 50}, asks={1498: 10}), now_ms=29_000)
+
+        state = strategy.trace_state(29_000)
+        plan = strategy.compute_quotes(now_ms=29_000)
+
+        self.assertEqual(plan.mode, "PRE_NEWS_PULLBACK")
+        self.assertEqual(state["overlay_exposures"]["earnings"]["allowed_sell"], 180)
+        self.assertTrue(any(action.intent == "earnings_prejump" and action.side == "SELL" for action in plan.aggressive_actions))
+        self.assertTrue(plan.ask is None or plan.ask.qty == 24)
 
     def test_prejump_stays_off_without_extreme_earnings_or_with_news_caution(self) -> None:
         neutral = self.make_strategy(

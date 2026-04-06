@@ -47,6 +47,29 @@ def print_summary(summary: dict) -> None:
     for metric, stats in (summary.get("local_processing_durations_ms") or {}).items():
         print(f"  {metric}: p50={stats.get('p50')} p95={stats.get('p95')} max={stats.get('max')}")
     print("")
+    print("Order lifecycle latencies (ms):")
+    for metric in (
+        "cancel_response_latency_ms",
+        "submit_to_fill_ms",
+        "submit_to_cancel_response_ms",
+    ):
+        stats = summary.get(metric) or {}
+        print(f"  {metric}: p50={stats.get('p50')} p95={stats.get('p95')} max={stats.get('max')}")
+    print("")
+    print("Earnings episode unwind:")
+    for episode in (summary.get("shock_episode_unwind_metrics") or []):
+        print(
+            "  "
+            f"#{episode.get('episode_index')} tick={episode.get('exchange_tick')} "
+            f"earnings={episode.get('earnings_value')} direction={episode.get('shock_direction')} "
+            f"peak={episode.get('peak_signed_earnings_position')} "
+            f"settle={episode.get('time_to_settle_ms')} "
+            f"unwind_start={episode.get('time_to_unwind_start_ms')} "
+            f"to<=20={episode.get('time_to_abs_20_ms')} "
+            f"to<=4={episode.get('time_to_abs_4_ms')} "
+            f"pre_settle_unwind={episode.get('opposite_unwind_before_settle_count')}"
+        )
+    print("")
     print("Fills by intent:")
     for intent, count in (summary.get("fills_by_intent") or {}).items():
         print(f"  {intent}: {count}")

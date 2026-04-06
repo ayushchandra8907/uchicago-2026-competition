@@ -36,6 +36,13 @@ SNAPSHOT_FIELDNAMES = [
     "trusted_multiplier",
     "multiplier_confidence",
     "discovery_contaminated",
+    "pre_news_hold_active",
+    "pre_news_expected_tick",
+    "pre_news_due_ms",
+    "pre_news_hold_deadline_ms",
+    "rapid_unwind_active",
+    "shock_stage",
+    "shock_accumulate_target_position",
     "inventory",
     "earnings_position",
     "mm_position",
@@ -207,6 +214,13 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     budget_shift_active_ms = 0
     last_budget_shift_state: bool | None = None
     last_budget_shift_started_ms: int | None = None
+    cancel_requested_at_ms: dict[str, int] = {}
+    submitted_at_ms: dict[str, int] = {}
+    first_fill_seen: set[str] = set()
+    cancel_response_latencies_ms: list[float] = []
+    submit_to_fill_latencies_ms: list[float] = []
+    submit_to_cancel_response_latencies_ms: list[float] = []
+    structured_earnings_events: list[dict[str, Any]] = []
 
     def nearest_snapshot_mid(target_ms: int) -> float | None:
         for snapshot in snapshot_events:
@@ -279,9 +293,24 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             submits_by_overlay[str(event.get("overlay") or "unknown")] += 1
             if bool(event.get("aggressive")):
                 spread_cross_count += 1
+            order_id = str(event.get("order_id") or "")
+            if order_id:
+                submitted_at_ms[order_id] = now_ms
 
         elif event.get("event_type") == "order_cancel_requested":
             cancel_reason_counts[str(event.get("cancel_reason") or "unknown")] += 1
+            order_id = str(event.get("order_id") or "")
+            if order_id:
+                cancel_requested_at_ms[order_id] = now_ms
+
+        elif event.get("event_type") == "order_cancel_response":
+            order_id = str(event.get("order_id") or "")
+            requested_at = cancel_requested_at_ms.pop(order_id, None) if order_id else None
+            if requested_at is not None:
+                cancel_response_latencies_ms.append(float(max(0, now_ms - requested_at)))
+            submitted_at = submitted_at_ms.get(order_id) if order_id else None
+            if submitted_at is not None:
+                submit_to_cancel_response_latencies_ms.append(float(max(0, now_ms - submitted_at)))
 
         elif event.get("event_type") == "order_rejected":
             reject_reason_counts[str(event.get("rejection_reason") or "unknown")] += 1
@@ -294,6 +323,12 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 aggressive_fills += 1
             else:
                 passive_fills += 1
+            order_id = str(event.get("order_id") or "")
+            if order_id and order_id not in first_fill_seen:
+                submitted_at = submitted_at_ms.get(order_id)
+                if submitted_at is not None:
+                    submit_to_fill_latencies_ms.append(float(max(0, now_ms - submitted_at)))
+                first_fill_seen.add(order_id)
             event_mid = event.get("mid_at_event")
             event_px = event.get("price")
             if event_mid is not None and event_px is not None:
@@ -304,6 +339,16 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                         continue
                     markout = signed_side * (future_mid - float(event_px))
                     fill_markouts_by_intent[intent][f"{window_ms}ms"].append(markout)
+
+        elif event.get("event_type") == "news_received" and event.get("earnings_value") is not None:
+            structured_earnings_events.append(
+                {
+                    "exchange_tick": event.get("exchange_tick"),
+                    "monotonic_ms": now_ms,
+                    "earnings_value": event.get("earnings_value"),
+                    "shock_direction": event.get("shock_direction"),
+                }
+            )
 
     if last_mode is not None and last_mode_started_ms is not None and event_list:
         final_ms = int(event_list[-1].get("monotonic_ms", 0))
@@ -317,6 +362,101 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         for label, values in windows.items():
             if values:
                 fill_markout_summary[intent][label] = sum(values) / len(values)
+
+    final_ms = int(event_list[-1].get("monotonic_ms", 0)) if event_list else 0
+    shock_episode_unwind_metrics: list[dict[str, Any]] = []
+    for index, episode in enumerate(structured_earnings_events, start=1):
+        start_ms = int(episode.get("monotonic_ms") or 0)
+        end_ms = final_ms + 1
+        if index < len(structured_earnings_events):
+            end_ms = int(structured_earnings_events[index].get("monotonic_ms") or final_ms)
+        episode_events = [
+            event
+            for event in event_list
+            if start_ms <= int(event.get("monotonic_ms", 0)) < end_ms
+        ]
+        episode_state_events = [
+            event
+            for event in episode_events
+            if event.get("earnings_position") is not None
+        ]
+        peak_signed_earnings_position = 0
+        if episode_state_events:
+            peak_snapshot = max(
+                episode_state_events,
+                key=lambda state_event: abs(int(state_event.get("earnings_position") or 0)),
+            )
+            peak_signed_earnings_position = int(peak_snapshot.get("earnings_position") or 0)
+        settle_event = next(
+            (
+                event
+                for event in episode_state_events
+                if event.get("shock_stage") == "SETTLED_UNWIND" or event.get("mode") == "UNWIND"
+            ),
+            None,
+        )
+        settle_ms = None if settle_event is None else int(settle_event.get("monotonic_ms", 0))
+        time_to_settle_ms = None if settle_ms is None else max(0, settle_ms - start_ms)
+        time_to_unwind_start_ms = time_to_settle_ms
+        time_to_abs_20_ms = next(
+            (
+                max(0, int(state_event.get("monotonic_ms", 0)) - start_ms)
+                for state_event in episode_state_events
+                if abs(int(state_event.get("earnings_position") or 0)) <= 20
+            ),
+            None,
+        )
+        time_to_abs_4_ms = next(
+            (
+                max(0, int(state_event.get("monotonic_ms", 0)) - start_ms)
+                for state_event in episode_state_events
+                if abs(int(state_event.get("earnings_position") or 0)) <= 4
+            ),
+            None,
+        )
+        opposite_unwind_before_settle_count = 0
+        settle_cutoff_ms = end_ms if settle_ms is None else settle_ms
+        shock_direction = int(episode.get("shock_direction") or 0)
+        for decision_event in episode_events:
+            if decision_event.get("event_type") != "decision_evaluated":
+                continue
+            decision_ms = int(decision_event.get("monotonic_ms", 0))
+            if decision_ms >= settle_cutoff_ms:
+                continue
+            desired_bid = decision_event.get("desired_bid") or {}
+            desired_ask = decision_event.get("desired_ask") or {}
+            aggressive_actions = decision_event.get("aggressive_actions") or []
+            if shock_direction > 0:
+                if desired_ask.get("intent") in {"unwind", "post_earnings_shock_unwind"}:
+                    opposite_unwind_before_settle_count += 1
+                opposite_unwind_before_settle_count += sum(
+                    1
+                    for action in aggressive_actions
+                    if action.get("side") == "SELL" and action.get("intent") in {"unwind", "post_earnings_shock_unwind"}
+                )
+            elif shock_direction < 0:
+                if desired_bid.get("intent") in {"unwind", "post_earnings_shock_unwind"}:
+                    opposite_unwind_before_settle_count += 1
+                opposite_unwind_before_settle_count += sum(
+                    1
+                    for action in aggressive_actions
+                    if action.get("side") == "BUY" and action.get("intent") in {"unwind", "post_earnings_shock_unwind"}
+                )
+        shock_episode_unwind_metrics.append(
+            {
+                "episode_index": index,
+                "exchange_tick": episode.get("exchange_tick"),
+                "earnings_value": episode.get("earnings_value"),
+                "shock_direction": episode.get("shock_direction"),
+                "peak_signed_earnings_position": peak_signed_earnings_position,
+                "time_to_settle_ms": time_to_settle_ms,
+                "time_to_unwind_start_ms": time_to_unwind_start_ms,
+                "time_to_abs_20_ms": time_to_abs_20_ms,
+                "time_to_abs_4_ms": time_to_abs_4_ms,
+                "opposite_unwind_before_settle_count": opposite_unwind_before_settle_count,
+                "opposite_unwind_before_settle": opposite_unwind_before_settle_count > 0,
+            }
+        )
 
     return {
         "total_events": len(event_list),
@@ -362,6 +502,22 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 "max": max(order_sync_durations_ms) if order_sync_durations_ms else None,
             },
         },
+        "cancel_response_latency_ms": {
+            "p50": _percentile(cancel_response_latencies_ms, 0.50),
+            "p95": _percentile(cancel_response_latencies_ms, 0.95),
+            "max": max(cancel_response_latencies_ms) if cancel_response_latencies_ms else None,
+        },
+        "submit_to_fill_ms": {
+            "p50": _percentile(submit_to_fill_latencies_ms, 0.50),
+            "p95": _percentile(submit_to_fill_latencies_ms, 0.95),
+            "max": max(submit_to_fill_latencies_ms) if submit_to_fill_latencies_ms else None,
+        },
+        "submit_to_cancel_response_ms": {
+            "p50": _percentile(submit_to_cancel_response_latencies_ms, 0.50),
+            "p95": _percentile(submit_to_cancel_response_latencies_ms, 0.95),
+            "max": max(submit_to_cancel_response_latencies_ms) if submit_to_cancel_response_latencies_ms else None,
+        },
+        "shock_episode_unwind_metrics": shock_episode_unwind_metrics,
         "activity_split": {
             "passive_mm": sum(count for intent, count in fills_by_intent.items() if intent in {"opening_mm", "steady_mm_passive", "multiplier_discovery_mm", "news_cautious_mm"}),
             "steady_takes": fills_by_intent.get("steady_take", 0),
@@ -378,6 +534,11 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     mode_durations = summary.get("mode_durations_ms") or {}
     no_action = summary.get("most_common_no_action_reasons") or {}
     local_processing = summary.get("local_processing_durations_ms") or {}
+    lifecycle_latencies = {
+        "cancel_response_latency_ms": summary.get("cancel_response_latency_ms") or {},
+        "submit_to_fill_ms": summary.get("submit_to_fill_ms") or {},
+        "submit_to_cancel_response_ms": summary.get("submit_to_cancel_response_ms") or {},
+    }
     return "\n".join(
         [
             f"# A Bot Run Summary",
@@ -401,6 +562,22 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             *(
                 f"- `{metric}`: `p50={stats.get('p50')}` `p95={stats.get('p95')}` `max={stats.get('max')}`"
                 for metric, stats in local_processing.items()
+            ),
+            "",
+            "## Order Lifecycle Latencies (ms)",
+            *(
+                f"- `{metric}`: `p50={stats.get('p50')}` `p95={stats.get('p95')}` `max={stats.get('max')}`"
+                for metric, stats in lifecycle_latencies.items()
+            ),
+            "",
+            "## Earnings Episode Unwind",
+            *(
+                f"- `#{episode.get('episode_index')}` tick=`{episode.get('exchange_tick')}` earnings=`{episode.get('earnings_value')}` "
+                f"direction=`{episode.get('shock_direction')}` peak=`{episode.get('peak_signed_earnings_position')}` "
+                f"`settle={episode.get('time_to_settle_ms')}` `unwind_start={episode.get('time_to_unwind_start_ms')}` "
+                f"`to<=20={episode.get('time_to_abs_20_ms')}` `to<=4={episode.get('time_to_abs_4_ms')}` "
+                f"`pre_settle_unwind={episode.get('opposite_unwind_before_settle_count')}`"
+                for episode in (summary.get("shock_episode_unwind_metrics") or [])
             ),
             "",
             "## Fills By Intent",
@@ -486,6 +663,13 @@ class TraceRecorder:
             "multiplier_confidence": state.get("multiplier_confidence"),
             "latest_earnings": state.get("latest_earnings"),
             "discovery_contaminated": state.get("discovery_contaminated"),
+            "pre_news_hold_active": state.get("pre_news_hold_active"),
+            "pre_news_expected_tick": state.get("pre_news_expected_tick"),
+            "pre_news_due_ms": state.get("pre_news_due_ms"),
+            "pre_news_hold_deadline_ms": state.get("pre_news_hold_deadline_ms"),
+            "rapid_unwind_active": state.get("rapid_unwind_active"),
+            "shock_stage": state.get("shock_stage"),
+            "shock_accumulate_target_position": state.get("shock_accumulate_target_position"),
             "shock_direction": state.get("shock_direction"),
             "shock_threshold": state.get("shock_threshold"),
             "shock_target_fair": state.get("shock_target_fair"),
@@ -918,6 +1102,13 @@ class TraceRecorder:
             "trusted_multiplier": event.get("trusted_multiplier"),
             "multiplier_confidence": event.get("multiplier_confidence"),
             "discovery_contaminated": event.get("discovery_contaminated"),
+            "pre_news_hold_active": event.get("pre_news_hold_active"),
+            "pre_news_expected_tick": event.get("pre_news_expected_tick"),
+            "pre_news_due_ms": event.get("pre_news_due_ms"),
+            "pre_news_hold_deadline_ms": event.get("pre_news_hold_deadline_ms"),
+            "rapid_unwind_active": event.get("rapid_unwind_active"),
+            "shock_stage": event.get("shock_stage"),
+            "shock_accumulate_target_position": event.get("shock_accumulate_target_position"),
             "inventory": event.get("inventory"),
             "earnings_position": event.get("earnings_position"),
             "mm_position": event.get("mm_position"),

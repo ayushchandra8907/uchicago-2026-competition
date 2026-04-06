@@ -22,6 +22,7 @@ ModeName = Literal[
 ]
 EarningsPhase = Literal["IDLE", "PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"]
 MMPhase = Literal["SHIFTED_OFF", "OPENING_MICRO_MM", "MULTIPLIER_DISCOVERY", "NEWS_CAUTIOUS_MM", "STEADY_MM"]
+ShockStage = Literal["NONE", "ACCUMULATE", "HOLD", "SETTLED_UNWIND"]
 
 DAY_TICKS = 450
 DAY_MS = 90_000
@@ -421,8 +422,8 @@ class QuoteEngine:
 
         return self._steady_quotes(mode, fair_value, inventory, book, buy_exposure, sell_exposure)
 
-    @staticmethod
     def _desired(
+        self,
         *,
         side: SideName,
         px: int,
@@ -433,10 +434,11 @@ class QuoteEngine:
         intent: str,
         mode: ModeName,
     ) -> DesiredOrder:
+        capped_qty = min(max(0, int(qty)), self.a_config.max_order_qty)
         return DesiredOrder(
             side=side,
             px=px,
-            qty=qty,
+            qty=capped_qty,
             overlay=overlay,
             aggressive=aggressive,
             reason=reason,
@@ -771,12 +773,12 @@ class QuoteEngine:
             if aggressive_edge_override is None
             else max(0, int(aggressive_edge_override))
         )
-        allowed_buy, allowed_sell = self._allowed_size(
-            inventory,
-            buy_exposure,
-            sell_exposure,
-            cap=cap,
-        )
+        if bullish:
+            allowed_buy = max(0, cap - (inventory + buy_exposure))
+            allowed_sell = 0
+        else:
+            allowed_buy = 0
+            allowed_sell = max(0, inventory + cap - sell_exposure)
         aggressive_actions: list[DesiredOrder] = []
         desired_bid = None
         desired_ask = None
@@ -867,14 +869,20 @@ class QuoteEngine:
         buy_exposure: int,
         sell_exposure: int,
         *,
+        shock_stage: ShockStage,
         shock_direction: int,
         shock_threshold: int,
         overlay: OverlayName = "earnings",
         cap_override: int | None = None,
-        quote_size_override: int | None = None,
+        min_quote_size_override: int | None = None,
+        max_quote_size_override: int | None = None,
     ) -> QuotePlan:
         aggressive_actions: list[DesiredOrder] = []
-        quote_size = self.a_config.shock_quote_size if quote_size_override is None else max(0, int(quote_size_override))
+        max_quote_size = (
+            self.a_config.shock_quote_size if max_quote_size_override is None else max(0, int(max_quote_size_override))
+        )
+        min_quote_size = max_quote_size if min_quote_size_override is None else max(0, int(min_quote_size_override))
+        min_quote_size = min(min_quote_size, max_quote_size)
         cap = self.a_config.shock_base_max_position if cap_override is None else max(0, int(cap_override))
         allowed_buy, allowed_sell = self._allowed_size(
             inventory,
@@ -886,13 +894,54 @@ class QuoteEngine:
         desired_ask = None
         half_spread = self.a_config.steady_half_spread_ticks
 
+        def clip_size(allowed: int, book_qty: int | None = None) -> int:
+            if allowed <= 0 or max_quote_size <= 0:
+                return 0
+            desired = min(max_quote_size, allowed)
+            if allowed >= min_quote_size:
+                desired = max(desired, min_quote_size)
+            if book_qty is not None:
+                desired = min(desired, book_qty)
+            return max(0, min(desired, allowed))
+
+        if shock_direction == 0:
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=False,
+                reason="no directional earnings shock edge",
+            )
+
+        if shock_stage == "HOLD":
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=False,
+                reason="holding shock inventory until the new fair settles",
+            )
+
+        if shock_stage != "ACCUMULATE":
+            return QuotePlan(
+                mode=mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=False,
+                reason="shock accumulation inactive",
+            )
+
         if shock_direction > 0:
             if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value - shock_threshold:
+                qty = clip_size(allowed_buy, book.best_ask.qty)
                 aggressive_actions.append(
                     self._desired(
                         side="BUY",
                         px=book.best_ask.px,
-                        qty=min(quote_size, allowed_buy, book.best_ask.qty),
+                        qty=qty,
                         overlay=overlay,
                         aggressive=True,
                         reason="earnings upside shock buy through stale asks",
@@ -900,26 +949,27 @@ class QuoteEngine:
                         mode=mode,
                     )
                 )
-            if allowed_sell > 0:
-                ask_px = int(ceil(fair_value + half_spread))
-                _, ask_px = self._clamp_inside_book(fair_value - 1, ask_px, book)
-                desired_ask = self._desired(
-                    side="SELL",
-                    px=ask_px,
-                    qty=min(quote_size, allowed_sell),
+            if allowed_buy > 0 and not aggressive_actions:
+                bid_px = int(floor(fair_value - half_spread))
+                bid_px, _ = self._clamp_inside_book(bid_px, fair_value + 1, book)
+                desired_bid = self._desired(
+                    side="BUY",
+                    px=bid_px,
+                    qty=clip_size(allowed_buy),
                     overlay=overlay,
                     aggressive=False,
-                    reason="post-earnings ask to unwind long inventory",
-                    intent="post_earnings_shock_unwind",
+                    reason="post-earnings bid to keep building upside shock inventory toward the target cap",
+                    intent="post_earnings_shock_take",
                     mode=mode,
                 )
         elif shock_direction < 0:
             if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value + shock_threshold:
+                qty = clip_size(allowed_sell, book.best_bid.qty)
                 aggressive_actions.append(
                     self._desired(
                         side="SELL",
                         px=book.best_bid.px,
-                        qty=min(quote_size, allowed_sell, book.best_bid.qty),
+                        qty=qty,
                         overlay=overlay,
                         aggressive=True,
                         reason="earnings downside shock sell through stale bids",
@@ -927,21 +977,19 @@ class QuoteEngine:
                         mode=mode,
                     )
                 )
-            if allowed_buy > 0:
-                bid_px = int(floor(fair_value - half_spread))
-                bid_px, _ = self._clamp_inside_book(bid_px, fair_value + 1, book)
-                desired_bid = self._desired(
-                    side="BUY",
-                    px=bid_px,
-                    qty=min(quote_size, allowed_buy),
+            if allowed_sell > 0 and not aggressive_actions:
+                ask_px = int(ceil(fair_value + half_spread))
+                _, ask_px = self._clamp_inside_book(fair_value - 1, ask_px, book)
+                desired_ask = self._desired(
+                    side="SELL",
+                    px=ask_px,
+                    qty=clip_size(allowed_sell),
                     overlay=overlay,
                     aggressive=False,
-                    reason="post-earnings bid to unwind short inventory",
-                    intent="post_earnings_shock_unwind",
+                    reason="post-earnings ask to keep building downside shock inventory toward the target cap",
+                    intent="post_earnings_shock_take",
                     mode=mode,
                 )
-        else:
-            return self._steady_quotes("STEADY_MM", fair_value, inventory, book, buy_exposure, sell_exposure)
 
         return QuotePlan(
             mode=mode,
@@ -949,7 +997,7 @@ class QuoteEngine:
             ask=desired_ask,
             aggressive_actions=tuple(aggressive_actions),
             observe_only=False,
-            reason="post-earnings shock",
+            reason="post-earnings shock accumulation",
         )
 
     def _unwind_quotes(
@@ -965,12 +1013,15 @@ class QuoteEngine:
         overlay: OverlayName = "earnings",
         cap_override: int | None = None,
         quote_size_override: int | None = None,
+        aggressive_quote_size_override: int | None = None,
         aggressive_intent: str = "unwind",
         passive_intent: str = "unwind",
         passive_take_edge_override: int | None = None,
+        aggressive_take_edge_override: int | None = None,
     ) -> QuotePlan:
         aggressive_actions: list[DesiredOrder] = []
         quote_size = self.a_config.steady_quote_size if quote_size_override is None else max(0, int(quote_size_override))
+        aggressive_quote_size = quote_size if aggressive_quote_size_override is None else max(0, int(aggressive_quote_size_override))
         cap = self.a_config.steady_max_position if cap_override is None else max(0, int(cap_override))
         allowed_buy, allowed_sell = self._allowed_size(
             inventory,
@@ -983,13 +1034,14 @@ class QuoteEngine:
             if passive_take_edge_override is None
             else max(0, int(passive_take_edge_override))
         )
+        aggressive_take_edge = 0 if aggressive_take_edge_override is None else max(0, int(aggressive_take_edge_override))
 
         if inventory > 0:
             if (
                 book.best_bid is not None
                 and allowed_sell > 0
                 and (
-                    (aggressive_allowed and book.best_bid.px >= fair_value)
+                    (aggressive_allowed and book.best_bid.px >= fair_value - aggressive_take_edge)
                     or (not aggressive_allowed and book.best_bid.px >= fair_value + passive_take_edge)
                 )
             ):
@@ -997,7 +1049,7 @@ class QuoteEngine:
                     self._desired(
                         side="SELL",
                         px=book.best_bid.px,
-                        qty=min(quote_size, allowed_sell, book.best_bid.qty),
+                        qty=min(aggressive_quote_size, allowed_sell, book.best_bid.qty),
                         overlay=overlay,
                         aggressive=True,
                         reason="unwind long inventory into rich bid",
@@ -1032,7 +1084,7 @@ class QuoteEngine:
                 book.best_ask is not None
                 and allowed_buy > 0
                 and (
-                    (aggressive_allowed and book.best_ask.px <= fair_value)
+                    (aggressive_allowed and book.best_ask.px <= fair_value + aggressive_take_edge)
                     or (not aggressive_allowed and book.best_ask.px <= fair_value - passive_take_edge)
                 )
             ):
@@ -1040,7 +1092,7 @@ class QuoteEngine:
                     self._desired(
                         side="BUY",
                         px=book.best_ask.px,
-                        qty=min(quote_size, allowed_buy, book.best_ask.qty),
+                        qty=min(aggressive_quote_size, allowed_buy, book.best_ask.qty),
                         overlay=overlay,
                         aggressive=True,
                         reason="unwind short inventory into cheap ask",
@@ -1264,16 +1316,22 @@ class OrderManager:
             if live is not None and desired is not None:
                 price_gap = abs(live.px - desired.px)
                 stale = now_ms - live.submitted_ms >= self.risk.stale_quote_ms
-                needs_reprice = (
+                immediate_reprice = (
                     live.remaining_qty != desired.qty
                     or live.overlay != desired.overlay
                     or live.aggressive != desired.aggressive
                     or stale
                     or live.aggressive
                     or desired.aggressive
-                    or price_gap >= self.risk.passive_reprice_threshold_ticks
                 )
-                if needs_reprice and now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms:
+                drift_reprice = price_gap >= self.risk.passive_reprice_threshold_ticks
+                needs_reprice = immediate_reprice or drift_reprice
+                rested_long_enough = now_ms - live.submitted_ms >= self.risk.passive_min_rest_ms
+                if (
+                    needs_reprice
+                    and now_ms - self.last_action_ms[side] >= self.risk.reprice_cooldown_ms
+                    and (immediate_reprice or rested_long_enough)
+                ):
                     cancel_reasons: list[str] = []
                     if live.remaining_qty != desired.qty:
                         cancel_reasons.append("qty changed")
@@ -1362,6 +1420,10 @@ class MarketAStrategy:
         self.mode: ModeName = "OPENING_MICRO_MM"
         self.earnings_phase: EarningsPhase = "IDLE"
         self.mm_phase: MMPhase = "OPENING_MICRO_MM"
+        self.pre_news_hold_active = False
+        self.pre_news_expected_tick: int | None = None
+        self.pre_news_due_ms: int | None = None
+        self.pre_news_hold_deadline_ms: int | None = None
         self.startup_ms = self._now_ms()
         self.tick_anchor_tick: int | None = None
         self.tick_anchor_ms: int | None = None
@@ -1373,6 +1435,11 @@ class MarketAStrategy:
         self.shock_direction = 0
         self.shock_threshold: int | None = None
         self.shock_target_fair: int | None = None
+        self.shock_stage: ShockStage = "NONE"
+        self.shock_hold_started_ms: int | None = None
+        self.shock_unwind_started_ms: int | None = None
+        self.shock_settle_confirmation_count = 0
+        self.shock_last_mark: float | None = None
         self.last_trade_px: int | None = None
         self.last_trade_qty: int | None = None
         self.last_trade_ms: int | None = None
@@ -1381,6 +1448,7 @@ class MarketAStrategy:
         self.recovery_active = False
         self.unwind_active = False
         self.unwind_aggressive_active = False
+        self.rapid_unwind_active = False
 
         for order in restored_orders:
             self.order_manager.restore_order(order)
@@ -1513,6 +1581,7 @@ class MarketAStrategy:
 
         earnings_value = float(news_release["new_data"]["value"])
         old_fair, new_fair = self.valuation.on_structured_earnings(earnings_value)
+        self._clear_pre_news_hold()
         self.news_caution_active = False
         self.discovery_contaminated = False
         self.discovery_window = DiscoveryWindow(
@@ -1534,16 +1603,18 @@ class MarketAStrategy:
             self.shock_direction = 1 if new_fair > reference_fair else -1 if new_fair < reference_fair else 0
             self.shock_threshold = max(self.a_config.shock_take_min_edge, round(self.a_config.shock_take_fraction * move_size))
             self.shock_target_fair = new_fair
+            self.shock_stage = "ACCUMULATE" if self.shock_direction != 0 else "NONE"
+            self.shock_hold_started_ms = None
+            self.shock_unwind_started_ms = None
+            self.shock_settle_confirmation_count = 0
+            self.shock_last_mark = None
             note = (
                 f"A earnings tick={tick} moved provisional fair from {old_fair} to {new_fair} "
                 f"on earnings={earnings_value}; shock_direction={self.shock_direction} threshold={self.shock_threshold}"
             )
             fair_updated = True
         else:
-            self.shock_started_ms = None
-            self.shock_direction = 0
-            self.shock_threshold = None
-            self.shock_target_fair = None
+            self._clear_shock_cycle()
             note = (
                 f"Structured A earnings arrived with earnings={earnings_value}; "
                 f"starting multiplier discovery after {self.a_config.calibration_min_delay_ms}ms."
@@ -1761,6 +1832,7 @@ class MarketAStrategy:
         if mode == "POST_EARNINGS_SHOCK":
             if self.valuation.fair_value is None:
                 return self._empty_overlay_plan("earnings", "Waiting for a trusted fair value before shock trading.")
+            shock_min_quote_size, shock_max_quote_size = self._shock_quote_size_bounds(now_ms)
             plan = self.quote_engine._shock_quotes(
                 mode,
                 self.valuation.fair_value,
@@ -1768,20 +1840,29 @@ class MarketAStrategy:
                 self.book,
                 earnings_buy_exposure,
                 earnings_sell_exposure,
+                shock_stage=self.shock_stage,
                 shock_direction=self.shock_direction,
-                shock_threshold=self.shock_threshold or self.a_config.shock_take_min_edge,
+                shock_threshold=self._shock_threshold_for_now(now_ms),
                 overlay="earnings",
-                cap_override=min(self._shock_cap_for_mode(mode), earnings_budget),
-                quote_size_override=self.a_config.shock_quote_size,
+                cap_override=min(self._shock_cap_for_mode(mode), earnings_budget, self.a_config.shock_accumulate_target_position),
+                min_quote_size_override=shock_min_quote_size,
+                max_quote_size_override=shock_max_quote_size,
             )
             return self._clamp_overlay_plan("earnings", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
 
         if mode == "UNWIND":
             if self.valuation.fair_value is None:
                 return self._empty_overlay_plan("earnings", "Waiting for a trusted fair value before unwind.")
+            shock_unwind_active = self.shock_stage == "SETTLED_UNWIND"
             passive_take_edge = self.a_config.earnings_unwind_passive_take_edge
-            if abs(earnings_inventory) <= self.a_config.earnings_unwind_passive_exit:
+            exit_position = (
+                self.a_config.shock_unwind_exit_position
+                if shock_unwind_active
+                else self.a_config.earnings_unwind_passive_exit
+            )
+            if abs(earnings_inventory) <= exit_position:
                 return self._empty_overlay_plan("earnings", "earnings inventory no longer needs dedicated unwind handling")
+            rapid_unwind = self.rapid_unwind_active and not shock_unwind_active
             plan = self.quote_engine._unwind_quotes(
                 mode,
                 self.valuation.fair_value,
@@ -1789,13 +1870,31 @@ class MarketAStrategy:
                 self.book,
                 earnings_buy_exposure,
                 earnings_sell_exposure,
-                aggressive_allowed=self.unwind_aggressive_active,
+                aggressive_allowed=shock_unwind_active or self.unwind_aggressive_active or rapid_unwind,
                 overlay="earnings",
                 cap_override=earnings_budget,
-                quote_size_override=self.a_config.steady_quote_size,
+                quote_size_override=(
+                    self.a_config.shock_unwind_quote_size
+                    if shock_unwind_active
+                    else self.a_config.earnings_unwind_quote_size
+                ),
+                aggressive_quote_size_override=(
+                    self.a_config.shock_unwind_aggressive_quote_size
+                    if shock_unwind_active
+                    else (
+                        self.a_config.earnings_unwind_aggressive_quote_size
+                        if rapid_unwind
+                        else self.a_config.earnings_unwind_quote_size
+                    )
+                ),
                 aggressive_intent="unwind",
                 passive_intent="unwind",
                 passive_take_edge_override=passive_take_edge,
+                aggressive_take_edge_override=(
+                    self.a_config.shock_unwind_take_edge
+                    if shock_unwind_active
+                    else (self.a_config.earnings_unwind_rapid_take_edge if rapid_unwind else None)
+                ),
             )
             return self._clamp_overlay_plan("earnings", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
 
@@ -1891,7 +1990,9 @@ class MarketAStrategy:
             budget=earnings_budget,
         )
         mm_mode_cap = self.a_config.steady_max_position
-        if mode == "OPENING_MICRO_MM":
+        if self.mm_phase == "SHIFTED_OFF":
+            mm_mode_cap = 0
+        elif mode == "OPENING_MICRO_MM":
             mm_mode_cap = self.a_config.opening_max_position
         elif mode == "MULTIPLIER_DISCOVERY":
             mm_mode_cap = self.a_config.discovery_max_position
@@ -1923,6 +2024,8 @@ class MarketAStrategy:
             "shock_threshold": self.shock_threshold,
             "shock_target_fair": self.shock_target_fair,
             "shock_started_ms": self.shock_started_ms,
+            "shock_stage": self.shock_stage,
+            "shock_accumulate_target_position": self.a_config.shock_accumulate_target_position,
             "discovery_window": discovery,
             "news_caution_active": self.news_caution_active,
             "discovery_contaminated": self.discovery_contaminated,
@@ -1934,6 +2037,7 @@ class MarketAStrategy:
             "budget_shift_active": budget_shift_active,
             "unwind_active": self.unwind_active,
             "unwind_aggressive_active": self.unwind_aggressive_active,
+            "rapid_unwind_active": self.rapid_unwind_active,
             "buy_exposure": buy_exposure,
             "sell_exposure": sell_exposure,
             "allowed_buy_size": allowed_buy,
@@ -1970,7 +2074,11 @@ class MarketAStrategy:
             "last_trade_qty": self.last_trade_qty,
             "last_trade_ms": self.last_trade_ms,
             "exchange_tick": self.last_news_tick,
-            "ms_until_next_earnings": self.ms_until_next_scheduled_earnings(now_ms),
+            "ms_until_next_earnings": self._effective_ms_until_next_scheduled_earnings(now_ms),
+            "pre_news_hold_active": self.pre_news_hold_active,
+            "pre_news_expected_tick": self.pre_news_expected_tick,
+            "pre_news_due_ms": self.pre_news_due_ms,
+            "pre_news_hold_deadline_ms": self.pre_news_hold_deadline_ms,
         }
 
     def ms_until_next_scheduled_earnings(self, now_ms: int | None = None) -> int | None:
@@ -2087,14 +2195,19 @@ class MarketAStrategy:
         )
 
     def _determine_earnings_phase(self, now_ms: int) -> EarningsPhase:
-        if self._shock_active(now_ms):
+        if self.shock_stage in {"ACCUMULATE", "HOLD"}:
             return "POST_EARNINGS_SHOCK"
+
+        if self.pre_news_hold_active:
+            return "PRE_NEWS_PULLBACK"
 
         until_next_earnings = self.ms_until_next_scheduled_earnings(now_ms)
         if until_next_earnings is not None and until_next_earnings <= self.a_config.pre_news_pullback_ms:
             return "PRE_NEWS_PULLBACK"
 
         self._refresh_unwind_state()
+        if self.shock_stage == "SETTLED_UNWIND":
+            return "UNWIND"
         if abs(self.earnings_position) > self.a_config.earnings_unwind_passive_exit:
             return "UNWIND"
 
@@ -2102,7 +2215,13 @@ class MarketAStrategy:
 
     def _determine_mm_phase(self, now_ms: int, earnings_phase: EarningsPhase) -> MMPhase:
         _, mm_budget, budget_shift_active = self.overlay_budgets(self._compose_mode(earnings_phase, self.mm_phase))
+        if self.shock_stage in {"ACCUMULATE", "HOLD"}:
+            return "SHIFTED_OFF"
+        if self.shock_stage == "SETTLED_UNWIND" and abs(self.earnings_position) > self.a_config.shock_unwind_exit_position:
+            return "SHIFTED_OFF"
         if budget_shift_active and mm_budget <= 0:
+            return "SHIFTED_OFF"
+        if earnings_phase == "UNWIND" and self.rapid_unwind_active:
             return "SHIFTED_OFF"
         if self.news_caution_active:
             return "NEWS_CAUTIOUS_MM"
@@ -2126,28 +2245,42 @@ class MarketAStrategy:
         return phase
 
     def _refresh_phases(self, now_ms: int) -> None:
+        self._update_pre_news_hold(now_ms)
+        self._refresh_shock_stage(now_ms)
         self.earnings_phase = self._determine_earnings_phase(now_ms)
         self.mm_phase = self._determine_mm_phase(now_ms, self.earnings_phase)
         self.mode = self._compose_mode(self.earnings_phase, self.mm_phase)
 
     def _shock_active(self, now_ms: int) -> bool:
-        if self.shock_started_ms is None or self.shock_target_fair is None:
-            return False
-        return now_ms - self.shock_started_ms < self.a_config.shock_window_ms
+        del now_ms
+        return self.shock_stage in {"ACCUMULATE", "HOLD"}
 
     def _refresh_unwind_state(self) -> None:
         abs_inventory = abs(self.earnings_position)
+        if self.shock_stage in {"ACCUMULATE", "HOLD"}:
+            self.unwind_active = False
+            self.unwind_aggressive_active = False
+            self.rapid_unwind_active = False
+            return
         if self.unwind_active:
             if abs_inventory <= self.a_config.earnings_unwind_passive_exit:
                 self.unwind_active = False
                 self.unwind_aggressive_active = False
+                self.rapid_unwind_active = False
                 return
         elif abs_inventory > self.a_config.earnings_unwind_passive_exit:
             self.unwind_active = True
 
         if not self.unwind_active:
             self.unwind_aggressive_active = False
+            self.rapid_unwind_active = False
             return
+
+        if self.rapid_unwind_active:
+            if abs_inventory < self.a_config.earnings_unwind_rapid_exit:
+                self.rapid_unwind_active = False
+        elif abs_inventory >= self.a_config.earnings_unwind_rapid_entry:
+            self.rapid_unwind_active = True
 
         if self.unwind_aggressive_active:
             if abs_inventory <= self.a_config.earnings_unwind_aggressive_exit:
@@ -2160,6 +2293,27 @@ class MarketAStrategy:
         _, _, budget_shift_active = self.overlay_budgets(mode)
         return self.a_config.shock_shift_max_position if budget_shift_active else self.a_config.shock_base_max_position
 
+    def _shock_threshold_for_now(self, now_ms: int) -> int:
+        base_threshold = self.shock_threshold or self.a_config.shock_take_min_edge
+        if self.shock_started_ms is None or self.shock_stage != "ACCUMULATE":
+            return base_threshold
+        elapsed = now_ms - self.shock_started_ms
+        if elapsed < 0 or elapsed >= self.a_config.shock_accumulate_window_ms:
+            return base_threshold
+        scaled = int(round(base_threshold * self.a_config.shock_accumulate_threshold_scale))
+        return max(self.a_config.shock_accumulate_min_edge, min(base_threshold, scaled))
+
+    def _shock_quote_size_bounds(self, now_ms: int) -> tuple[int, int]:
+        if self.shock_started_ms is None or self.shock_stage != "ACCUMULATE":
+            return self.a_config.shock_quote_size, self.a_config.shock_quote_size
+        elapsed = now_ms - self.shock_started_ms
+        if elapsed < 0 or elapsed >= self.a_config.shock_accumulate_window_ms:
+            return self.a_config.shock_quote_size, self.a_config.shock_quote_size
+        return (
+            self.a_config.shock_accumulate_min_quote_size,
+            self.a_config.shock_accumulate_max_quote_size,
+        )
+
     def _earnings_mode_cap(self, mode: ModeName, now_ms: int) -> int:
         earnings_budget, _, _ = self.overlay_budgets(mode)
         if mode == "PRE_NEWS_PULLBACK":
@@ -2167,7 +2321,11 @@ class MarketAStrategy:
                 return 0
             return min(self.a_config.prejump_max_position, earnings_budget)
         if mode == "POST_EARNINGS_SHOCK":
-            return min(self._shock_cap_for_mode(mode), earnings_budget)
+            return min(
+                self._shock_cap_for_mode(mode),
+                earnings_budget,
+                self.a_config.shock_accumulate_target_position,
+            )
         if mode == "UNWIND":
             return earnings_budget
         return 0
@@ -2181,8 +2339,8 @@ class MarketAStrategy:
             return None
         if self.trusted_multiplier is None or self.last_earnings_value is None or self.fair_value is None:
             return None
-        until_next_earnings = self.ms_until_next_scheduled_earnings(now_ms)
-        if until_next_earnings is None or until_next_earnings > self.a_config.prejump_window_ms:
+        until_next_earnings = self._effective_ms_until_next_scheduled_earnings(now_ms)
+        if until_next_earnings is None or until_next_earnings < 0 or until_next_earnings > self.a_config.prejump_window_ms:
             return None
         if self.last_earnings_value <= self.a_config.prejump_low_threshold:
             return "BUY"
@@ -2220,6 +2378,129 @@ class MarketAStrategy:
     def _maybe_finish_recovery(self) -> None:
         if self.recovery_active and not self.recovery_pending:
             self.on_recovery_complete()
+
+    def _clear_shock_cycle(self) -> None:
+        self.shock_started_ms = None
+        self.shock_direction = 0
+        self.shock_threshold = None
+        self.shock_target_fair = None
+        self.shock_stage = "NONE"
+        self.shock_hold_started_ms = None
+        self.shock_unwind_started_ms = None
+        self.shock_settle_confirmation_count = 0
+        self.shock_last_mark = None
+
+    def _current_shock_mark(self) -> float | None:
+        if self.book.mid is not None:
+            return float(self.book.mid)
+        if self.book.microprice is not None:
+            return float(self.book.microprice)
+        if self.last_trade_px is not None:
+            return float(self.last_trade_px)
+        if self.valuation.fair_value is not None:
+            return float(self.valuation.fair_value)
+        return None
+
+    def _refresh_shock_stage(self, now_ms: int) -> None:
+        if self.shock_stage == "NONE":
+            return
+        if self.shock_started_ms is None or self.shock_target_fair is None or self.shock_direction == 0:
+            self._clear_shock_cycle()
+            return
+
+        if self.shock_stage == "SETTLED_UNWIND":
+            if abs(self.earnings_position) <= self.a_config.shock_unwind_exit_position:
+                self._clear_shock_cycle()
+            return
+
+        elapsed = max(0, now_ms - self.shock_started_ms)
+        if self.shock_stage == "ACCUMULATE":
+            if elapsed < self.a_config.shock_accumulate_window_ms:
+                return
+            self.shock_stage = "HOLD"
+            self.shock_hold_started_ms = now_ms
+            self.shock_settle_confirmation_count = 0
+            self.shock_last_mark = self._current_shock_mark()
+            return
+
+        if self.shock_stage != "HOLD":
+            return
+
+        if self.shock_hold_started_ms is None:
+            self.shock_hold_started_ms = now_ms
+        hold_elapsed = max(0, now_ms - self.shock_hold_started_ms)
+        if hold_elapsed >= self.a_config.shock_settle_max_hold_ms:
+            self.shock_stage = "SETTLED_UNWIND"
+            self.shock_unwind_started_ms = now_ms
+            return
+
+        mark = self._current_shock_mark()
+        if mark is None:
+            self.shock_settle_confirmation_count = 0
+            return
+        if hold_elapsed < self.a_config.shock_settle_min_hold_ms:
+            self.shock_last_mark = mark
+            return
+
+        within_band = abs(mark - float(self.shock_target_fair)) <= self.a_config.shock_settle_band_ticks
+        drift_ok = self.shock_last_mark is None or abs(mark - self.shock_last_mark) <= self.a_config.shock_settle_drift_ticks
+        if within_band and drift_ok:
+            self.shock_settle_confirmation_count += 1
+            if self.shock_settle_confirmation_count >= self.a_config.shock_settle_confirmations:
+                self.shock_stage = "SETTLED_UNWIND"
+                self.shock_unwind_started_ms = now_ms
+        else:
+            self.shock_settle_confirmation_count = 0
+        self.shock_last_mark = mark
+
+    def _effective_ms_until_next_scheduled_earnings(self, now_ms: int) -> int | None:
+        if self.pre_news_hold_active and self.pre_news_due_ms is not None:
+            return self.pre_news_due_ms - now_ms
+        return self.ms_until_next_scheduled_earnings(now_ms)
+
+    def _update_pre_news_hold(self, now_ms: int) -> None:
+        if self.pre_news_hold_active:
+            if self.pre_news_hold_deadline_ms is not None and now_ms > self.pre_news_hold_deadline_ms:
+                self._clear_pre_news_hold()
+            return
+
+        expected = self._expected_scheduled_earnings_target(now_ms)
+        if expected is None:
+            return
+        expected_tick, due_ms = expected
+        if due_ms - now_ms > self.a_config.pre_news_pullback_ms:
+            return
+        self.pre_news_hold_active = True
+        self.pre_news_expected_tick = expected_tick
+        self.pre_news_due_ms = due_ms
+        self.pre_news_hold_deadline_ms = due_ms + self.a_config.pre_news_arrival_grace_ms
+
+    def _clear_pre_news_hold(self) -> None:
+        self.pre_news_hold_active = False
+        self.pre_news_expected_tick = None
+        self.pre_news_due_ms = None
+        self.pre_news_hold_deadline_ms = None
+
+    def _expected_scheduled_earnings_target(self, now_ms: int) -> tuple[int, int] | None:
+        if self.tick_anchor_tick is not None and self.tick_anchor_ms is not None:
+            estimated_day_tick = self._estimated_day_tick(now_ms)
+            if estimated_day_tick is None:
+                return None
+            next_tick = self._next_earnings_day_tick(estimated_day_tick)
+            delta_ticks = (next_tick - estimated_day_tick) % DAY_TICKS
+            due_ms = now_ms if delta_ticks == 0 else now_ms + round(delta_ticks * TICK_MS)
+            return next_tick, due_ms
+
+        if not self.a_config.startup_assume_fresh_round:
+            return None
+
+        day_elapsed_ms = max(0, (now_ms - self.startup_ms) % DAY_MS)
+        schedule = ((150, 30_000), (300, 60_000))
+        for earnings_tick, earnings_ms in schedule:
+            if day_elapsed_ms <= earnings_ms:
+                return earnings_tick, now_ms + (earnings_ms - day_elapsed_ms)
+        wrap_due_ms = DAY_MS - day_elapsed_ms + 30_000
+        return 150, now_ms + wrap_due_ms
 
     @staticmethod
     def _handles_a_earnings(news_release: dict) -> bool:
