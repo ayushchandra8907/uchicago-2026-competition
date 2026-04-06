@@ -41,7 +41,8 @@ class TraceTests(unittest.TestCase):
                 unwind_entry_position=24,
                 unwind_exit_position=12,
                 shock_quote_size=12,
-                shock_max_position=80,
+                shock_base_max_position=80,
+                shock_shift_max_position=160,
             ),
             risk=RiskConfig(
                 reprice_cooldown_ms=0,
@@ -294,6 +295,47 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(summary["passive_fills"], 1)
         self.assertIn("steady_mm_passive", summary["fill_markouts_by_intent"])
         self.assertAlmostEqual(summary["fill_markouts_by_intent"]["steady_mm_passive"]["250ms"], 3.0, delta=0.001)
+
+    def test_summarize_trace_events_tracks_earnings_prejump_intent(self) -> None:
+        events = [
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "mode": "PRE_NEWS_PULLBACK",
+                "overlay": "earnings",
+                "intent": "earnings_prejump",
+                "aggressive": True,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_100,
+                "mode": "PRE_NEWS_PULLBACK",
+                "overlay": "earnings",
+                "side": "BUY",
+                "price": 999,
+                "qty": 1,
+                "aggressive": True,
+                "intent": "earnings_prejump",
+                "mid_at_event": 1000.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "mode": "POST_EARNINGS_SHOCK",
+                "mid": 1006.0,
+                "inventory": 1,
+                "quoted_spread": 2,
+                "budget_shift_active": True,
+            },
+        ]
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        self.assertEqual(summary["fills_by_intent"]["earnings_prejump"], 1)
+        self.assertEqual(summary["submits_by_intent"]["earnings_prejump"], 1)
+        self.assertEqual(summary["activity_split"]["earnings_prejump"], 1)
+        self.assertAlmostEqual(summary["fill_markouts_by_intent"]["earnings_prejump"]["250ms"], 7.0, delta=0.001)
 
 
 if __name__ == "__main__":

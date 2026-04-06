@@ -318,6 +318,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             "passive_mm": sum(count for intent, count in fills_by_intent.items() if intent in {"opening_mm", "steady_mm_passive", "multiplier_discovery_mm", "news_cautious_mm"}),
             "steady_takes": fills_by_intent.get("steady_take", 0),
             "earnings_shock_takes": fills_by_intent.get("post_earnings_shock_take", 0),
+            "earnings_prejump": fills_by_intent.get("earnings_prejump", 0),
             "unwind": fills_by_intent.get("unwind", 0) + fills_by_intent.get("post_earnings_shock_unwind", 0),
         },
     }
