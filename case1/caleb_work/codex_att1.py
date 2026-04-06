@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import math
 import os
 from pathlib import Path
@@ -69,8 +70,13 @@ class BotConfig:
     startup_probe_qty: int
     startup_probe_timeout_sec: float
     startup_probe_max_attempts: int
-    force_entry_after_sec: float
-    force_entry_edge_floor: float
+    passive_entry_ttl_sec: float
+    passive_hedge_ttl_sec: float
+    passive_unwind_ttl_sec: float
+    passive_unwind_reprice_sec: float
+    capture_enabled: bool
+    capture_snapshot_interval_sec: float
+    capture_dir: str
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,60 @@ class ParitySnapshot:
     short_synth_edge: Optional[float]
 
 
+@dataclass(frozen=True)
+class PassiveQuotePlan:
+    symbol: str
+    side: Side
+    price: int
+    qty: int
+    preserved_edge: float
+    option_spread: int
+    top_depth: int
+    note: str
+
+
+@dataclass(frozen=True)
+class CampaignCandidate:
+    kind: str
+    pair: OptionPair
+    first_leg: PassiveQuotePlan
+    hedge_symbol: str
+    hedge_side: Side
+    score: float
+    note: str
+
+
+@dataclass
+class PassiveCampaign:
+    state: str
+    kind: str
+    pair: OptionPair
+    first_leg: PassiveQuotePlan
+    hedge_symbol: str
+    hedge_side: Side
+    started_at: float
+    stage_started_at: float
+    current_order_id: Optional[str] = None
+    current_role: Optional[str] = None
+    first_filled_qty: int = 0
+    first_fill_notional: float = 0.0
+    hedge_filled_qty: int = 0
+    hedge_fill_notional: float = 0.0
+    unwind_filled_qty: int = 0
+    unwind_fill_notional: float = 0.0
+    unwind_reprices: int = 0
+    last_reprice_at: float = 0.0
+    notes: dict[str, str] = field(default_factory=dict)
+
+    def first_fill_price(self) -> Optional[float]:
+        if self.first_filled_qty <= 0:
+            return None
+        return self.first_fill_notional / self.first_filled_qty
+
+    def residual_qty(self) -> int:
+        return max(0, self.first_filled_qty - self.hedge_filled_qty - self.unwind_filled_qty)
+
+
 def load_config() -> BotConfig:
     return BotConfig(
         host=env_str("UTC_HOST", "34.197.188.76:3333"),
@@ -127,12 +187,17 @@ def load_config() -> BotConfig:
         order_ttl_sec=env_float("B_ORDER_TTL_SEC", 0.75),
         poll_sec=env_float("B_POLL_SEC", 0.25),
         status_sec=env_float("B_STATUS_SEC", 5.0),
-        startup_probe_enabled=env_bool("B_STARTUP_PROBE", True),
+        startup_probe_enabled=env_bool("B_STARTUP_PROBE", False),
         startup_probe_qty=max(1, env_int("B_STARTUP_PROBE_QTY", 1)),
         startup_probe_timeout_sec=env_float("B_STARTUP_PROBE_TIMEOUT_SEC", 6.0),
         startup_probe_max_attempts=max(1, env_int("B_STARTUP_PROBE_MAX_ATTEMPTS", 2)),
-        force_entry_after_sec=env_float("B_FORCE_ENTRY_AFTER_SEC", 0.0),
-        force_entry_edge_floor=env_float("B_FORCE_ENTRY_EDGE_FLOOR", -6.0),
+        passive_entry_ttl_sec=env_float("B_PASSIVE_ENTRY_TTL_SEC", 5.0),
+        passive_hedge_ttl_sec=env_float("B_PASSIVE_HEDGE_TTL_SEC", 3.0),
+        passive_unwind_ttl_sec=env_float("B_PASSIVE_UNWIND_TTL_SEC", 5.0),
+        passive_unwind_reprice_sec=env_float("B_PASSIVE_UNWIND_REPRICE_SEC", 1.0),
+        capture_enabled=env_bool("B_CAPTURE_ENABLED", True),
+        capture_snapshot_interval_sec=env_float("B_CAPTURE_SNAPSHOT_INTERVAL_SEC", 1.0),
+        capture_dir=env_str("B_CAPTURE_DIR", str(Path(__file__).resolve().parent / "run_logs")),
     )
 
 
@@ -184,11 +249,43 @@ class MarketBBot(XChangeClient):
         self.startup_probe_started_at = self.now()
         self.startup_probe_entry_attempts = 0
         self.startup_probe_exit_attempts = 0
-        self.last_open_trade_at = 0.0
+        self.active_campaign: Optional[PassiveCampaign] = None
+        self.capture_file_path: Optional[Path] = None
+        self.capture_handle = None
         self.discover_option_pairs()
+        self.setup_capture()
 
     def now(self) -> float:
         return time.monotonic()
+
+    def setup_capture(self) -> None:
+        if not self.cfg.capture_enabled:
+            return
+        capture_dir = Path(self.cfg.capture_dir)
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        session_name = time.strftime("market_b_%Y%m%d_%H%M%S")
+        self.capture_file_path = capture_dir / f"{session_name}.jsonl"
+        self.capture_handle = self.capture_file_path.open("a", encoding="utf-8", buffering=1)
+        print(f"[CAPTURE] file={self.capture_file_path}")
+        self.record_event(
+            "session_start",
+            config={
+                "host": self.cfg.host,
+                "username": self.cfg.username,
+                "risk_free_rate": self.cfg.risk_free_rate,
+                "time_to_expiry_years": self.cfg.time_to_expiry_years,
+                "parity_entry_edge": self.cfg.parity_entry_edge,
+                "parity_exit_band": self.cfg.parity_exit_band,
+                "startup_probe_enabled": self.cfg.startup_probe_enabled,
+                "startup_probe_timeout_sec": self.cfg.startup_probe_timeout_sec,
+                "startup_probe_max_attempts": self.cfg.startup_probe_max_attempts,
+                "passive_entry_ttl_sec": self.cfg.passive_entry_ttl_sec,
+                "passive_hedge_ttl_sec": self.cfg.passive_hedge_ttl_sec,
+                "passive_unwind_ttl_sec": self.cfg.passive_unwind_ttl_sec,
+                "passive_unwind_reprice_sec": self.cfg.passive_unwind_reprice_sec,
+                "capture_snapshot_interval_sec": self.cfg.capture_snapshot_interval_sec,
+            },
+        )
 
     def discover_option_pairs(self) -> None:
         discovered: dict[int, dict[str, str]] = {}
@@ -215,6 +312,144 @@ class MarketBBot(XChangeClient):
         for pair in self.option_pairs:
             symbols.extend((pair.call_symbol, pair.put_symbol))
         return symbols
+
+    def tracked_symbols(self) -> list[str]:
+        return ["B", *self.option_symbols()]
+
+    def normalize_value(self, value):
+        if isinstance(value, dict):
+            return {str(key): self.normalize_value(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.normalize_value(item) for item in value]
+        return value
+
+    def record_event(self, kind: str, **payload) -> None:
+        if self.capture_handle is None:
+            return
+        event = {
+            "ts_wall": time.time(),
+            "ts_mono": self.now(),
+            "kind": kind,
+            "payload": self.normalize_value(payload),
+        }
+        try:
+            self.capture_handle.write(json.dumps(event, sort_keys=True) + "\n")
+            self.capture_handle.flush()
+        except Exception as exc:
+            print(f"[CAPTURE-ERROR] kind={kind} error={exc}")
+
+    def serialize_book(self, symbol: str) -> dict:
+        book = self.get_book(symbol)
+        if book is None:
+            return {"bids": [], "asks": [], "last_trade": self.last_trade.get(symbol)}
+        bids = sorted(
+            [[int(px), int(qty)] for px, qty in book.bids.items() if qty > 0],
+            key=lambda level: level[0],
+            reverse=True,
+        )
+        asks = sorted(
+            [[int(px), int(qty)] for px, qty in book.asks.items() if qty > 0],
+            key=lambda level: level[0],
+        )
+        return {
+            "bids": bids,
+            "asks": asks,
+            "last_trade": self.last_trade.get(symbol),
+        }
+
+    def serialize_open_orders(self) -> list[dict]:
+        rows: list[dict] = []
+        for order_id, meta in self.order_meta.items():
+            order = self.open_orders.get(order_id)
+            remaining_qty = int(order[1]) if order else 0
+            rows.append(
+                {
+                    "order_id": order_id,
+                    "symbol": meta.symbol,
+                    "side": meta.side.name,
+                    "price": meta.price,
+                    "remaining_qty": remaining_qty,
+                    "purpose": meta.purpose,
+                    "strike": meta.strike,
+                    "cancel_pending": meta.cancel_pending,
+                    "age_sec": round(self.now() - meta.created_at, 3),
+                }
+            )
+        return rows
+
+    def serialize_parity(self, spot: Optional[float]) -> dict:
+        rows: dict[str, dict] = {}
+        if spot is None:
+            return rows
+        for pair in self.option_pairs:
+            snapshot = self.parity_snapshot(pair, spot)
+            if snapshot is None:
+                continue
+            rows[str(pair.strike)] = {
+                "spot": snapshot.spot,
+                "discounted_strike": snapshot.discounted_strike,
+                "theoretical_cp_diff": snapshot.theoretical_cp_diff,
+                "call_bid": snapshot.call_bid,
+                "call_ask": snapshot.call_ask,
+                "put_bid": snapshot.put_bid,
+                "put_ask": snapshot.put_ask,
+                "mid_gap": snapshot.mid_gap,
+                "long_synth_edge": snapshot.long_synth_edge,
+                "short_synth_edge": snapshot.short_synth_edge,
+                "pending_order_count": self.pending_order_count_for_strike(pair.strike),
+                "local_call_pos": self.position(pair.call_symbol),
+                "local_put_pos": self.position(pair.put_symbol),
+                "exchange_call_pos": self.exchange_position(pair.call_symbol),
+                "exchange_put_pos": self.exchange_position(pair.put_symbol),
+            }
+        return rows
+
+    def serialize_campaign(self) -> Optional[dict]:
+        if self.active_campaign is None:
+            return None
+        campaign = self.active_campaign
+        return {
+            "state": campaign.state,
+            "kind": campaign.kind,
+            "strike": campaign.pair.strike,
+            "current_order_id": campaign.current_order_id,
+            "current_role": campaign.current_role,
+            "first_leg": {
+                "symbol": campaign.first_leg.symbol,
+                "side": campaign.first_leg.side.name,
+                "price": campaign.first_leg.price,
+                "qty": campaign.first_leg.qty,
+                "preserved_edge": campaign.first_leg.preserved_edge,
+                "note": campaign.first_leg.note,
+            },
+            "hedge_symbol": campaign.hedge_symbol,
+            "hedge_side": campaign.hedge_side.name,
+            "first_filled_qty": campaign.first_filled_qty,
+            "first_fill_price": campaign.first_fill_price(),
+            "hedge_filled_qty": campaign.hedge_filled_qty,
+            "unwind_filled_qty": campaign.unwind_filled_qty,
+            "residual_qty": campaign.residual_qty(),
+            "unwind_reprices": campaign.unwind_reprices,
+            "notes": campaign.notes,
+        }
+
+    def record_snapshot(self, reason: str) -> None:
+        spot = self.extract_spot()
+        self.record_event(
+            "snapshot",
+            reason=reason,
+            probe_state=self.startup_probe_state,
+            campaign=self.serialize_campaign(),
+            spot=spot,
+            positions={
+                "local": {symbol: self.position(symbol) for symbol in self.option_symbols()},
+                "exchange": {symbol: self.exchange_position(symbol) for symbol in self.option_symbols()},
+                "cash": self.positions.get("cash", 0),
+            },
+            open_orders=self.serialize_open_orders(),
+            books={symbol: self.serialize_book(symbol) for symbol in self.tracked_symbols()},
+            parity=self.serialize_parity(spot),
+        )
 
     def top(self, symbol: str) -> tuple[Optional[int], int, Optional[int], int]:
         book = self.get_book(symbol)
@@ -341,6 +576,7 @@ class MarketBBot(XChangeClient):
             return
         self.last_gate_log_at[key] = now
         print(message)
+        self.record_event("gate", key=key, message=message)
 
     def probe_active(self) -> bool:
         return self.startup_probe_state not in {"disabled", "done", "failed"}
@@ -349,6 +585,7 @@ class MarketBBot(XChangeClient):
         if state == self.startup_probe_state and reason is None:
             return
         self.startup_probe_state = state
+        self.record_event("probe_state", state=state, reason=reason)
         if reason:
             print(f"[PROBE] state={state} reason={reason}")
         else:
@@ -368,11 +605,31 @@ class MarketBBot(XChangeClient):
         reason = self.submission_block_reason(symbol, side, qty)
         if reason is not None:
             print(f"[BLOCK] {purpose} {symbol} {side.name} qty={qty} px={price}: {reason}")
+            self.record_event(
+                "order_blocked",
+                purpose=purpose,
+                symbol=symbol,
+                side=side.name,
+                qty=qty,
+                price=price,
+                strike=strike,
+                reason=reason,
+            )
             return None
         try:
             order_id = await self.place_order(symbol, int(qty), side, int(price))
         except Exception as exc:
             print(f"[ORDER-ERROR] {purpose} {symbol} {side.name} {qty}@{price}: {exc}")
+            self.record_event(
+                "order_error",
+                purpose=purpose,
+                symbol=symbol,
+                side=side.name,
+                qty=qty,
+                price=price,
+                strike=strike,
+                error=str(exc),
+            )
             return None
 
         self.order_meta[order_id] = OrderMeta(
@@ -384,6 +641,16 @@ class MarketBBot(XChangeClient):
             strike=int(strike),
             created_at=self.now(),
         )
+        self.record_event(
+            "order_submitted",
+            order_id=order_id,
+            purpose=purpose,
+            symbol=symbol,
+            side=side.name,
+            qty=qty,
+            price=price,
+            strike=strike,
+        )
         return order_id
 
     async def cancel_stale_orders(self) -> None:
@@ -394,12 +661,23 @@ class MarketBBot(XChangeClient):
             if order_id not in self.open_orders:
                 self.order_meta.pop(order_id, None)
                 continue
+            if meta.purpose.startswith("campaign:"):
+                continue
             if now - meta.created_at < self.cfg.order_ttl_sec:
                 continue
             meta.cancel_pending = True
             print(
                 f"[STALE] cancel order_id={order_id} purpose={meta.purpose} "
                 f"symbol={meta.symbol} age={now - meta.created_at:.2f}s"
+            )
+            self.record_event(
+                "order_cancel_requested",
+                order_id=order_id,
+                purpose=meta.purpose,
+                symbol=meta.symbol,
+                strike=meta.strike,
+                age_sec=round(now - meta.created_at, 3),
+                reason="stale",
             )
             try:
                 await self.cancel_order(order_id)
@@ -598,267 +876,763 @@ class MarketBBot(XChangeClient):
 
         return False
 
-    def trade_size_for_open(self, pair: OptionPair, snapshot: ParitySnapshot) -> int:
-        if snapshot.call_ask is None or snapshot.call_bid is None or snapshot.put_ask is None or snapshot.put_bid is None:
-            return 0
-        call_pos = abs(self.position(pair.call_symbol))
-        put_pos = abs(self.position(pair.put_symbol))
-        call_capacity = max(0, self.cfg.max_position_per_option - call_pos)
-        put_capacity = max(0, self.cfg.max_position_per_option - put_pos)
-        size = min(
-            self.cfg.max_trade_qty,
-            call_capacity,
-            put_capacity,
-        )
-        return int(size)
+    def option_spread(self, symbol: str) -> Optional[int]:
+        bid, _bid_qty, ask, _ask_qty = self.top(symbol)
+        if bid is None or ask is None or ask <= bid:
+            return None
+        return ask - bid
 
-    async def open_synthetic_long(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
-        if snapshot.call_ask is None or snapshot.put_bid is None:
-            return False
-        size = min(
-            self.trade_size_for_open(pair, snapshot),
-            snapshot.call_ask_qty or self.cfg.max_trade_qty,
-            snapshot.put_bid_qty or self.cfg.max_trade_qty,
-        )
-        if size <= 0:
-            return False
+    def quote_depth(self, bid_qty: int, ask_qty: int) -> int:
+        return max(int(bid_qty), int(ask_qty))
 
-        results = await asyncio.gather(
-            self.submit_cross(pair.call_symbol, Side.BUY, size, snapshot.call_ask, "pcp-open-long", pair.strike),
-            self.submit_cross(pair.put_symbol, Side.SELL, size, snapshot.put_bid, "pcp-open-long", pair.strike),
+    def trade_size_for_pair(self, pair: OptionPair, cap_qty: Optional[int] = None) -> int:
+        call_capacity = max(0, self.cfg.max_position_per_option - abs(self.position(pair.call_symbol)))
+        put_capacity = max(0, self.cfg.max_position_per_option - abs(self.position(pair.put_symbol)))
+        qty = min(self.cfg.max_trade_qty, call_capacity, put_capacity)
+        if cap_qty is not None:
+            qty = min(qty, cap_qty)
+        return int(max(0, qty))
+
+    def passive_buy_price(self, bid: Optional[int], ask: Optional[int], cap_price: float) -> Optional[int]:
+        if bid is None or ask is None or ask <= bid:
+            return None
+        price = min(ask - 1, math.floor(cap_price))
+        if price < bid:
+            return None
+        return int(price)
+
+    def passive_sell_price(self, bid: Optional[int], ask: Optional[int], floor_price: float) -> Optional[int]:
+        if bid is None or ask is None or ask <= bid:
+            return None
+        price = max(bid + 1, math.ceil(floor_price))
+        if price > ask:
+            return None
+        return int(price)
+
+    def current_campaign_state(self) -> str:
+        if self.active_campaign is not None:
+            return self.active_campaign.state
+        for pair in self.option_pairs:
+            synthetic_long, synthetic_short, _ = self.paired_inventory(pair)
+            if synthetic_long > 0 or synthetic_short > 0:
+                return "PAIRED_POSITION"
+        return "IDLE"
+
+    def transition_campaign(self, state: str, reason: str) -> None:
+        if self.active_campaign is None:
+            return
+        self.active_campaign.state = state
+        self.active_campaign.stage_started_at = self.now()
+        self.record_event(
+            "campaign_state",
+            state=state,
+            campaign_kind=self.active_campaign.kind,
+            strike=self.active_campaign.pair.strike,
+            reason=reason,
         )
-        if any(results):
-            now = self.now()
-            self.last_action_at[pair.strike] = now
-            self.last_open_trade_at = now
-            print(
-                f"[TRADE] strike={pair.strike} action=BUY_CALL_SELL_PUT "
-                f"edge={snapshot.long_synth_edge:.2f} spot={snapshot.spot:.2f}"
-            )
+        print(
+            f"[CAMPAIGN] state={state} kind={self.active_campaign.kind} "
+            f"strike={self.active_campaign.pair.strike} reason={reason}"
+        )
+
+    def clear_campaign(self, reason: str) -> None:
+        if self.active_campaign is None:
+            return
+        strike = self.active_campaign.pair.strike
+        kind = self.active_campaign.kind
+        self.record_event(
+            "campaign_cleared",
+            campaign_kind=kind,
+            strike=strike,
+            state=self.active_campaign.state,
+            reason=reason,
+            residual_qty=self.active_campaign.residual_qty(),
+        )
+        print(f"[CAMPAIGN] clear kind={kind} strike={strike} reason={reason}")
+        self.last_action_at[strike] = self.now()
+        self.active_campaign = None
+
+    def campaign_has_live_order(self) -> bool:
+        if self.active_campaign is None or self.active_campaign.current_order_id is None:
+            return False
+        order_id = self.active_campaign.current_order_id
+        meta = self.order_meta.get(order_id)
+        if meta is not None and meta.cancel_pending:
+            return False
+        return order_id in self.open_orders
+
+    async def cancel_campaign_order(self, reason: str) -> None:
+        if self.active_campaign is None or self.active_campaign.current_order_id is None:
+            return
+        order_id = self.active_campaign.current_order_id
+        if order_id not in self.open_orders:
+            return
+        meta = self.order_meta.get(order_id)
+        if meta is not None:
+            if meta.cancel_pending:
+                return
+            meta.cancel_pending = True
+        self.record_event(
+            "campaign_cancel_requested",
+            campaign_kind=self.active_campaign.kind,
+            strike=self.active_campaign.pair.strike,
+            state=self.active_campaign.state,
+            role=self.active_campaign.current_role,
+            order_id=order_id,
+            reason=reason,
+        )
+        print(
+            f"[CAMPAIGN] cancel kind={self.active_campaign.kind} strike={self.active_campaign.pair.strike} "
+            f"role={self.active_campaign.current_role} order_id={order_id} reason={reason}"
+        )
+        try:
+            await self.cancel_order(order_id)
+        except Exception as exc:
+            if meta is not None:
+                meta.cancel_pending = False
+            print(f"[CANCEL-ERROR] {order_id}: {exc}")
+
+    async def submit_campaign_plan(self, plan: PassiveQuotePlan, role: str) -> bool:
+        if self.active_campaign is None:
+            return False
+        purpose = f"campaign:{self.active_campaign.kind}:{role}"
+        order_id = await self.submit_cross(
+            plan.symbol,
+            plan.side,
+            plan.qty,
+            plan.price,
+            purpose,
+            self.active_campaign.pair.strike,
+        )
+        if order_id is None:
+            return False
+        self.active_campaign.current_order_id = order_id
+        self.active_campaign.current_role = role
+        self.active_campaign.stage_started_at = self.now()
+        if role == "unwind":
+            self.active_campaign.unwind_reprices += 1
+            self.active_campaign.last_reprice_at = self.now()
+        self.record_event(
+            "campaign_quote",
+            campaign_kind=self.active_campaign.kind,
+            strike=self.active_campaign.pair.strike,
+            state=self.active_campaign.state,
+            role=role,
+            symbol=plan.symbol,
+            side=plan.side.name,
+            qty=plan.qty,
+            price=plan.price,
+            preserved_edge=plan.preserved_edge,
+            note=plan.note,
+        )
+        print(
+            f"[CAMPAIGN] submit kind={self.active_campaign.kind} strike={self.active_campaign.pair.strike} "
+            f"state={self.active_campaign.state} role={role} symbol={plan.symbol} "
+            f"side={plan.side.name} qty={plan.qty} px={plan.price} edge={plan.preserved_edge:.2f}"
+        )
+        return True
+
+    async def start_campaign(self, candidate: CampaignCandidate) -> bool:
+        if self.active_campaign is not None:
+            return False
+        state = "ENTRY_RESTING" if candidate.kind.startswith("entry_") else "EXIT_RESTING"
+        self.active_campaign = PassiveCampaign(
+            state=state,
+            kind=candidate.kind,
+            pair=candidate.pair,
+            first_leg=candidate.first_leg,
+            hedge_symbol=candidate.hedge_symbol,
+            hedge_side=candidate.hedge_side,
+            started_at=self.now(),
+            stage_started_at=self.now(),
+            notes={"origin": candidate.note},
+        )
+        self.record_event(
+            "campaign_created",
+            campaign_kind=candidate.kind,
+            strike=candidate.pair.strike,
+            state=state,
+            score=candidate.score,
+            note=candidate.note,
+            first_leg={
+                "symbol": candidate.first_leg.symbol,
+                "side": candidate.first_leg.side.name,
+                "price": candidate.first_leg.price,
+                "qty": candidate.first_leg.qty,
+                "preserved_edge": candidate.first_leg.preserved_edge,
+                "option_spread": candidate.first_leg.option_spread,
+                "top_depth": candidate.first_leg.top_depth,
+                "note": candidate.first_leg.note,
+            },
+            hedge_symbol=candidate.hedge_symbol,
+            hedge_side=candidate.hedge_side.name,
+        )
+        if await self.submit_campaign_plan(candidate.first_leg, "first"):
             return True
+        self.clear_campaign("first_leg_submit_failed")
         return False
 
-    async def open_synthetic_short(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
-        if snapshot.call_bid is None or snapshot.put_ask is None:
-            return False
-        size = min(
-            self.trade_size_for_open(pair, snapshot),
-            snapshot.call_bid_qty or self.cfg.max_trade_qty,
-            snapshot.put_ask_qty or self.cfg.max_trade_qty,
-        )
-        if size <= 0:
-            return False
+    def entry_candidates_for_pair(self, pair: OptionPair, snapshot: ParitySnapshot) -> list[CampaignCandidate]:
+        candidates: list[CampaignCandidate] = []
+        qty = self.trade_size_for_pair(pair)
+        if qty <= 0:
+            return candidates
 
-        results = await asyncio.gather(
-            self.submit_cross(pair.call_symbol, Side.SELL, size, snapshot.call_bid, "pcp-open-short", pair.strike),
-            self.submit_cross(pair.put_symbol, Side.BUY, size, snapshot.put_ask, "pcp-open-short", pair.strike),
-        )
-        if any(results):
-            now = self.now()
-            self.last_action_at[pair.strike] = now
-            self.last_open_trade_at = now
-            print(
-                f"[TRADE] strike={pair.strike} action=SELL_CALL_BUY_PUT "
-                f"edge={snapshot.short_synth_edge:.2f} spot={snapshot.spot:.2f}"
+        call_spread = self.option_spread(pair.call_symbol)
+        put_spread = self.option_spread(pair.put_symbol)
+        call_depth = self.quote_depth(snapshot.call_bid_qty, snapshot.call_ask_qty)
+        put_depth = self.quote_depth(snapshot.put_bid_qty, snapshot.put_ask_qty)
+
+        if snapshot.put_bid is not None and call_spread is not None:
+            price = self.passive_buy_price(
+                snapshot.call_bid,
+                snapshot.call_ask,
+                snapshot.theoretical_cp_diff + snapshot.put_bid - self.cfg.parity_entry_edge,
             )
-            return True
-        return False
+            if price is not None:
+                edge = snapshot.theoretical_cp_diff - (price - snapshot.put_bid)
+                candidates.append(
+                    CampaignCandidate(
+                        kind="entry_long",
+                        pair=pair,
+                        first_leg=PassiveQuotePlan(
+                            symbol=pair.call_symbol,
+                            side=Side.BUY,
+                            price=price,
+                            qty=qty,
+                            preserved_edge=edge,
+                            option_spread=call_spread,
+                            top_depth=call_depth,
+                            note="long_call_first",
+                        ),
+                        hedge_symbol=pair.put_symbol,
+                        hedge_side=Side.SELL,
+                        score=edge - self.cfg.parity_entry_edge,
+                        note="passive_entry",
+                    )
+                )
 
-    async def close_synthetic_long(self, pair: OptionPair, snapshot: ParitySnapshot, qty: int) -> None:
-        if qty <= 0 or snapshot.call_bid is None or snapshot.put_ask is None:
-            return
-        qty = min(qty, snapshot.call_bid_qty or qty, snapshot.put_ask_qty or qty, self.cfg.max_trade_qty)
-        if qty <= 0:
-            return
+        if snapshot.call_ask is not None and put_spread is not None:
+            price = self.passive_sell_price(
+                snapshot.put_bid,
+                snapshot.put_ask,
+                snapshot.call_ask - snapshot.theoretical_cp_diff + self.cfg.parity_entry_edge,
+            )
+            if price is not None:
+                edge = snapshot.theoretical_cp_diff - (snapshot.call_ask - price)
+                candidates.append(
+                    CampaignCandidate(
+                        kind="entry_long",
+                        pair=pair,
+                        first_leg=PassiveQuotePlan(
+                            symbol=pair.put_symbol,
+                            side=Side.SELL,
+                            price=price,
+                            qty=qty,
+                            preserved_edge=edge,
+                            option_spread=put_spread,
+                            top_depth=put_depth,
+                            note="long_put_first",
+                        ),
+                        hedge_symbol=pair.call_symbol,
+                        hedge_side=Side.BUY,
+                        score=edge - self.cfg.parity_entry_edge,
+                        note="passive_entry",
+                    )
+                )
 
-        results = await asyncio.gather(
-            self.submit_cross(pair.call_symbol, Side.SELL, qty, snapshot.call_bid, "pcp-close-long", pair.strike),
-            self.submit_cross(pair.put_symbol, Side.BUY, qty, snapshot.put_ask, "pcp-close-long", pair.strike),
+        if snapshot.put_ask is not None and call_spread is not None:
+            price = self.passive_sell_price(
+                snapshot.call_bid,
+                snapshot.call_ask,
+                snapshot.theoretical_cp_diff + snapshot.put_ask + self.cfg.parity_entry_edge,
+            )
+            if price is not None:
+                edge = (price - snapshot.put_ask) - snapshot.theoretical_cp_diff
+                candidates.append(
+                    CampaignCandidate(
+                        kind="entry_short",
+                        pair=pair,
+                        first_leg=PassiveQuotePlan(
+                            symbol=pair.call_symbol,
+                            side=Side.SELL,
+                            price=price,
+                            qty=qty,
+                            preserved_edge=edge,
+                            option_spread=call_spread,
+                            top_depth=call_depth,
+                            note="short_call_first",
+                        ),
+                        hedge_symbol=pair.put_symbol,
+                        hedge_side=Side.BUY,
+                        score=edge - self.cfg.parity_entry_edge,
+                        note="passive_entry",
+                    )
+                )
+
+        if snapshot.call_bid is not None and put_spread is not None:
+            price = self.passive_buy_price(
+                snapshot.put_bid,
+                snapshot.put_ask,
+                snapshot.call_bid - snapshot.theoretical_cp_diff - self.cfg.parity_entry_edge,
+            )
+            if price is not None:
+                edge = (snapshot.call_bid - price) - snapshot.theoretical_cp_diff
+                candidates.append(
+                    CampaignCandidate(
+                        kind="entry_short",
+                        pair=pair,
+                        first_leg=PassiveQuotePlan(
+                            symbol=pair.put_symbol,
+                            side=Side.BUY,
+                            price=price,
+                            qty=qty,
+                            preserved_edge=edge,
+                            option_spread=put_spread,
+                            top_depth=put_depth,
+                            note="short_put_first",
+                        ),
+                        hedge_symbol=pair.call_symbol,
+                        hedge_side=Side.SELL,
+                        score=edge - self.cfg.parity_entry_edge,
+                        note="passive_entry",
+                    )
+                )
+
+        return [candidate for candidate in candidates if candidate.score >= 0]
+
+    def best_entry_candidate(self, spot: float) -> Optional[CampaignCandidate]:
+        best_per_pair: list[CampaignCandidate] = []
+        for pair in self.option_pairs:
+            if not self.cooldown_ready(pair.strike):
+                self.log_gate(
+                    f"entry:{pair.strike}:cooldown",
+                    f"[SKIP] strike={pair.strike} reason=entry_cooldown",
+                )
+                continue
+            if self.strike_has_pending_orders(pair.strike):
+                self.log_gate(
+                    f"entry:{pair.strike}:pending",
+                    f"[SKIP] strike={pair.strike} reason=pending_orders count={self.pending_order_count_for_strike(pair.strike)}",
+                )
+                continue
+            synthetic_long, synthetic_short, imbalance = self.paired_inventory(pair)
+            if synthetic_long > 0 or synthetic_short > 0 or imbalance > 0:
+                self.log_gate(
+                    f"entry:{pair.strike}:inventory",
+                    f"[SKIP] strike={pair.strike} reason=existing_inventory "
+                    f"call={self.position(pair.call_symbol)} put={self.position(pair.put_symbol)}",
+                )
+                continue
+            snapshot = self.parity_snapshot(pair, spot)
+            if snapshot is None:
+                continue
+            candidates = self.entry_candidates_for_pair(pair, snapshot)
+            if not candidates:
+                self.log_gate(
+                    f"entry:{pair.strike}:no-feasible",
+                    f"[SKIP] strike={pair.strike} reason=no_passive_entry "
+                    f"long={snapshot.long_synth_edge} short={snapshot.short_synth_edge}",
+                )
+                continue
+            best_per_pair.append(
+                max(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.first_leg.option_spread,
+                        candidate.first_leg.preserved_edge,
+                        candidate.first_leg.top_depth,
+                    ),
+                )
+            )
+        if not best_per_pair:
+            return None
+        return max(
+            best_per_pair,
+            key=lambda candidate: (
+                candidate.first_leg.preserved_edge,
+                candidate.first_leg.option_spread,
+                candidate.first_leg.top_depth,
+            ),
         )
-        if any(results):
-            self.last_action_at[pair.strike] = self.now()
-            print(f"[REDUCE] strike={pair.strike} action=CLOSE_SYNTH_LONG gap={snapshot.mid_gap}")
 
-    async def close_synthetic_short(self, pair: OptionPair, snapshot: ParitySnapshot, qty: int) -> None:
-        if qty <= 0 or snapshot.call_ask is None or snapshot.put_bid is None:
-            return
-        qty = min(qty, snapshot.call_ask_qty or qty, snapshot.put_bid_qty or qty, self.cfg.max_trade_qty)
-        if qty <= 0:
-            return
+    async def maybe_start_entry_campaign(self, spot: float) -> bool:
+        candidate = self.best_entry_candidate(spot)
+        if candidate is None:
+            return False
+        return await self.start_campaign(candidate)
 
-        results = await asyncio.gather(
-            self.submit_cross(pair.call_symbol, Side.BUY, qty, snapshot.call_ask, "pcp-close-short", pair.strike),
-            self.submit_cross(pair.put_symbol, Side.SELL, qty, snapshot.put_bid, "pcp-close-short", pair.strike),
-        )
-        if any(results):
-            self.last_action_at[pair.strike] = self.now()
-            print(f"[REDUCE] strike={pair.strike} action=CLOSE_SYNTH_SHORT gap={snapshot.mid_gap}")
-
-    async def maybe_reduce_when_normalized(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
+    def exit_candidates_for_pair(self, pair: OptionPair, snapshot: ParitySnapshot) -> list[CampaignCandidate]:
+        candidates: list[CampaignCandidate] = []
         synthetic_long, synthetic_short, _ = self.paired_inventory(pair)
-        if snapshot.mid_gap is None:
-            return False
-        if abs(snapshot.mid_gap) > self.cfg.parity_exit_band:
-            return False
-        if not self.cooldown_ready(pair.strike):
-            return False
+        call_spread = self.option_spread(pair.call_symbol)
+        put_spread = self.option_spread(pair.put_symbol)
+        call_depth = self.quote_depth(snapshot.call_bid_qty, snapshot.call_ask_qty)
+        put_depth = self.quote_depth(snapshot.put_bid_qty, snapshot.put_ask_qty)
 
         if synthetic_long > 0:
-            executable_close = None
-            if snapshot.call_bid is not None and snapshot.put_ask is not None:
-                executable_close = snapshot.call_bid - snapshot.put_ask
-            if executable_close is not None and executable_close >= snapshot.theoretical_cp_diff - self.cfg.parity_exit_band:
-                await self.close_synthetic_long(pair, snapshot, synthetic_long)
-                return True
+            qty = self.trade_size_for_pair(pair, synthetic_long)
+            if qty > 0 and snapshot.mid_gap is not None and abs(snapshot.mid_gap) <= self.cfg.parity_exit_band:
+                if snapshot.put_ask is not None and call_spread is not None:
+                    price = self.passive_sell_price(
+                        snapshot.call_bid,
+                        snapshot.call_ask,
+                        snapshot.theoretical_cp_diff + snapshot.put_ask - self.cfg.parity_exit_band,
+                    )
+                    if price is not None:
+                        slack = price - snapshot.put_ask - (snapshot.theoretical_cp_diff - self.cfg.parity_exit_band)
+                        candidates.append(
+                            CampaignCandidate(
+                                kind="exit_long",
+                                pair=pair,
+                                first_leg=PassiveQuotePlan(
+                                    symbol=pair.call_symbol,
+                                    side=Side.SELL,
+                                    price=price,
+                                    qty=qty,
+                                    preserved_edge=slack,
+                                    option_spread=call_spread,
+                                    top_depth=call_depth,
+                                    note="exit_long_call_first",
+                                ),
+                                hedge_symbol=pair.put_symbol,
+                                hedge_side=Side.BUY,
+                                score=slack,
+                                note="passive_exit",
+                            )
+                        )
+                if snapshot.call_bid is not None and put_spread is not None:
+                    price = self.passive_buy_price(
+                        snapshot.put_bid,
+                        snapshot.put_ask,
+                        snapshot.call_bid - snapshot.theoretical_cp_diff + self.cfg.parity_exit_band,
+                    )
+                    if price is not None:
+                        slack = snapshot.call_bid - price - (snapshot.theoretical_cp_diff - self.cfg.parity_exit_band)
+                        candidates.append(
+                            CampaignCandidate(
+                                kind="exit_long",
+                                pair=pair,
+                                first_leg=PassiveQuotePlan(
+                                    symbol=pair.put_symbol,
+                                    side=Side.BUY,
+                                    price=price,
+                                    qty=qty,
+                                    preserved_edge=slack,
+                                    option_spread=put_spread,
+                                    top_depth=put_depth,
+                                    note="exit_long_put_first",
+                                ),
+                                hedge_symbol=pair.call_symbol,
+                                hedge_side=Side.SELL,
+                                score=slack,
+                                note="passive_exit",
+                            )
+                        )
 
         if synthetic_short > 0:
-            executable_close = None
-            if snapshot.call_ask is not None and snapshot.put_bid is not None:
-                executable_close = snapshot.call_ask - snapshot.put_bid
-            if executable_close is not None and executable_close <= snapshot.theoretical_cp_diff + self.cfg.parity_exit_band:
-                await self.close_synthetic_short(pair, snapshot, synthetic_short)
-                return True
+            qty = self.trade_size_for_pair(pair, synthetic_short)
+            if qty > 0 and snapshot.mid_gap is not None and abs(snapshot.mid_gap) <= self.cfg.parity_exit_band:
+                if snapshot.put_bid is not None and call_spread is not None:
+                    price = self.passive_buy_price(
+                        snapshot.call_bid,
+                        snapshot.call_ask,
+                        snapshot.theoretical_cp_diff + snapshot.put_bid + self.cfg.parity_exit_band,
+                    )
+                    if price is not None:
+                        slack = snapshot.theoretical_cp_diff + self.cfg.parity_exit_band - (price - snapshot.put_bid)
+                        candidates.append(
+                            CampaignCandidate(
+                                kind="exit_short",
+                                pair=pair,
+                                first_leg=PassiveQuotePlan(
+                                    symbol=pair.call_symbol,
+                                    side=Side.BUY,
+                                    price=price,
+                                    qty=qty,
+                                    preserved_edge=slack,
+                                    option_spread=call_spread,
+                                    top_depth=call_depth,
+                                    note="exit_short_call_first",
+                                ),
+                                hedge_symbol=pair.put_symbol,
+                                hedge_side=Side.SELL,
+                                score=slack,
+                                note="passive_exit",
+                            )
+                        )
+                if snapshot.call_ask is not None and put_spread is not None:
+                    price = self.passive_sell_price(
+                        snapshot.put_bid,
+                        snapshot.put_ask,
+                        snapshot.call_ask - snapshot.theoretical_cp_diff - self.cfg.parity_exit_band,
+                    )
+                    if price is not None:
+                        slack = snapshot.theoretical_cp_diff + self.cfg.parity_exit_band - (snapshot.call_ask - price)
+                        candidates.append(
+                            CampaignCandidate(
+                                kind="exit_short",
+                                pair=pair,
+                                first_leg=PassiveQuotePlan(
+                                    symbol=pair.put_symbol,
+                                    side=Side.SELL,
+                                    price=price,
+                                    qty=qty,
+                                    preserved_edge=slack,
+                                    option_spread=put_spread,
+                                    top_depth=put_depth,
+                                    note="exit_short_put_first",
+                                ),
+                                hedge_symbol=pair.call_symbol,
+                                hedge_side=Side.BUY,
+                                score=slack,
+                                note="passive_exit",
+                            )
+                        )
 
-        return False
+        return [candidate for candidate in candidates if candidate.score >= 0]
 
-    async def maybe_reduce_unpaired_inventory(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
-        call_pos = self.position(pair.call_symbol)
-        put_pos = self.position(pair.put_symbol)
-        cleanup_band = max(self.cfg.parity_exit_band, self.cfg.parity_entry_edge)
-        if snapshot.mid_gap is not None and abs(snapshot.mid_gap) > cleanup_band:
-            return False
-        if not self.cooldown_ready(pair.strike):
-            return False
-        if self.strike_has_pending_orders(pair.strike):
-            return False
-
-        if call_pos > 0 and snapshot.call_bid is not None:
-            qty = min(call_pos, snapshot.call_bid_qty or call_pos, self.cfg.max_trade_qty)
-            if qty > 0:
-                order_id = await self.submit_cross(pair.call_symbol, Side.SELL, qty, snapshot.call_bid, "pcp-cleanup", pair.strike)
-                if order_id:
-                    self.last_action_at[pair.strike] = self.now()
-                    return True
-        if call_pos < 0 and snapshot.call_ask is not None:
-            qty = min(abs(call_pos), snapshot.call_ask_qty or abs(call_pos), self.cfg.max_trade_qty)
-            if qty > 0:
-                order_id = await self.submit_cross(pair.call_symbol, Side.BUY, qty, snapshot.call_ask, "pcp-cleanup", pair.strike)
-                if order_id:
-                    self.last_action_at[pair.strike] = self.now()
-                    return True
-        if put_pos > 0 and snapshot.put_bid is not None:
-            qty = min(put_pos, snapshot.put_bid_qty or put_pos, self.cfg.max_trade_qty)
-            if qty > 0:
-                order_id = await self.submit_cross(pair.put_symbol, Side.SELL, qty, snapshot.put_bid, "pcp-cleanup", pair.strike)
-                if order_id:
-                    self.last_action_at[pair.strike] = self.now()
-                    return True
-        if put_pos < 0 and snapshot.put_ask is not None:
-            qty = min(abs(put_pos), snapshot.put_ask_qty or abs(put_pos), self.cfg.max_trade_qty)
-            if qty > 0:
-                order_id = await self.submit_cross(pair.put_symbol, Side.BUY, qty, snapshot.put_ask, "pcp-cleanup", pair.strike)
-                if order_id:
-                    self.last_action_at[pair.strike] = self.now()
-                    return True
-
-        return False
-
-    async def maybe_open_parity_trade(self, pair: OptionPair, snapshot: ParitySnapshot) -> bool:
-        synthetic_long, synthetic_short, imbalance = self.paired_inventory(pair)
-        if imbalance > 0:
-            self.log_gate(
-                f"open:{pair.strike}:imbalance",
-                f"[SKIP] strike={pair.strike} reason=unpaired_inventory "
-                f"call={self.position(pair.call_symbol)} put={self.position(pair.put_symbol)}",
-            )
-            return False
-        if not self.cooldown_ready(pair.strike):
-            self.log_gate(
-                f"open:{pair.strike}:cooldown",
-                f"[SKIP] strike={pair.strike} reason=cooldown "
-                f"wait={self.cfg.per_strike_cooldown_sec - (self.now() - self.last_action_at.get(pair.strike, 0.0)):.2f}s",
-            )
-            return False
-        if self.strike_has_pending_orders(pair.strike):
-            self.log_gate(
-                f"open:{pair.strike}:pending",
-                f"[SKIP] strike={pair.strike} reason=pending_orders count={self.pending_order_count_for_strike(pair.strike)}",
-            )
-            return False
-        if synthetic_long > 0 or synthetic_short > 0:
-            self.log_gate(
-                f"open:{pair.strike}:paired",
-                f"[SKIP] strike={pair.strike} reason=existing_pair long={synthetic_long} short={synthetic_short}",
-            )
-            return False
-
-        if snapshot.long_synth_edge is None and snapshot.short_synth_edge is None:
-            self.log_gate(f"open:{pair.strike}:quotes", f"[SKIP] strike={pair.strike} reason=no_executable_quotes")
-            return False
-
-        if snapshot.long_synth_edge is not None and snapshot.long_synth_edge >= self.cfg.parity_entry_edge:
-            return await self.open_synthetic_long(pair, snapshot)
-
-        if snapshot.short_synth_edge is not None and snapshot.short_synth_edge >= self.cfg.parity_entry_edge:
-            return await self.open_synthetic_short(pair, snapshot)
-
-        self.log_gate(
-            f"open:{pair.strike}:edge",
-            f"[SKIP] strike={pair.strike} reason=edge_below_threshold "
-            f"long={snapshot.long_synth_edge} short={snapshot.short_synth_edge} "
-            f"threshold={self.cfg.parity_entry_edge}",
-        )
-
-        return False
-
-    async def maybe_force_parity_trade(self, snapshots: list[tuple[OptionPair, ParitySnapshot]]) -> bool:
-        if self.probe_active():
-            return False
-        if self.has_any_option_inventory_or_orders():
-            return False
-        if self.now() - self.last_open_trade_at < self.cfg.force_entry_after_sec:
-            return False
-
-        best_pair: Optional[OptionPair] = None
-        best_snapshot: Optional[ParitySnapshot] = None
-        best_side: Optional[str] = None
-        best_edge = float("-inf")
-
-        for pair, snapshot in snapshots:
+    def best_exit_candidate(self, spot: float) -> Optional[CampaignCandidate]:
+        best_per_pair: list[CampaignCandidate] = []
+        for pair in self.option_pairs:
             if not self.cooldown_ready(pair.strike):
                 continue
             if self.strike_has_pending_orders(pair.strike):
                 continue
-            if snapshot.long_synth_edge is not None and snapshot.long_synth_edge > best_edge:
-                best_pair = pair
-                best_snapshot = snapshot
-                best_side = "long"
-                best_edge = snapshot.long_synth_edge
-            if snapshot.short_synth_edge is not None and snapshot.short_synth_edge > best_edge:
-                best_pair = pair
-                best_snapshot = snapshot
-                best_side = "short"
-                best_edge = snapshot.short_synth_edge
-
-        if best_pair is None or best_snapshot is None or best_side is None:
-            self.log_gate("force:none", "[FORCE] skip reason=no_force_candidate")
-            return False
-
-        if best_edge < self.cfg.force_entry_edge_floor:
-            self.log_gate(
-                "force:floor",
-                f"[FORCE] skip reason=edge_below_floor best_edge={best_edge} "
-                f"floor={self.cfg.force_entry_edge_floor}",
+            snapshot = self.parity_snapshot(pair, spot)
+            if snapshot is None:
+                continue
+            candidates = self.exit_candidates_for_pair(pair, snapshot)
+            if not candidates:
+                continue
+            best_per_pair.append(
+                max(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.first_leg.option_spread,
+                        candidate.first_leg.preserved_edge,
+                        candidate.first_leg.top_depth,
+                    ),
+                )
             )
-            return False
-
-        print(
-            f"[FORCE] strike={best_pair.strike} side={best_side} "
-            f"edge={best_edge:.2f} floor={self.cfg.force_entry_edge_floor}"
+        if not best_per_pair:
+            return None
+        return max(
+            best_per_pair,
+            key=lambda candidate: (
+                candidate.first_leg.preserved_edge,
+                candidate.first_leg.option_spread,
+                candidate.first_leg.top_depth,
+            ),
         )
-        if best_side == "long":
-            return await self.open_synthetic_long(best_pair, best_snapshot)
-        return await self.open_synthetic_short(best_pair, best_snapshot)
+
+    async def maybe_start_exit_campaign(self, spot: float) -> bool:
+        candidate = self.best_exit_candidate(spot)
+        if candidate is None:
+            return False
+        return await self.start_campaign(candidate)
+
+    def build_hedge_plan(self, campaign: PassiveCampaign, snapshot: ParitySnapshot) -> Optional[PassiveQuotePlan]:
+        fill_price = campaign.first_fill_price()
+        if fill_price is None:
+            return None
+        qty = max(0, campaign.first_filled_qty - campaign.hedge_filled_qty)
+        if qty <= 0:
+            return None
+        symbol = campaign.hedge_symbol
+        bid, bid_qty, ask, ask_qty = self.top(symbol)
+        spread = self.option_spread(symbol)
+        if spread is None:
+            return None
+        depth = self.quote_depth(bid_qty, ask_qty)
+        theoretical = snapshot.theoretical_cp_diff
+        note = f"hedge_after_{campaign.first_leg.note}"
+
+        if campaign.kind == "entry_long" and campaign.first_leg.symbol == campaign.pair.call_symbol:
+            price = self.passive_sell_price(bid, ask, fill_price - theoretical + self.cfg.parity_entry_edge)
+            if price is None:
+                return None
+            edge = theoretical - (fill_price - price)
+            return PassiveQuotePlan(symbol=symbol, side=Side.SELL, price=price, qty=qty, preserved_edge=edge, option_spread=spread, top_depth=depth, note=note)
+
+        if campaign.kind == "entry_long":
+            price = self.passive_buy_price(bid, ask, theoretical + fill_price - self.cfg.parity_entry_edge)
+            if price is None:
+                return None
+            edge = theoretical - (price - fill_price)
+            return PassiveQuotePlan(symbol=symbol, side=Side.BUY, price=price, qty=qty, preserved_edge=edge, option_spread=spread, top_depth=depth, note=note)
+
+        if campaign.kind == "entry_short" and campaign.first_leg.symbol == campaign.pair.call_symbol:
+            price = self.passive_buy_price(bid, ask, fill_price - theoretical - self.cfg.parity_entry_edge)
+            if price is None:
+                return None
+            edge = (fill_price - price) - theoretical
+            return PassiveQuotePlan(symbol=symbol, side=Side.BUY, price=price, qty=qty, preserved_edge=edge, option_spread=spread, top_depth=depth, note=note)
+
+        if campaign.kind == "entry_short":
+            price = self.passive_sell_price(bid, ask, theoretical + fill_price + self.cfg.parity_entry_edge)
+            if price is None:
+                return None
+            edge = (price - fill_price) - theoretical
+            return PassiveQuotePlan(symbol=symbol, side=Side.SELL, price=price, qty=qty, preserved_edge=edge, option_spread=spread, top_depth=depth, note=note)
+
+        if campaign.kind == "exit_long" and campaign.first_leg.symbol == campaign.pair.call_symbol:
+            price = self.passive_buy_price(bid, ask, fill_price - theoretical + self.cfg.parity_exit_band)
+            if price is None:
+                return None
+            slack = fill_price - price - (theoretical - self.cfg.parity_exit_band)
+            return PassiveQuotePlan(symbol=symbol, side=Side.BUY, price=price, qty=qty, preserved_edge=slack, option_spread=spread, top_depth=depth, note=note)
+
+        if campaign.kind == "exit_long":
+            price = self.passive_sell_price(bid, ask, theoretical + fill_price - self.cfg.parity_exit_band)
+            if price is None:
+                return None
+            slack = price - fill_price - (theoretical - self.cfg.parity_exit_band)
+            return PassiveQuotePlan(symbol=symbol, side=Side.SELL, price=price, qty=qty, preserved_edge=slack, option_spread=spread, top_depth=depth, note=note)
+
+        if campaign.kind == "exit_short" and campaign.first_leg.symbol == campaign.pair.call_symbol:
+            price = self.passive_sell_price(bid, ask, fill_price - theoretical - self.cfg.parity_exit_band)
+            if price is None:
+                return None
+            slack = price - (fill_price - theoretical - self.cfg.parity_exit_band)
+            return PassiveQuotePlan(symbol=symbol, side=Side.SELL, price=price, qty=qty, preserved_edge=slack, option_spread=spread, top_depth=depth, note=note)
+
+        price = self.passive_buy_price(bid, ask, theoretical + fill_price + self.cfg.parity_exit_band)
+        if price is None:
+            return None
+        slack = theoretical + self.cfg.parity_exit_band - (price - fill_price)
+        return PassiveQuotePlan(symbol=symbol, side=Side.BUY, price=price, qty=qty, preserved_edge=slack, option_spread=spread, top_depth=depth, note=note)
+
+    def build_unwind_plan(self, campaign: PassiveCampaign) -> Optional[PassiveQuotePlan]:
+        qty = campaign.residual_qty()
+        if qty <= 0:
+            return None
+        symbol = campaign.first_leg.symbol
+        bid, bid_qty, ask, ask_qty = self.top(symbol)
+        if bid is None or ask is None or ask <= bid:
+            return None
+        side = Side.SELL if campaign.first_leg.side == Side.BUY else Side.BUY
+        spread = ask - bid
+        step = campaign.unwind_reprices
+        if side == Side.SELL:
+            base = max(bid + 1, math.floor((bid + ask) / 2)) if spread >= 2 else ask
+            price = min(ask, base + step)
+        else:
+            base = min(ask - 1, math.ceil((bid + ask) / 2)) if spread >= 2 else bid
+            price = max(bid, base - step)
+        return PassiveQuotePlan(
+            symbol=symbol,
+            side=side,
+            price=int(price),
+            qty=qty,
+            preserved_edge=0.0,
+            option_spread=spread,
+            top_depth=self.quote_depth(bid_qty, ask_qty),
+            note="passive_unwind",
+        )
+
+    async def advance_campaign(self, spot: float) -> bool:
+        campaign = self.active_campaign
+        if campaign is None:
+            return False
+        snapshot = self.parity_snapshot(campaign.pair, spot)
+        if snapshot is None:
+            self.log_gate("campaign:no-snapshot", "[SKIP] campaign reason=no_snapshot")
+            return True
+        now = self.now()
+
+        if campaign.state in {"ENTRY_RESTING", "EXIT_RESTING"}:
+            if self.campaign_has_live_order():
+                if now - campaign.stage_started_at >= self.cfg.passive_entry_ttl_sec:
+                    await self.cancel_campaign_order("first_leg_ttl")
+                return True
+            if campaign.first_filled_qty > 0:
+                self.transition_campaign("FIRST_LEG_FILLED_WAITING_HEDGE", "first_leg_filled")
+            else:
+                self.clear_campaign("first_leg_unfilled")
+            return True
+
+        if campaign.state == "FIRST_LEG_FILLED_WAITING_HEDGE":
+            if self.campaign_has_live_order():
+                return True
+            hedge_plan = self.build_hedge_plan(campaign, snapshot)
+            if hedge_plan is None:
+                self.transition_campaign("UNWIND_RESTING", "hedge_not_passively_feasible")
+                return True
+            self.transition_campaign("HEDGE_RESTING", "submit_passive_hedge")
+            if not await self.submit_campaign_plan(hedge_plan, "hedge"):
+                self.transition_campaign("UNWIND_RESTING", "hedge_submit_failed")
+            return True
+
+        if campaign.state == "HEDGE_RESTING":
+            if self.campaign_has_live_order():
+                if now - campaign.stage_started_at >= self.cfg.passive_hedge_ttl_sec:
+                    await self.cancel_campaign_order("hedge_ttl")
+                return True
+            if campaign.first_filled_qty <= campaign.hedge_filled_qty:
+                if campaign.kind.startswith("entry_"):
+                    self.record_event(
+                        "parity_trade_open",
+                        strike=campaign.pair.strike,
+                        action=campaign.kind,
+                        qty=campaign.hedge_filled_qty,
+                        first_fill_price=campaign.first_fill_price(),
+                    )
+                else:
+                    self.record_event(
+                        "parity_trade_exit",
+                        strike=campaign.pair.strike,
+                        action=campaign.kind,
+                        qty=campaign.hedge_filled_qty,
+                        first_fill_price=campaign.first_fill_price(),
+                    )
+                self.clear_campaign("hedge_completed")
+                return True
+            self.transition_campaign("UNWIND_RESTING", f"hedge_incomplete residual={campaign.residual_qty()}")
+            return True
+
+        if campaign.state == "UNWIND_RESTING":
+            if campaign.residual_qty() <= 0:
+                if campaign.hedge_filled_qty > 0:
+                    self.record_event(
+                        "parity_trade_open" if campaign.kind.startswith("entry_") else "parity_trade_exit",
+                        strike=campaign.pair.strike,
+                        action=campaign.kind,
+                        qty=campaign.hedge_filled_qty,
+                        partial=True,
+                        first_fill_price=campaign.first_fill_price(),
+                        unwind_filled_qty=campaign.unwind_filled_qty,
+                    )
+                else:
+                    self.record_event(
+                        "campaign_aborted",
+                        strike=campaign.pair.strike,
+                        action=campaign.kind,
+                        first_fill_price=campaign.first_fill_price(),
+                        unwind_filled_qty=campaign.unwind_filled_qty,
+                    )
+                self.clear_campaign("unwind_completed")
+                return True
+            if self.campaign_has_live_order():
+                if now - campaign.stage_started_at < self.cfg.passive_unwind_ttl_sec:
+                    if now - campaign.last_reprice_at >= self.cfg.passive_unwind_reprice_sec:
+                        await self.cancel_campaign_order("unwind_reprice")
+                return True
+            plan = self.build_unwind_plan(campaign)
+            if plan is None:
+                self.log_gate(
+                    f"campaign:{campaign.pair.strike}:unwind_no_quote",
+                    f"[SKIP] strike={campaign.pair.strike} reason=no_unwind_quote",
+                )
+                return True
+            if not await self.submit_campaign_plan(plan, "unwind"):
+                self.log_gate(
+                    f"campaign:{campaign.pair.strike}:unwind_blocked",
+                    f"[SKIP] strike={campaign.pair.strike} reason=unwind_submit_blocked",
+                )
+            return True
+
+        return True
 
     def prune_order_meta(self) -> None:
         for order_id in list(self.order_meta):
@@ -882,9 +1656,7 @@ class MarketBBot(XChangeClient):
             if call_pos or put_pos:
                 local_parts.append(f"{pair.strike}:C={call_pos},P={put_pos}")
             if call_pos != call_exchange or put_pos != put_exchange:
-                diff_parts.append(
-                    f"{pair.strike}:C={call_pos}/{call_exchange},P={put_pos}/{put_exchange}"
-                )
+                diff_parts.append(f"{pair.strike}:C={call_pos}/{call_exchange},P={put_pos}/{put_exchange}")
             snapshot = self.parity_snapshot(pair, spot) if spot is not None else None
             if snapshot is None:
                 continue
@@ -894,6 +1666,7 @@ class MarketBBot(XChangeClient):
                 f"/P={self.pending_order_count_for_strike(pair.strike)}"
             )
 
+        campaign = self.serialize_campaign()
         print(
             "[STATUS]",
             f"spot={spot:.2f}" if spot is not None else "spot=NA",
@@ -903,6 +1676,18 @@ class MarketBBot(XChangeClient):
             f"outstanding={self.outstanding_qty()}",
             f"edges={' | '.join(edge_parts) if edge_parts else 'NA'}",
             f"probe={self.startup_probe_state}",
+            f"campaign={self.current_campaign_state()}",
+            f"campaign_strike={campaign['strike'] if campaign else 'NA'}",
+        )
+        self.record_event(
+            "status",
+            spot=spot,
+            local_positions=local_parts,
+            exchange_diff=diff_parts,
+            edges=edge_parts,
+            outstanding=self.outstanding_qty(),
+            probe=self.startup_probe_state,
+            campaign=campaign,
         )
 
     async def run_strategy(self) -> None:
@@ -918,34 +1703,117 @@ class MarketBBot(XChangeClient):
                 return
 
             await self.maybe_run_startup_probe()
+            if self.probe_active():
+                self.print_status(spot)
+                return
 
-            snapshots: list[tuple[OptionPair, ParitySnapshot]] = []
-            opened = False
-            for pair in self.option_pairs:
-                if self.probe_active() and self.startup_probe_strike == pair.strike:
-                    self.log_gate(
-                        f"probe:strike:{pair.strike}",
-                        f"[SKIP] strike={pair.strike} reason=probe_active state={self.startup_probe_state}",
-                    )
-                    continue
-                snapshot = self.parity_snapshot(pair, spot)
-                if snapshot is None:
-                    continue
-                snapshots.append((pair, snapshot))
-                reduced = await self.maybe_reduce_when_normalized(pair, snapshot)
-                if reduced:
-                    continue
-                cleaned = await self.maybe_reduce_unpaired_inventory(pair, snapshot)
-                if cleaned:
-                    continue
-                opened = await self.maybe_open_parity_trade(pair, snapshot)
-                if opened:
-                    break
+            if await self.advance_campaign(spot):
+                self.print_status(spot)
+                return
 
-            if not opened:
-                await self.maybe_force_parity_trade(snapshots)
+            if await self.maybe_start_exit_campaign(spot):
+                self.print_status(spot)
+                return
 
+            if self.has_any_option_inventory_or_orders():
+                self.log_gate("strategy:inventory", "[SKIP] strategy reason=inventory_or_orders_present")
+                self.print_status(spot)
+                return
+
+            await self.maybe_start_entry_campaign(spot)
             self.print_status(spot)
+
+    async def capture_loop(self) -> None:
+        if not self.cfg.capture_enabled:
+            return
+        while True:
+            try:
+                self.record_snapshot("periodic")
+            except Exception as exc:
+                print(f"[CAPTURE-ERROR] snapshot error={exc}")
+            await asyncio.sleep(self.cfg.capture_snapshot_interval_sec)
+
+    async def process_message(self, msg) -> None:
+        if hasattr(msg, "WhichOneof"):
+            msg_type = msg.WhichOneof("body")
+            index = getattr(msg, "index", None)
+            if msg_type == "trade":
+                self.record_event(
+                    "exchange_trade",
+                    index=index,
+                    symbol=msg.trade.symbol,
+                    price=msg.trade.px,
+                    qty=msg.trade.qty,
+                )
+            elif msg_type == "book_update":
+                side = "BUY" if int(msg.book_update.side) == 1 else "SELL"
+                self.record_event(
+                    "exchange_book_update",
+                    index=index,
+                    symbol=msg.book_update.symbol,
+                    side=side,
+                    price=msg.book_update.px,
+                    delta_qty=msg.book_update.dq,
+                )
+            elif msg_type == "book_snapshot":
+                self.record_event(
+                    "exchange_book_snapshot",
+                    index=index,
+                    symbol=msg.book_snapshot.symbol,
+                    bids=[[int(level.px), int(level.qty)] for level in msg.book_snapshot.bids],
+                    asks=[[int(level.px), int(level.qty)] for level in msg.book_snapshot.asks],
+                )
+            elif msg_type == "order_fill":
+                self.record_event(
+                    "exchange_order_fill",
+                    index=index,
+                    order_id=msg.order_fill.id,
+                    qty=msg.order_fill.qty,
+                    price=msg.order_fill.px,
+                    known_order=msg.order_fill.id in self.open_orders,
+                )
+            elif msg_type == "order_rejected":
+                self.record_event(
+                    "exchange_order_rejected",
+                    index=index,
+                    order_id=msg.order_rejected.id,
+                    reason=msg.order_rejected.reason,
+                )
+            elif msg_type == "cancel_response":
+                result = "ok" if msg.cancel_response.WhichOneof("result") == "ok" else "error"
+                self.record_event(
+                    "exchange_cancel_response",
+                    index=index,
+                    order_id=msg.cancel_response.id,
+                    result=result,
+                )
+            elif msg_type == "position_update":
+                symbol = msg.position_update.symbol
+                self.record_event(
+                    "exchange_position_update",
+                    index=index,
+                    symbol=symbol,
+                    old_value=self.exchange_position(symbol),
+                    new_value=msg.position_update.value,
+                )
+            elif msg_type == "cash_update":
+                self.record_event(
+                    "exchange_cash_update",
+                    index=index,
+                    old_value=self.positions.get("cash", 0),
+                    new_value=msg.cash_update.value,
+                )
+            elif msg_type == "position_snapshot":
+                snapshot_positions = {
+                    position.symbol: position.position for position in msg.position_snapshot.positions
+                }
+                self.record_event(
+                    "exchange_position_snapshot",
+                    index=index,
+                    cash=msg.position_snapshot.cash,
+                    positions=snapshot_positions,
+                )
+        await super().process_message(msg)
 
     async def strategy_loop(self) -> None:
         await asyncio.sleep(1.0)
@@ -956,8 +1824,19 @@ class MarketBBot(XChangeClient):
             f"startup_probe={self.cfg.startup_probe_enabled} "
             f"probe_timeout={self.cfg.startup_probe_timeout_sec} "
             f"probe_attempts={self.cfg.startup_probe_max_attempts} "
-            f"force_after={self.cfg.force_entry_after_sec} "
-            f"force_floor={self.cfg.force_entry_edge_floor}"
+            f"passive_entry_ttl={self.cfg.passive_entry_ttl_sec} "
+            f"passive_hedge_ttl={self.cfg.passive_hedge_ttl_sec} "
+            f"passive_unwind_ttl={self.cfg.passive_unwind_ttl_sec}"
+        )
+        self.record_event(
+            "init",
+            host=self.cfg.host,
+            username=self.cfg.username,
+            parity_entry_edge=self.cfg.parity_entry_edge,
+            startup_probe=self.cfg.startup_probe_enabled,
+            passive_entry_ttl_sec=self.cfg.passive_entry_ttl_sec,
+            passive_hedge_ttl_sec=self.cfg.passive_hedge_ttl_sec,
+            passive_unwind_ttl_sec=self.cfg.passive_unwind_ttl_sec,
         )
         while True:
             try:
@@ -977,6 +1856,7 @@ class MarketBBot(XChangeClient):
 
     async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int):
         self.last_trade[symbol] = int(price)
+        self.record_event("trade_msg", symbol=symbol, price=price, qty=qty)
         if symbol == "B" or OPTION_RE.fullmatch(symbol):
             self._book_event.set()
 
@@ -992,6 +1872,39 @@ class MarketBBot(XChangeClient):
                 f"[FILL-STATE] symbol={meta.symbol} local={self.local_positions[meta.symbol]} "
                 f"exchange={self.exchange_position(meta.symbol)}"
             )
+            self.record_event(
+                "order_fill",
+                order_id=order_id,
+                purpose=meta.purpose,
+                symbol=meta.symbol,
+                side=meta.side.name,
+                qty=qty,
+                price=price,
+                local_position=self.local_positions[meta.symbol],
+                exchange_position=self.exchange_position(meta.symbol),
+            )
+            if self.active_campaign is not None and order_id == self.active_campaign.current_order_id:
+                if self.active_campaign.current_role == "first":
+                    self.active_campaign.first_filled_qty += qty
+                    self.active_campaign.first_fill_notional += qty * price
+                    if order_id in self.open_orders:
+                        await self.cancel_campaign_order("first_leg_partial_fill")
+                    else:
+                        self.active_campaign.current_order_id = None
+                        self.active_campaign.current_role = None
+                        self.transition_campaign("FIRST_LEG_FILLED_WAITING_HEDGE", "first_leg_filled")
+                elif self.active_campaign.current_role == "hedge":
+                    self.active_campaign.hedge_filled_qty += qty
+                    self.active_campaign.hedge_fill_notional += qty * price
+                    if order_id not in self.open_orders:
+                        self.active_campaign.current_order_id = None
+                        self.active_campaign.current_role = None
+                elif self.active_campaign.current_role == "unwind":
+                    self.active_campaign.unwind_filled_qty += qty
+                    self.active_campaign.unwind_fill_notional += qty * price
+                    if order_id not in self.open_orders:
+                        self.active_campaign.current_order_id = None
+                        self.active_campaign.current_role = None
             if meta.purpose == "startup-probe-entry":
                 self.set_probe_state("entry_filled_waiting_exit", f"symbol={meta.symbol} pos={self.position(meta.symbol)}")
             elif meta.purpose == "startup-probe-exit" and self.position(meta.symbol) == 0:
@@ -1002,8 +1915,28 @@ class MarketBBot(XChangeClient):
         self._book_event.set()
 
     async def bot_handle_order_rejected(self, order_id: str, reason: str) -> None:
+        if self.active_campaign is not None and order_id == self.active_campaign.current_order_id:
+            self.record_event(
+                "campaign_order_rejected",
+                campaign_kind=self.active_campaign.kind,
+                strike=self.active_campaign.pair.strike,
+                state=self.active_campaign.state,
+                role=self.active_campaign.current_role,
+                order_id=order_id,
+                reason=reason,
+            )
+            if self.active_campaign.current_role == "first":
+                self.clear_campaign(f"first_leg_rejected:{reason}")
+            elif self.active_campaign.current_role == "hedge":
+                self.active_campaign.current_order_id = None
+                self.active_campaign.current_role = None
+                self.transition_campaign("UNWIND_RESTING", f"hedge_rejected:{reason}")
+            else:
+                self.active_campaign.current_order_id = None
+                self.active_campaign.current_role = None
         self.order_meta.pop(order_id, None)
         print(f"[REJECT] {order_id}: {reason}")
+        self.record_event("order_rejected", order_id=order_id, reason=reason)
         self._book_event.set()
 
     async def bot_handle_cancel_response(self, order_id: str, success: bool, error: Optional[str] = None) -> None:
@@ -1011,11 +1944,15 @@ class MarketBBot(XChangeClient):
         if meta:
             meta.cancel_pending = False
         if success:
+            if self.active_campaign is not None and order_id == self.active_campaign.current_order_id:
+                self.active_campaign.current_order_id = None
+                self.active_campaign.current_role = None
             if meta and meta.purpose.startswith("startup-probe"):
                 print(f"[PROBE] cancel order_id={order_id} purpose={meta.purpose} symbol={meta.symbol}")
             self.order_meta.pop(order_id, None)
         else:
             print(f"[CANCEL-FAIL] {order_id}: {error}")
+        self.record_event("cancel_response", order_id=order_id, success=success, error=error)
         self._book_event.set()
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool):
@@ -1026,6 +1963,8 @@ class MarketBBot(XChangeClient):
 
     async def start(self):
         asyncio.create_task(self.strategy_loop())
+        if self.cfg.capture_enabled:
+            asyncio.create_task(self.capture_loop())
         await self.connect()
 
 

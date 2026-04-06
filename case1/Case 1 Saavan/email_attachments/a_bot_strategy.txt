@@ -451,7 +451,7 @@ class QuoteEngine:
         if mode == "NEWS_CAUTIOUS_MM":
             return self.a_config.news_caution_max_position
         if mode == "POST_EARNINGS_SHOCK":
-            return self.a_config.shock_base_max_position
+            return self.a_config.shock_max_position
         if mode == "PRE_NEWS_PULLBACK":
             return 0
         return self.a_config.steady_max_position
@@ -747,115 +747,6 @@ class QuoteEngine:
             reason="steady mm",
         )
 
-    def _prejump_quotes(
-        self,
-        mode: ModeName,
-        fair_value: int,
-        inventory: int,
-        book: BookSnapshot,
-        buy_exposure: int,
-        sell_exposure: int,
-        *,
-        bullish: bool,
-        overlay: OverlayName = "earnings",
-        cap_override: int | None = None,
-        quote_size_override: int | None = None,
-        aggressive_edge_override: int | None = None,
-    ) -> QuotePlan:
-        quote_size = self.a_config.prejump_quote_size if quote_size_override is None else max(0, int(quote_size_override))
-        cap = self.a_config.prejump_max_position if cap_override is None else max(0, int(cap_override))
-        aggressive_edge = (
-            self.a_config.prejump_aggressive_edge
-            if aggressive_edge_override is None
-            else max(0, int(aggressive_edge_override))
-        )
-        allowed_buy, allowed_sell = self._allowed_size(
-            inventory,
-            buy_exposure,
-            sell_exposure,
-            cap=cap,
-        )
-        aggressive_actions: list[DesiredOrder] = []
-        desired_bid = None
-        desired_ask = None
-
-        if bullish:
-            if book.best_ask is not None and allowed_buy > 0 and book.best_ask.px <= fair_value + aggressive_edge:
-                aggressive_actions.append(
-                    self._desired(
-                        side="BUY",
-                        px=book.best_ask.px,
-                        qty=min(quote_size, allowed_buy, book.best_ask.qty),
-                        overlay=overlay,
-                        aggressive=True,
-                        reason="boundary pre-jump buy near low earnings extreme",
-                        intent="earnings_prejump",
-                        mode=mode,
-                    )
-                )
-            if allowed_buy > 0:
-                bid_px = int(floor(fair_value - self.a_config.steady_half_spread_ticks))
-                if book.best_bid is not None:
-                    bid_px = max(bid_px, book.best_bid.px + 1)
-                if book.best_ask is not None:
-                    bid_px = min(bid_px, book.best_ask.px - 1)
-                desired_bid = self._desired(
-                    side="BUY",
-                    px=bid_px,
-                    qty=min(quote_size, allowed_buy),
-                    overlay=overlay,
-                    aggressive=False,
-                    reason="boundary pre-jump bid accumulation ahead of earnings",
-                    intent="earnings_prejump",
-                    mode=mode,
-                )
-            return QuotePlan(
-                mode=mode,
-                bid=desired_bid,
-                ask=None,
-                aggressive_actions=tuple(aggressive_actions),
-                observe_only=False,
-                reason="boundary bullish pre-jump",
-            )
-
-        if book.best_bid is not None and allowed_sell > 0 and book.best_bid.px >= fair_value - aggressive_edge:
-            aggressive_actions.append(
-                self._desired(
-                    side="SELL",
-                    px=book.best_bid.px,
-                    qty=min(quote_size, allowed_sell, book.best_bid.qty),
-                    overlay=overlay,
-                    aggressive=True,
-                    reason="boundary pre-jump sell near high earnings extreme",
-                    intent="earnings_prejump",
-                    mode=mode,
-                )
-            )
-        if allowed_sell > 0:
-            ask_px = int(ceil(fair_value + self.a_config.steady_half_spread_ticks))
-            if book.best_ask is not None:
-                ask_px = min(ask_px, max(book.best_bid.px + 1, book.best_ask.px - 1) if book.best_bid is not None else book.best_ask.px - 1)
-            if book.best_bid is not None:
-                ask_px = max(ask_px, book.best_bid.px + 1)
-            desired_ask = self._desired(
-                side="SELL",
-                px=ask_px,
-                qty=min(quote_size, allowed_sell),
-                overlay=overlay,
-                aggressive=False,
-                reason="boundary pre-jump ask accumulation ahead of earnings",
-                intent="earnings_prejump",
-                mode=mode,
-            )
-        return QuotePlan(
-            mode=mode,
-            bid=None,
-            ask=desired_ask,
-            aggressive_actions=tuple(aggressive_actions),
-            observe_only=False,
-            reason="boundary bearish pre-jump",
-        )
-
     def _shock_quotes(
         self,
         mode: ModeName,
@@ -873,7 +764,7 @@ class QuoteEngine:
     ) -> QuotePlan:
         aggressive_actions: list[DesiredOrder] = []
         quote_size = self.a_config.shock_quote_size if quote_size_override is None else max(0, int(quote_size_override))
-        cap = self.a_config.shock_base_max_position if cap_override is None else max(0, int(cap_override))
+        cap = self.a_config.shock_max_position if cap_override is None else max(0, int(cap_override))
         allowed_buy, allowed_sell = self._allowed_size(
             inventory,
             buy_exposure,
@@ -965,7 +856,6 @@ class QuoteEngine:
         quote_size_override: int | None = None,
         aggressive_intent: str = "unwind",
         passive_intent: str = "unwind",
-        passive_take_edge_override: int | None = None,
     ) -> QuotePlan:
         aggressive_actions: list[DesiredOrder] = []
         quote_size = self.a_config.steady_quote_size if quote_size_override is None else max(0, int(quote_size_override))
@@ -976,11 +866,7 @@ class QuoteEngine:
             sell_exposure,
             cap=cap,
         )
-        passive_take_edge = (
-            max(self.a_config.steady_take_large_inventory_edge, self.a_config.steady_half_spread_ticks)
-            if passive_take_edge_override is None
-            else max(0, int(passive_take_edge_override))
-        )
+        passive_take_edge = max(self.a_config.steady_take_large_inventory_edge, self.a_config.steady_half_spread_ticks)
 
         if inventory > 0:
             if (
@@ -1627,7 +1513,7 @@ class MarketAStrategy:
                 reason="Waiting for recovered A orders to be cancelled.",
             )
 
-        earnings_plan = self._compute_earnings_overlay_plan(self.mode, now_ms)
+        earnings_plan = self._compute_earnings_overlay_plan(self.mode)
         mm_plan = self._compute_mm_overlay_plan(self.mode)
         return self._merge_overlay_plans(self.mode, earnings_plan, mm_plan)
 
@@ -1712,36 +1598,23 @@ class MarketAStrategy:
 
         return self._empty_overlay_plan("mm", "MM overlay idle in earnings-handling mode.")
 
-    def _compute_earnings_overlay_plan(self, mode: ModeName, now_ms: int) -> OverlayPlan:
+    def _compute_earnings_overlay_plan(self, mode: ModeName) -> OverlayPlan:
         earnings_budget, _, _ = self.overlay_budgets(mode)
         if earnings_budget <= 0:
             return self._empty_overlay_plan("earnings", "Earnings overlay budget disabled.")
 
         earnings_inventory = self.earnings_position
         earnings_buy_exposure, earnings_sell_exposure = self.overlay_exposures("earnings")
-        mode_cap = self._earnings_mode_cap(mode, now_ms)
+        mode_cap = (
+            0 if mode == "PRE_NEWS_PULLBACK"
+            else self.a_config.shock_max_position if mode == "POST_EARNINGS_SHOCK"
+            else earnings_budget if mode == "UNWIND"
+            else 0
+        )
         allowed_buy, allowed_sell = self.overlay_allowed_size("earnings", mode_cap=mode_cap, budget=earnings_budget)
 
         if mode == "PRE_NEWS_PULLBACK":
-            prejump_side = self._prejump_side(now_ms)
-            if prejump_side is None:
-                return self._empty_overlay_plan("earnings", "flat before scheduled A earnings")
-            if self.valuation.fair_value is None:
-                return self._empty_overlay_plan("earnings", "waiting for a trusted fair before boundary pre-jump")
-            plan = self.quote_engine._prejump_quotes(
-                mode,
-                self.valuation.fair_value,
-                earnings_inventory,
-                self.book,
-                earnings_buy_exposure,
-                earnings_sell_exposure,
-                bullish=prejump_side == "BUY",
-                overlay="earnings",
-                cap_override=min(self.a_config.prejump_max_position, earnings_budget),
-                quote_size_override=self.a_config.prejump_quote_size,
-                aggressive_edge_override=self.a_config.prejump_aggressive_edge,
-            )
-            return self._clamp_overlay_plan("earnings", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
+            return self._empty_overlay_plan("earnings", "flat before scheduled A earnings")
 
         if mode == "POST_EARNINGS_SHOCK":
             if self.valuation.fair_value is None:
@@ -1756,7 +1629,7 @@ class MarketAStrategy:
                 shock_direction=self.shock_direction,
                 shock_threshold=self.shock_threshold or self.a_config.shock_take_min_edge,
                 overlay="earnings",
-                cap_override=min(self._shock_cap_for_mode(mode), earnings_budget),
+                cap_override=min(self.a_config.shock_max_position, earnings_budget),
                 quote_size_override=self.a_config.shock_quote_size,
             )
             return self._clamp_overlay_plan("earnings", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
@@ -1764,9 +1637,6 @@ class MarketAStrategy:
         if mode == "UNWIND":
             if self.valuation.fair_value is None:
                 return self._empty_overlay_plan("earnings", "Waiting for a trusted fair value before unwind.")
-            passive_take_edge = self.a_config.earnings_unwind_passive_take_edge
-            if abs(earnings_inventory) <= self.a_config.earnings_unwind_passive_exit:
-                return self._empty_overlay_plan("earnings", "earnings inventory no longer needs dedicated unwind handling")
             plan = self.quote_engine._unwind_quotes(
                 mode,
                 self.valuation.fair_value,
@@ -1780,7 +1650,6 @@ class MarketAStrategy:
                 quote_size_override=self.a_config.steady_quote_size,
                 aggressive_intent="unwind",
                 passive_intent="unwind",
-                passive_take_edge_override=passive_take_edge,
             )
             return self._clamp_overlay_plan("earnings", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
 
@@ -1872,7 +1741,7 @@ class MarketAStrategy:
         mm_buy_exposure, mm_sell_exposure = self.overlay_exposures("mm")
         earnings_allowed_buy, earnings_allowed_sell = self.overlay_allowed_size(
             "earnings",
-            mode_cap=self._earnings_mode_cap(mode, now_ms),
+            mode_cap=max(self.a_config.shock_max_position, earnings_budget),
             budget=earnings_budget,
         )
         mm_mode_cap = self.a_config.steady_max_position
@@ -1891,7 +1760,7 @@ class MarketAStrategy:
             self.a_config.total_position_limit,
             max(
                 0,
-                self._earnings_mode_cap(mode, now_ms) if mode in {"PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"} else 0,
+                earnings_budget if mode in {"PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"} else 0,
                 mm_budget,
             ),
         )
@@ -2099,7 +1968,7 @@ class MarketAStrategy:
     def _refresh_unwind_state(self) -> None:
         abs_inventory = abs(self.earnings_position)
         if self.unwind_active:
-            if abs_inventory <= self.a_config.earnings_unwind_passive_exit:
+            if abs_inventory <= self.a_config.unwind_exit_position:
                 self.unwind_active = False
                 self.unwind_aggressive_active = False
                 return
@@ -2111,43 +1980,11 @@ class MarketAStrategy:
             return
 
         if self.unwind_aggressive_active:
-            if abs_inventory <= self.a_config.earnings_unwind_aggressive_exit:
+            if abs_inventory <= self.a_config.unwind_aggressive_exit:
                 self.unwind_aggressive_active = False
             return
-        if abs_inventory >= self.a_config.earnings_unwind_aggressive_entry:
+        if abs_inventory >= self.a_config.unwind_aggressive_entry:
             self.unwind_aggressive_active = True
-
-    def _shock_cap_for_mode(self, mode: ModeName) -> int:
-        _, _, budget_shift_active = self.overlay_budgets(mode)
-        return self.a_config.shock_shift_max_position if budget_shift_active else self.a_config.shock_base_max_position
-
-    def _earnings_mode_cap(self, mode: ModeName, now_ms: int) -> int:
-        earnings_budget, _, _ = self.overlay_budgets(mode)
-        if mode == "PRE_NEWS_PULLBACK":
-            if self._prejump_side(now_ms) is None:
-                return 0
-            return min(self.a_config.prejump_max_position, earnings_budget)
-        if mode == "POST_EARNINGS_SHOCK":
-            return min(self._shock_cap_for_mode(mode), earnings_budget)
-        if mode == "UNWIND":
-            return earnings_budget
-        return 0
-
-    def _prejump_side(self, now_ms: int) -> SideName | None:
-        if not self.a_config.prejump_enabled:
-            return None
-        if self.news_caution_active:
-            return None
-        if self.trusted_multiplier is None or self.last_earnings_value is None or self.fair_value is None:
-            return None
-        until_next_earnings = self.ms_until_next_scheduled_earnings(now_ms)
-        if until_next_earnings is None or until_next_earnings > self.a_config.prejump_window_ms:
-            return None
-        if self.last_earnings_value <= self.a_config.prejump_low_threshold:
-            return "BUY"
-        if self.last_earnings_value >= self.a_config.prejump_high_threshold:
-            return "SELL"
-        return None
 
     @staticmethod
     def _order_reduces_position(side: SideName, position: int) -> bool:

@@ -37,12 +37,19 @@ def print_summary(summary: dict) -> None:
     print(f"Largest long inventory: {summary.get('largest_inventory_long', 0)}")
     print(f"Largest short inventory: {summary.get('largest_inventory_short', 0)}")
     print(f"Average inventory: {summary.get('average_inventory', 0.0):.2f}")
+    print(f"Average earnings inventory: {summary.get('average_earnings_inventory', 0.0):.2f}")
+    print(f"Average MM inventory: {summary.get('average_mm_inventory', 0.0):.2f}")
     print(f"Average quoted spread: {summary.get('average_quoted_spread')}")
     print(f"Observe-only decisions: {summary.get('observe_only_count', 0)}")
+    print(f"Budget shift active (ms): {summary.get('budget_shift_active_ms', 0)}")
     print("")
     print("Fills by intent:")
     for intent, count in (summary.get("fills_by_intent") or {}).items():
         print(f"  {intent}: {count}")
+    print("")
+    print("Fills by overlay:")
+    for overlay, count in (summary.get("fills_by_overlay") or {}).items():
+        print(f"  {overlay}: {count}")
     print("")
     print("Mode durations (ms):")
     for mode, duration in (summary.get("mode_durations_ms") or {}).items():
