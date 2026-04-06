@@ -43,6 +43,8 @@ SNAPSHOT_FIELDNAMES = [
     "rapid_unwind_active",
     "shock_stage",
     "shock_accumulate_target_position",
+    "shock_target_total_inventory",
+    "shock_remaining_total_room",
     "inventory",
     "earnings_position",
     "mm_position",
@@ -221,6 +223,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     submit_to_fill_latencies_ms: list[float] = []
     submit_to_cancel_response_latencies_ms: list[float] = []
     structured_earnings_events: list[dict[str, Any]] = []
+    ownership_transfer_events: list[dict[str, Any]] = []
 
     def nearest_snapshot_mid(target_ms: int) -> float | None:
         for snapshot in snapshot_events:
@@ -349,6 +352,19 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                     "shock_direction": event.get("shock_direction"),
                 }
             )
+        elif event.get("event_type") == "inventory_ownership_transfer":
+            ownership_transfer_events.append(
+                {
+                    "exchange_tick": event.get("exchange_tick"),
+                    "monotonic_ms": now_ms,
+                    "ownership_transfer_qty": event.get("ownership_transfer_qty"),
+                    "prior_earnings_position": event.get("prior_earnings_position"),
+                    "prior_mm_position": event.get("prior_mm_position"),
+                    "resulting_earnings_position": event.get("resulting_earnings_position"),
+                    "resulting_mm_position": event.get("resulting_mm_position"),
+                    "reason": event.get("reason"),
+                }
+            )
 
     if last_mode is not None and last_mode_started_ms is not None and event_list:
         final_ms = int(event_list[-1].get("monotonic_ms", 0))
@@ -367,9 +383,20 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     shock_episode_unwind_metrics: list[dict[str, Any]] = []
     for index, episode in enumerate(structured_earnings_events, start=1):
         start_ms = int(episode.get("monotonic_ms") or 0)
+        previous_episode_start_ms = 0
+        if index > 1:
+            previous_episode_start_ms = int(structured_earnings_events[index - 2].get("monotonic_ms") or 0)
         end_ms = final_ms + 1
         if index < len(structured_earnings_events):
             end_ms = int(structured_earnings_events[index].get("monotonic_ms") or final_ms)
+        transfer_event = next(
+            (
+                transfer
+                for transfer in reversed(ownership_transfer_events)
+                if previous_episode_start_ms <= int(transfer.get("monotonic_ms") or 0) < start_ms
+            ),
+            None,
+        )
         episode_events = [
             event
             for event in event_list
@@ -378,8 +405,19 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         episode_state_events = [
             event
             for event in episode_events
-            if event.get("earnings_position") is not None
+            if (
+                event.get("inventory") is not None
+                or event.get("earnings_position") is not None
+                or event.get("mm_position") is not None
+            )
         ]
+        peak_signed_total_inventory = 0
+        if episode_state_events:
+            peak_total_snapshot = max(
+                episode_state_events,
+                key=lambda state_event: abs(int(state_event.get("inventory") or 0)),
+            )
+            peak_signed_total_inventory = int(peak_total_snapshot.get("inventory") or 0)
         peak_signed_earnings_position = 0
         if episode_state_events:
             peak_snapshot = max(
@@ -387,6 +425,34 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 key=lambda state_event: abs(int(state_event.get("earnings_position") or 0)),
             )
             peak_signed_earnings_position = int(peak_snapshot.get("earnings_position") or 0)
+        peak_residual_mm_position = 0
+        if episode_state_events:
+            peak_mm_snapshot = max(
+                episode_state_events,
+                key=lambda state_event: abs(int(state_event.get("mm_position") or 0)),
+            )
+            peak_residual_mm_position = int(peak_mm_snapshot.get("mm_position") or 0)
+        episode_target_total_inventory = next(
+            (
+                int(state_event.get("shock_target_total_inventory"))
+                for state_event in episode_state_events
+                if state_event.get("shock_target_total_inventory") is not None
+            ),
+            None,
+        )
+        shock_stage_nonzero_mm_position_count = sum(
+            1
+            for state_event in episode_state_events
+            if state_event.get("shock_stage") in {"ACCUMULATE", "HOLD", "SETTLED_UNWIND"}
+            and abs(int(state_event.get("mm_position") or 0)) > 0
+        )
+        total_inventory_exceeded_target_cap = False
+        if episode_target_total_inventory is not None:
+            total_inventory_exceeded_target_cap = any(
+                abs(int(state_event.get("inventory") or 0)) > abs(episode_target_total_inventory)
+                for state_event in episode_state_events
+                if state_event.get("inventory") is not None
+            )
         settle_event = next(
             (
                 event
@@ -448,7 +514,14 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 "exchange_tick": episode.get("exchange_tick"),
                 "earnings_value": episode.get("earnings_value"),
                 "shock_direction": episode.get("shock_direction"),
+                "transferred_mm_inventory_at_cycle_start": None if transfer_event is None else transfer_event.get("ownership_transfer_qty"),
+                "peak_signed_total_inventory": peak_signed_total_inventory,
                 "peak_signed_earnings_position": peak_signed_earnings_position,
+                "peak_residual_mm_position": peak_residual_mm_position,
+                "shock_target_total_inventory": episode_target_total_inventory,
+                "total_inventory_exceeded_target_cap": total_inventory_exceeded_target_cap,
+                "shock_stage_nonzero_mm_position_count": shock_stage_nonzero_mm_position_count,
+                "shock_stage_nonzero_mm_position": shock_stage_nonzero_mm_position_count > 0,
                 "time_to_settle_ms": time_to_settle_ms,
                 "time_to_unwind_start_ms": time_to_unwind_start_ms,
                 "time_to_abs_20_ms": time_to_abs_20_ms,
@@ -574,6 +647,12 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             *(
                 f"- `#{episode.get('episode_index')}` tick=`{episode.get('exchange_tick')}` earnings=`{episode.get('earnings_value')}` "
                 f"direction=`{episode.get('shock_direction')}` peak=`{episode.get('peak_signed_earnings_position')}` "
+                f"`transfer_mm={episode.get('transferred_mm_inventory_at_cycle_start')}` "
+                f"`peak_total={episode.get('peak_signed_total_inventory')}` "
+                f"`peak_mm={episode.get('peak_residual_mm_position')}` "
+                f"`target={episode.get('shock_target_total_inventory')}` "
+                f"`target_exceeded={episode.get('total_inventory_exceeded_target_cap')}` "
+                f"`shock_mm_nonzero={episode.get('shock_stage_nonzero_mm_position_count')}` "
                 f"`settle={episode.get('time_to_settle_ms')}` `unwind_start={episode.get('time_to_unwind_start_ms')}` "
                 f"`to<=20={episode.get('time_to_abs_20_ms')}` `to<=4={episode.get('time_to_abs_4_ms')}` "
                 f"`pre_settle_unwind={episode.get('opposite_unwind_before_settle_count')}`"
@@ -670,6 +749,8 @@ class TraceRecorder:
             "rapid_unwind_active": state.get("rapid_unwind_active"),
             "shock_stage": state.get("shock_stage"),
             "shock_accumulate_target_position": state.get("shock_accumulate_target_position"),
+            "shock_target_total_inventory": state.get("shock_target_total_inventory"),
+            "shock_remaining_total_room": state.get("shock_remaining_total_room"),
             "shock_direction": state.get("shock_direction"),
             "shock_threshold": state.get("shock_threshold"),
             "shock_target_fair": state.get("shock_target_fair"),
@@ -791,6 +872,24 @@ class TraceRecorder:
         )
         event.update(self._state_fields(state, cash))
         event["trigger"] = trigger
+        self._write_event(event)
+
+    def record_inventory_ownership_transfer(
+        self,
+        *,
+        now_ms: int,
+        state: dict[str, Any],
+        cash: int | None,
+        details: dict[str, Any],
+    ) -> None:
+        event = self._base_event(
+            "inventory_ownership_transfer",
+            now_ms=now_ms,
+            exchange_tick=details.get("exchange_tick") if details.get("exchange_tick") is not None else state.get("exchange_tick"),
+            mode=state.get("mode"),
+        )
+        event.update(self._state_fields(state, cash))
+        event.update(details)
         self._write_event(event)
 
     def record_news(self, *, now_ms: int, state: dict[str, Any], cash: int | None, news_payload: dict[str, Any], reaction: dict[str, Any]) -> None:
@@ -1109,6 +1208,8 @@ class TraceRecorder:
             "rapid_unwind_active": event.get("rapid_unwind_active"),
             "shock_stage": event.get("shock_stage"),
             "shock_accumulate_target_position": event.get("shock_accumulate_target_position"),
+            "shock_target_total_inventory": event.get("shock_target_total_inventory"),
+            "shock_remaining_total_room": event.get("shock_remaining_total_room"),
             "inventory": event.get("inventory"),
             "earnings_position": event.get("earnings_position"),
             "mm_position": event.get("mm_position"),

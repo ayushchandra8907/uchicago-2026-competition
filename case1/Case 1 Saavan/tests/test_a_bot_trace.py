@@ -29,7 +29,7 @@ class TraceTests(unittest.TestCase):
         strategy = MarketAStrategy(
             a_config=AConfig(
                 startup_assume_fresh_round=True,
-                pre_news_pullback_ms=6_000,
+                pre_news_pullback_ms=4_000,
                 pre_news_arrival_grace_ms=1_200,
                 calibration_min_delay_ms=5_000,
                 calibration_max_delay_ms=20_000,
@@ -41,33 +41,33 @@ class TraceTests(unittest.TestCase):
                 steady_max_position=24,
                 steady_take_min_edge=2,
                 steady_take_large_inventory_edge=4,
-                discovery_max_position=2,
-                discovery_half_spread_ticks=10,
-                news_caution_max_position=2,
-                news_caution_half_spread_ticks=10,
+                discovery_max_position=4,
+                discovery_half_spread_ticks=8,
+                news_caution_max_position=4,
+                news_caution_half_spread_ticks=8,
                 steady_take_inventory_guard=8,
                 unwind_entry_position=24,
                 unwind_exit_position=12,
-                earnings_unwind_quote_size=24,
-                earnings_unwind_aggressive_quote_size=36,
-                earnings_unwind_rapid_entry=64,
-                earnings_unwind_rapid_exit=24,
-                earnings_unwind_rapid_take_edge=1,
-                earnings_unwind_aggressive_entry=32,
-                earnings_unwind_aggressive_exit=12,
-                earnings_unwind_passive_exit=4,
-                earnings_unwind_passive_take_edge=4,
-                shock_quote_size=18,
-                shock_entry_window_ms=1_500,
-                shock_entry_quote_size=36,
-                shock_entry_min_edge=1,
-                shock_entry_threshold_scale=0.25,
-                shock_accumulate_target_position=199,
-                shock_accumulate_min_quote_size=39,
-                shock_accumulate_max_quote_size=39,
-                shock_accumulate_min_edge=0,
-                shock_accumulate_threshold_scale=0.0,
-                shock_accumulate_window_ms=2_000,
+                earnings_unwind_quote_size=3,
+                earnings_unwind_aggressive_quote_size=3,
+                earnings_unwind_rapid_entry=9_999,
+                earnings_unwind_rapid_exit=9_998,
+                earnings_unwind_rapid_take_edge=4,
+                earnings_unwind_aggressive_entry=48,
+                earnings_unwind_aggressive_exit=24,
+                earnings_unwind_passive_exit=8,
+                earnings_unwind_passive_take_edge=8,
+                shock_quote_size=12,
+                shock_entry_window_ms=1_000,
+                shock_entry_quote_size=24,
+                shock_entry_min_edge=2,
+                shock_entry_threshold_scale=0.50,
+                shock_accumulate_target_position=180,
+                shock_accumulate_min_quote_size=12,
+                shock_accumulate_max_quote_size=12,
+                shock_accumulate_min_edge=4,
+                shock_accumulate_threshold_scale=1.0,
+                shock_accumulate_window_ms=3_000,
                 shock_base_max_position=80,
                 shock_shift_max_position=160,
                 shock_settle_min_hold_ms=1_200,
@@ -75,14 +75,14 @@ class TraceTests(unittest.TestCase):
                 shock_settle_band_ticks=8,
                 shock_settle_drift_ticks=4,
                 shock_settle_confirmations=2,
-                shock_unwind_quote_size=24,
-                shock_unwind_aggressive_quote_size=39,
-                shock_unwind_take_edge=1,
-                shock_unwind_exit_position=4,
-                prejump_window_ms=6_000,
-                prejump_max_position=120,
-                prejump_quote_size=24,
-                prejump_aggressive_edge=1,
+                shock_unwind_quote_size=3,
+                shock_unwind_aggressive_quote_size=3,
+                shock_unwind_take_edge=4,
+                shock_unwind_exit_position=8,
+                prejump_window_ms=1_200,
+                prejump_max_position=24,
+                prejump_quote_size=6,
+                prejump_aggressive_edge=2,
             ),
             risk=RiskConfig(
                 reprice_cooldown_ms=0,
@@ -126,9 +126,11 @@ class TraceTests(unittest.TestCase):
         self.assertFalse(state["pre_news_hold_active"])
         self.assertFalse(state["rapid_unwind_active"])
         self.assertEqual(state["shock_stage"], "NONE")
-        self.assertEqual(state["shock_accumulate_target_position"], 199)
+        self.assertEqual(state["shock_accumulate_target_position"], 180)
+        self.assertIsNone(state["shock_target_total_inventory"])
+        self.assertIsNone(state["shock_remaining_total_room"])
         self.assertIsNone(state["pre_news_expected_tick"])
-        self.assertEqual(state["allowed_buy_size"], 198)
+        self.assertEqual(state["allowed_buy_size"], 178)
         self.assertEqual(state["buy_exposure"], 2)
         self.assertEqual(state["mm_position"], 0)
         self.assertEqual(state["earnings_budget"], 120)
@@ -281,8 +283,8 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(config.trace.trace_root, Path(temp_dir).resolve() / "analysis_runs")
             self.assertFalse(config.trace.trace_enabled)
             self.assertEqual(config.trace.trace_detail_level, "lite")
-            self.assertEqual(config.risk.passive_min_rest_ms, 500)
-            self.assertEqual(config.risk.passive_reprice_threshold_ticks, 3)
+            self.assertEqual(config.risk.passive_min_rest_ms, 0)
+            self.assertEqual(config.risk.passive_reprice_threshold_ticks, 2)
             self.assertFalse(config.market_a.recover_pricing_state)
 
     def test_trace_recorder_full_mode_keeps_book_and_trade_events(self) -> None:
@@ -602,6 +604,99 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(episode["peak_signed_earnings_position"], 48)
         self.assertEqual(episode["time_to_abs_20_ms"], 500)
         self.assertEqual(episode["time_to_abs_4_ms"], 900)
+
+    def test_summarize_trace_events_reports_inventory_ownership_transfer_metrics(self) -> None:
+        events = [
+            {
+                "event_type": "inventory_ownership_transfer",
+                "run_id": "run-1",
+                "monotonic_ms": 900,
+                "exchange_tick": 149,
+                "ownership_transfer_qty": 14,
+                "prior_earnings_position": -3,
+                "prior_mm_position": 14,
+                "resulting_earnings_position": 11,
+                "resulting_mm_position": 0,
+                "reason": "pre_news_pullback_start",
+            },
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "exchange_tick": 150,
+                "mode": "POST_EARNINGS_SHOCK",
+                "earnings_value": 1.2,
+                "shock_direction": 1,
+            },
+            {
+                "event_type": "decision_evaluated",
+                "run_id": "run-1",
+                "monotonic_ms": 1_050,
+                "mode": "POST_EARNINGS_SHOCK",
+                "shock_stage": "ACCUMULATE",
+                "shock_target_total_inventory": 199,
+                "inventory": 48,
+                "earnings_position": 48,
+                "mm_position": 0,
+                "quoted_spread": 2,
+                "observe_only": False,
+                "aggressive_action_count": 1,
+                "reason": "shock",
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_200,
+                "mode": "POST_EARNINGS_SHOCK",
+                "shock_stage": "HOLD",
+                "shock_target_total_inventory": 199,
+                "inventory": 180,
+                "earnings_position": 180,
+                "mm_position": 0,
+                "quoted_spread": 2,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_300,
+                "mode": "POST_EARNINGS_SHOCK",
+                "shock_stage": "HOLD",
+                "shock_target_total_inventory": 199,
+                "inventory": 166,
+                "earnings_position": 152,
+                "mm_position": 14,
+                "quoted_spread": 2,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "mode": "UNWIND",
+                "shock_stage": "SETTLED_UNWIND",
+                "shock_target_total_inventory": 199,
+                "inventory": 18,
+                "earnings_position": 18,
+                "mm_position": 0,
+                "quoted_spread": 2,
+            },
+            {
+                "event_type": "session_end",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "mode": "STEADY_MM",
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        episode = summary["shock_episode_unwind_metrics"][0]
+        self.assertEqual(episode["transferred_mm_inventory_at_cycle_start"], 14)
+        self.assertEqual(episode["peak_signed_total_inventory"], 180)
+        self.assertEqual(episode["peak_signed_earnings_position"], 180)
+        self.assertEqual(episode["peak_residual_mm_position"], 14)
+        self.assertEqual(episode["shock_target_total_inventory"], 199)
+        self.assertFalse(episode["total_inventory_exceeded_target_cap"])
+        self.assertEqual(episode["shock_stage_nonzero_mm_position_count"], 1)
+        self.assertTrue(episode["shock_stage_nonzero_mm_position"])
 
 
 if __name__ == "__main__":

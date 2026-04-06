@@ -504,6 +504,24 @@ class MarketABot(XChangeClient):
                             "tolerance": event.tolerance,
                         },
                     )
+            for transfer in self.strategy.drain_inventory_transfer_events():
+                LOGGER.info(
+                    "Transferred A inventory ownership into earnings cycle: earnings %s -> %s, mm %s -> %s, qty=%s reason=%s",
+                    transfer.get("prior_earnings_position"),
+                    transfer.get("resulting_earnings_position"),
+                    transfer.get("prior_mm_position"),
+                    transfer.get("resulting_mm_position"),
+                    transfer.get("ownership_transfer_qty"),
+                    transfer.get("reason"),
+                )
+                if self.tracer is not None:
+                    transfer_now_ms = int(transfer.get("monotonic_ms") or now_ms)
+                    self.tracer.record_inventory_ownership_transfer(
+                        now_ms=transfer_now_ms,
+                        state=self._trace_state(transfer_now_ms),
+                        cash=self._current_cash(),
+                        details=transfer,
+                    )
             if self.strategy.fair_value is not None and self.strategy.fair_value != prior_fair:
                 self.journal.record_fair_value(
                     fair_value=self.strategy.fair_value,
