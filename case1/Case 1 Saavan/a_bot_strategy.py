@@ -20,6 +20,8 @@ ModeName = Literal[
     "UNWIND",
     "STEADY_MM",
 ]
+EarningsPhase = Literal["IDLE", "PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"]
+MMPhase = Literal["SHIFTED_OFF", "OPENING_MICRO_MM", "MULTIPLIER_DISCOVERY", "NEWS_CAUTIOUS_MM", "STEADY_MM"]
 
 DAY_TICKS = 450
 DAY_MS = 90_000
@@ -1358,11 +1360,14 @@ class MarketAStrategy:
         self.mm_position = 0
         self.book = BookSnapshot()
         self.mode: ModeName = "OPENING_MICRO_MM"
+        self.earnings_phase: EarningsPhase = "IDLE"
+        self.mm_phase: MMPhase = "OPENING_MICRO_MM"
         self.startup_ms = self._now_ms()
         self.tick_anchor_tick: int | None = None
         self.tick_anchor_ms: int | None = None
         self.last_news_tick: int | None = None
         self.discovery_window: DiscoveryWindow | None = None
+        self.discovery_contaminated = False
         self.news_caution_active = False
         self.shock_started_ms: int | None = None
         self.shock_direction = 0
@@ -1406,7 +1411,7 @@ class MarketAStrategy:
             abs(inventory) >= self.a_config.unwind_entry_position
             or self.unwind_active
             or abs(self.earnings_position) > 0
-            or self.mode in {"PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"}
+            or self.earnings_phase in {"PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"}
         ):
             self.earnings_position = inventory
             self.mm_position = 0
@@ -1477,7 +1482,7 @@ class MarketAStrategy:
             return False
         self.book = BookSnapshot.from_order_book(book, depth_levels=self.book_depth_levels)
         self._advance_discovery(now_ms)
-        self.mode = self._determine_mode(now_ms)
+        self._refresh_phases(now_ms)
         return True
 
     def on_news(self, news_release: dict, now_ms: int) -> NewsReaction:
@@ -1489,11 +1494,12 @@ class MarketAStrategy:
 
         if self._is_a_unstructured_news(news_release):
             self.news_caution_active = True
+            self.discovery_contaminated = self.discovery_contaminated or self.discovery_window is not None
             if self.discovery_window is not None and self.discovery_window.invalidated_reason is None:
                 self.discovery_window.invalidated_reason = (
                     "calibration contaminated because unstructured A news arrived before the new multiplier locked"
                 )
-            self.mode = self._determine_mode(now_ms)
+            self._refresh_phases(now_ms)
             return NewsReaction(
                 relevant=True,
                 fair_value_updated=False,
@@ -1502,12 +1508,13 @@ class MarketAStrategy:
             )
 
         if not self._handles_a_earnings(news_release):
-            self.mode = self._determine_mode(now_ms)
+            self._refresh_phases(now_ms)
             return NewsReaction(relevant=False, fair_value_updated=False, tick=tick if isinstance(tick, int) else None)
 
         earnings_value = float(news_release["new_data"]["value"])
         old_fair, new_fair = self.valuation.on_structured_earnings(earnings_value)
         self.news_caution_active = False
+        self.discovery_contaminated = False
         self.discovery_window = DiscoveryWindow(
             started_ms=now_ms,
             min_lock_ms=now_ms + self.a_config.calibration_min_delay_ms,
@@ -1543,7 +1550,7 @@ class MarketAStrategy:
             )
             fair_updated = False
 
-        self.mode = self._determine_mode(now_ms)
+        self._refresh_phases(now_ms)
         return NewsReaction(
             relevant=True,
             fair_value_updated=fair_updated,
@@ -1616,7 +1623,7 @@ class MarketAStrategy:
         if now_ms is None:
             now_ms = self._now_ms()
         self._advance_discovery(now_ms)
-        self.mode = self._determine_mode(now_ms)
+        self._refresh_phases(now_ms)
         if self.recovery_active:
             return QuotePlan(
                 mode=self.mode,
@@ -1627,16 +1634,19 @@ class MarketAStrategy:
                 reason="Waiting for recovered A orders to be cancelled.",
             )
 
-        earnings_plan = self._compute_earnings_overlay_plan(self.mode, now_ms)
-        mm_plan = self._compute_mm_overlay_plan(self.mode)
+        earnings_plan = self._compute_earnings_overlay_plan(self.earnings_phase, now_ms)
+        mm_plan = self._compute_mm_overlay_plan(self.mm_phase)
         return self._merge_overlay_plans(self.mode, earnings_plan, mm_plan)
 
     def _empty_overlay_plan(self, overlay: OverlayName, reason: str) -> OverlayPlan:
         return OverlayPlan(overlay=overlay, bid=None, ask=None, aggressive_actions=(), reason=reason)
 
-    def _compute_mm_overlay_plan(self, mode: ModeName) -> OverlayPlan:
-        _, mm_budget, _ = self.overlay_budgets(mode)
+    def _compute_mm_overlay_plan(self, phase: MMPhase) -> OverlayPlan:
+        _, mm_budget, _ = self.overlay_budgets(self.mode)
         if mm_budget <= 0:
+            return self._empty_overlay_plan("mm", "MM budget temporarily shifted into earnings handling.")
+
+        if phase == "SHIFTED_OFF":
             return self._empty_overlay_plan("mm", "MM budget temporarily shifted into earnings handling.")
 
         mm_inventory = self.mm_position
@@ -1644,17 +1654,17 @@ class MarketAStrategy:
         allowed_buy, allowed_sell = self.overlay_allowed_size(
             "mm",
             mode_cap=(
-                self.a_config.opening_max_position if mode == "OPENING_MICRO_MM"
-                else self.a_config.discovery_max_position if mode == "MULTIPLIER_DISCOVERY"
-                else self.a_config.news_caution_max_position if mode == "NEWS_CAUTIOUS_MM"
+                self.a_config.opening_max_position if phase == "OPENING_MICRO_MM"
+                else self.a_config.discovery_max_position if phase == "MULTIPLIER_DISCOVERY"
+                else self.a_config.news_caution_max_position if phase == "NEWS_CAUTIOUS_MM"
                 else self.a_config.steady_max_position
             ),
             budget=mm_budget,
         )
 
-        if mode == "OPENING_MICRO_MM":
+        if phase == "OPENING_MICRO_MM":
             plan = self.quote_engine._opening_quotes(
-                mode,
+                "OPENING_MICRO_MM",
                 mm_inventory,
                 self.book,
                 mm_buy_exposure,
@@ -1664,9 +1674,9 @@ class MarketAStrategy:
             )
             return self._clamp_overlay_plan("mm", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
 
-        if mode == "MULTIPLIER_DISCOVERY":
+        if phase == "MULTIPLIER_DISCOVERY":
             plan = self.quote_engine._cautious_quotes(
-                mode,
+                "MULTIPLIER_DISCOVERY",
                 self.valuation.fair_value,
                 mm_inventory,
                 self.book,
@@ -1679,9 +1689,9 @@ class MarketAStrategy:
             )
             return self._clamp_overlay_plan("mm", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
 
-        if mode == "NEWS_CAUTIOUS_MM":
+        if phase == "NEWS_CAUTIOUS_MM":
             plan = self.quote_engine._cautious_quotes(
-                mode,
+                "NEWS_CAUTIOUS_MM",
                 self.valuation.fair_value,
                 mm_inventory,
                 self.book,
@@ -1694,11 +1704,11 @@ class MarketAStrategy:
             )
             return self._clamp_overlay_plan("mm", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell)
 
-        if mode in {"STEADY_MM", "UNWIND"}:
+        if phase == "STEADY_MM":
             if self.valuation.fair_value is None:
                 return self._empty_overlay_plan("mm", "Waiting for a clean A fair value before steady MM.")
             plan = self.quote_engine._steady_quotes(
-                mode,
+                "STEADY_MM",
                 self.valuation.fair_value,
                 mm_inventory,
                 self.book,
@@ -1712,10 +1722,13 @@ class MarketAStrategy:
 
         return self._empty_overlay_plan("mm", "MM overlay idle in earnings-handling mode.")
 
-    def _compute_earnings_overlay_plan(self, mode: ModeName, now_ms: int) -> OverlayPlan:
-        earnings_budget, _, _ = self.overlay_budgets(mode)
+    def _compute_earnings_overlay_plan(self, phase: EarningsPhase, now_ms: int) -> OverlayPlan:
+        mode = self._earnings_phase_to_mode(phase)
+        earnings_budget, _, _ = self.overlay_budgets(self.mode)
         if earnings_budget <= 0:
             return self._empty_overlay_plan("earnings", "Earnings overlay budget disabled.")
+        if mode is None:
+            return self._empty_overlay_plan("earnings", "earnings overlay idle outside earnings-active modes")
 
         earnings_inventory = self.earnings_position
         earnings_buy_exposure, earnings_sell_exposure = self.overlay_exposures("earnings")
@@ -1723,6 +1736,8 @@ class MarketAStrategy:
         allowed_buy, allowed_sell = self.overlay_allowed_size("earnings", mode_cap=mode_cap, budget=earnings_budget)
 
         if mode == "PRE_NEWS_PULLBACK":
+            if self.discovery_contaminated:
+                return self._empty_overlay_plan("earnings", "discovery contaminated by unstructured news; blocking new earnings adds until next structured earnings")
             prejump_side = self._prejump_side(now_ms)
             if prejump_side is None:
                 return self._empty_overlay_plan("earnings", "flat before scheduled A earnings")
@@ -1898,6 +1913,8 @@ class MarketAStrategy:
         live_orders = self.order_manager.live_orders_snapshot()
         return {
             "mode": mode,
+            "earnings_phase": self.earnings_phase,
+            "mm_phase": self.mm_phase,
             "fair_value": self.valuation.fair_value,
             "trusted_multiplier": self.valuation.trusted_multiplier,
             "multiplier_confidence": self.valuation.multiplier_confidence,
@@ -1908,6 +1925,7 @@ class MarketAStrategy:
             "shock_started_ms": self.shock_started_ms,
             "discovery_window": discovery,
             "news_caution_active": self.news_caution_active,
+            "discovery_contaminated": self.discovery_contaminated,
             "inventory": self.inventory,
             "earnings_position": self.earnings_position,
             "mm_position": self.mm_position,
@@ -2068,7 +2086,7 @@ class MarketAStrategy:
             )
         )
 
-    def _determine_mode(self, now_ms: int) -> ModeName:
+    def _determine_earnings_phase(self, now_ms: int) -> EarningsPhase:
         if self._shock_active(now_ms):
             return "POST_EARNINGS_SHOCK"
 
@@ -2076,20 +2094,41 @@ class MarketAStrategy:
         if until_next_earnings is not None and until_next_earnings <= self.a_config.pre_news_pullback_ms:
             return "PRE_NEWS_PULLBACK"
 
-        if self.news_caution_active:
-            return "NEWS_CAUTIOUS_MM"
-
-        if self.discovery_window is not None:
-            return "MULTIPLIER_DISCOVERY"
-
-        if self.valuation.fair_value is None:
-            return "OPENING_MICRO_MM"
-
         self._refresh_unwind_state()
-        if self.unwind_active:
+        if abs(self.earnings_position) > self.a_config.earnings_unwind_passive_exit:
             return "UNWIND"
 
+        return "IDLE"
+
+    def _determine_mm_phase(self, now_ms: int, earnings_phase: EarningsPhase) -> MMPhase:
+        _, mm_budget, budget_shift_active = self.overlay_budgets(self._compose_mode(earnings_phase, self.mm_phase))
+        if budget_shift_active and mm_budget <= 0:
+            return "SHIFTED_OFF"
+        if self.news_caution_active:
+            return "NEWS_CAUTIOUS_MM"
+        if self.discovery_window is not None:
+            return "MULTIPLIER_DISCOVERY"
+        if self.valuation.fair_value is None:
+            return "OPENING_MICRO_MM"
         return "STEADY_MM"
+
+    def _compose_mode(self, earnings_phase: EarningsPhase, mm_phase: MMPhase) -> ModeName:
+        if earnings_phase != "IDLE":
+            return self._earnings_phase_to_mode(earnings_phase) or "STEADY_MM"
+        if mm_phase == "SHIFTED_OFF":
+            return "STEADY_MM"
+        return mm_phase
+
+    @staticmethod
+    def _earnings_phase_to_mode(phase: EarningsPhase) -> ModeName | None:
+        if phase == "IDLE":
+            return None
+        return phase
+
+    def _refresh_phases(self, now_ms: int) -> None:
+        self.earnings_phase = self._determine_earnings_phase(now_ms)
+        self.mm_phase = self._determine_mm_phase(now_ms, self.earnings_phase)
+        self.mode = self._compose_mode(self.earnings_phase, self.mm_phase)
 
     def _shock_active(self, now_ms: int) -> bool:
         if self.shock_started_ms is None or self.shock_target_fair is None:
@@ -2103,7 +2142,7 @@ class MarketAStrategy:
                 self.unwind_active = False
                 self.unwind_aggressive_active = False
                 return
-        elif abs_inventory >= self.a_config.unwind_entry_position:
+        elif abs_inventory > self.a_config.earnings_unwind_passive_exit:
             self.unwind_active = True
 
         if not self.unwind_active:
@@ -2136,6 +2175,8 @@ class MarketAStrategy:
     def _prejump_side(self, now_ms: int) -> SideName | None:
         if not self.a_config.prejump_enabled:
             return None
+        if self.discovery_contaminated:
+            return None
         if self.news_caution_active:
             return None
         if self.trusted_multiplier is None or self.last_earnings_value is None or self.fair_value is None:
@@ -2158,7 +2199,7 @@ class MarketAStrategy:
         return False
 
     def _preferred_overlay_for_inventory_delta(self, inventory: int, delta: int) -> OverlayName:
-        if self.unwind_active or self.mode in {"PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"}:
+        if self.unwind_active or self.earnings_phase in {"PRE_NEWS_PULLBACK", "POST_EARNINGS_SHOCK", "UNWIND"}:
             return "earnings"
         if abs(self.earnings_position) > abs(self.mm_position):
             return "earnings"

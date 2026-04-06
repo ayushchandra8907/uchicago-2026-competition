@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
+from typing import Literal
 
 
 class ConfigError(ValueError):
@@ -21,10 +22,10 @@ class AConfig:
     initial_multiplier: float | None = None
     initial_fair_value: int | None = None
     recover_pricing_state: bool = False
-    total_position_limit: int = 180
+    total_position_limit: int = 200
     earnings_base_budget: int = 120
     mm_base_budget: int = 60
-    earnings_shift_budget: int = 180
+    earnings_shift_budget: int = 200
     mm_shift_budget: int = 0
     startup_assume_fresh_round: bool = True
     pre_news_pullback_ms: int = 4_000
@@ -36,14 +37,14 @@ class AConfig:
     calibration_min_tolerance_fraction: float = 0.03
     candidate_confirmations: int = 2
     discovery_quote_size: int = 1
-    discovery_max_position: int = 4
-    discovery_half_spread_ticks: int = 8
+    discovery_max_position: int = 2
+    discovery_half_spread_ticks: int = 10
     news_caution_quote_size: int = 1
-    news_caution_max_position: int = 4
-    news_caution_half_spread_ticks: int = 8
+    news_caution_max_position: int = 2
+    news_caution_half_spread_ticks: int = 10
     steady_half_spread_ticks: int = 1
-    steady_take_min_edge: int = 2
-    steady_take_large_inventory_edge: int = 4
+    steady_take_min_edge: int = 3
+    steady_take_large_inventory_edge: int = 5
     opening_quote_size: int = 1
     opening_max_position: int = 8
     opening_half_spread_ticks: int = 4
@@ -66,7 +67,7 @@ class AConfig:
     earnings_unwind_passive_take_edge: int = 8
     shock_quote_size: int = 12
     shock_base_max_position: int = 100
-    shock_shift_max_position: int = 180
+    shock_shift_max_position: int = 200
     shock_window_ms: int = 3_000
     shock_take_fraction: float = 0.25
     shock_take_min_edge: int = 4
@@ -101,6 +102,7 @@ class BotPaths:
 class TraceConfig:
     trace_enabled: bool = False
     trace_root: Path | None = None
+    trace_detail_level: Literal["lite", "full"] = "lite"
     trace_snapshot_interval_ms: int = 500
     trace_book_depth_levels: int = 10
     trace_markout_windows_ms: tuple[int, ...] = (250, 1_000, 5_000)
@@ -179,6 +181,17 @@ def _optional_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _optional_literal(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized not in allowed:
+        allowed_csv = ", ".join(allowed)
+        raise ConfigError(f"Environment variable {name} must be one of: {allowed_csv}.")
+    return normalized
+
+
 def load_bot_config(
     base_dir: str | Path,
     *,
@@ -220,10 +233,10 @@ def load_bot_config(
             initial_multiplier=_optional_float("A_INITIAL_MULTIPLIER", default=default_initial_multiplier),
             initial_fair_value=_optional_int("A_INITIAL_FAIR_VALUE", default_initial_fair_value),
             recover_pricing_state=_optional_bool("A_RECOVER_PRICING_STATE", False),
-            total_position_limit=_optional_int("A_TOTAL_POSITION_LIMIT", 180) or 180,
+            total_position_limit=_optional_int("A_TOTAL_POSITION_LIMIT", 200) or 200,
             earnings_base_budget=_optional_int("A_EARNINGS_BASE_BUDGET", 120) or 120,
             mm_base_budget=_optional_int("A_MM_BASE_BUDGET", 60) or 60,
-            earnings_shift_budget=_optional_int("A_EARNINGS_SHIFT_BUDGET", 180) or 180,
+            earnings_shift_budget=_optional_int("A_EARNINGS_SHIFT_BUDGET", 200) or 200,
             mm_shift_budget=_optional_int("A_MM_SHIFT_BUDGET", 0) or 0,
             startup_assume_fresh_round=_optional_bool("A_STARTUP_ASSUME_FRESH_ROUND", True),
             pre_news_pullback_ms=_optional_int("A_PRE_NEWS_PULLBACK_MS", 4_000) or 4_000,
@@ -235,14 +248,14 @@ def load_bot_config(
             calibration_min_tolerance_fraction=_optional_float("A_CALIBRATION_MIN_TOLERANCE_FRACTION", 0.03) or 0.03,
             candidate_confirmations=_optional_int("A_CANDIDATE_CONFIRMATIONS", 2) or 2,
             discovery_quote_size=_optional_int("A_DISCOVERY_QUOTE_SIZE", 1) or 1,
-            discovery_max_position=_optional_int("A_DISCOVERY_MAX_POSITION", 4) or 4,
-            discovery_half_spread_ticks=_optional_int("A_DISCOVERY_HALF_SPREAD_TICKS", 8) or 8,
+            discovery_max_position=_optional_int("A_DISCOVERY_MAX_POSITION", 2) or 2,
+            discovery_half_spread_ticks=_optional_int("A_DISCOVERY_HALF_SPREAD_TICKS", 10) or 10,
             news_caution_quote_size=_optional_int("A_NEWS_CAUTION_QUOTE_SIZE", 1) or 1,
-            news_caution_max_position=_optional_int("A_NEWS_CAUTION_MAX_POSITION", 4) or 4,
-            news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 8) or 8,
+            news_caution_max_position=_optional_int("A_NEWS_CAUTION_MAX_POSITION", 2) or 2,
+            news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 10) or 10,
             steady_half_spread_ticks=_optional_int("A_STEADY_HALF_SPREAD_TICKS", 1) or 1,
-            steady_take_min_edge=_optional_int("A_STEADY_TAKE_MIN_EDGE", 2) or 2,
-            steady_take_large_inventory_edge=_optional_int("A_STEADY_TAKE_LARGE_INVENTORY_EDGE", 4) or 4,
+            steady_take_min_edge=_optional_int("A_STEADY_TAKE_MIN_EDGE", 3) or 3,
+            steady_take_large_inventory_edge=_optional_int("A_STEADY_TAKE_LARGE_INVENTORY_EDGE", 5) or 5,
             opening_quote_size=_optional_int("A_OPENING_QUOTE_SIZE", 1) or 1,
             opening_max_position=_optional_int("A_OPENING_MAX_POSITION", 8) or 8,
             opening_half_spread_ticks=_optional_int("A_OPENING_HALF_SPREAD_TICKS", 4) or 4,
@@ -265,7 +278,7 @@ def load_bot_config(
             earnings_unwind_passive_take_edge=_optional_int("A_EARNINGS_UNWIND_PASSIVE_TAKE_EDGE", 8) or 8,
             shock_quote_size=_optional_int("A_SHOCK_QUOTE_SIZE", 12) or 12,
             shock_base_max_position=_optional_int("A_SHOCK_BASE_MAX_POSITION", 100) or 100,
-            shock_shift_max_position=_optional_int("A_SHOCK_SHIFT_MAX_POSITION", 180) or 180,
+            shock_shift_max_position=_optional_int("A_SHOCK_SHIFT_MAX_POSITION", 200) or 200,
             shock_window_ms=_optional_int("A_SHOCK_WINDOW_MS", 3_000) or 3_000,
             shock_take_fraction=_optional_float("A_SHOCK_TAKE_FRACTION", 0.25) or 0.25,
             shock_take_min_edge=_optional_int("A_SHOCK_TAKE_MIN_EDGE", 4) or 4,
@@ -289,6 +302,7 @@ def load_bot_config(
         trace=TraceConfig(
             trace_enabled=_optional_bool("TRACE_ENABLED", False),
             trace_root=trace_root,
+            trace_detail_level=_optional_literal("TRACE_DETAIL_LEVEL", "lite", ("lite", "full")),  # type: ignore[arg-type]
             trace_snapshot_interval_ms=_optional_int("TRACE_SNAPSHOT_INTERVAL_MS", 500) or 500,
             trace_book_depth_levels=_optional_int("TRACE_BOOK_DEPTH_LEVELS", 10) or 10,
             trace_markout_windows_ms=_optional_int_tuple("TRACE_MARKOUT_WINDOWS_MS", (250, 1_000, 5_000)),

@@ -43,6 +43,10 @@ def print_summary(summary: dict) -> None:
     print(f"Observe-only decisions: {summary.get('observe_only_count', 0)}")
     print(f"Budget shift active (ms): {summary.get('budget_shift_active_ms', 0)}")
     print("")
+    print("Local processing durations (ms):")
+    for metric, stats in (summary.get("local_processing_durations_ms") or {}).items():
+        print(f"  {metric}: p50={stats.get('p50')} p95={stats.get('p95')} max={stats.get('max')}")
+    print("")
     print("Fills by intent:")
     for intent, count in (summary.get("fills_by_intent") or {}).items():
         print(f"  {intent}: {count}")

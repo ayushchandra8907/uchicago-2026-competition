@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -52,16 +53,21 @@ class MarketABotTests(unittest.TestCase):
                 calibration_tolerance_fraction=0.10,
                 calibration_min_tolerance_fraction=0.03,
                 candidate_confirmations=2,
+                total_position_limit=200,
+                earnings_base_budget=120,
+                mm_base_budget=60,
+                earnings_shift_budget=200,
+                mm_shift_budget=0,
                 discovery_quote_size=1,
-                discovery_max_position=4,
-                discovery_half_spread_ticks=8,
+                discovery_max_position=2,
+                discovery_half_spread_ticks=10,
                 recover_pricing_state=False,
                 news_caution_quote_size=1,
-                news_caution_max_position=4,
-                news_caution_half_spread_ticks=8,
+                news_caution_max_position=2,
+                news_caution_half_spread_ticks=10,
                 steady_half_spread_ticks=1,
-                steady_take_min_edge=2,
-                steady_take_large_inventory_edge=4,
+                steady_take_min_edge=3,
+                steady_take_large_inventory_edge=5,
                 opening_quote_size=1,
                 opening_max_position=8,
                 opening_half_spread_ticks=4,
@@ -84,7 +90,7 @@ class MarketABotTests(unittest.TestCase):
                 earnings_unwind_passive_take_edge=8,
                 shock_quote_size=12,
                 shock_base_max_position=100,
-                shock_shift_max_position=180,
+                shock_shift_max_position=200,
                 shock_window_ms=3_000,
                 shock_take_fraction=0.25,
                 shock_take_min_edge=4,
@@ -503,6 +509,77 @@ class MarketABotTests(unittest.TestCase):
             self.assertEqual(replay.live_orders[0].remaining_qty, 1)
             self.assertTrue(replay.live_orders[0].restored)
 
+    def test_finished_session_is_ignored_and_prepare_for_startup_rotates_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = Path(temp_dir) / "journal.jsonl"
+            journal = TradingJournal(journal_path)
+            journal.record_session_started(startup_mode="clean_start", recovered_orders=0)
+            journal.record_multiplier(1050.0, confidence=2, source="updated", estimate=1055.0, method="stable_level")
+            journal.record_fair_value(945, source="learned_multiplier", earnings_value=0.9)
+            journal.record_inventory(7, cash=1000)
+            journal.record_session_finished(note="normal round end")
+
+            replay = journal.load_replay_state()
+            self.assertEqual(replay.startup_mode, "finished_session_ignored")
+            self.assertIsNone(replay.multiplier)
+            self.assertIsNone(replay.fair_value)
+            self.assertEqual(replay.inventory, 0)
+            self.assertEqual(replay.live_orders, ())
+
+            prepared = journal.prepare_for_startup()
+            self.assertEqual(prepared.startup_mode, "finished_session_ignored")
+            self.assertIsNotNone(prepared.archived_path)
+            assert prepared.archived_path is not None
+            self.assertTrue(prepared.archived_path.exists())
+            self.assertEqual(prepared.archived_path.parent.name, "journal_archive")
+
+            with journal_path.open("r", encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual([record["event_type"] for record in records], ["session_started"])
+            self.assertEqual(records[0]["startup_mode"], "finished_session_ignored")
+
+    def test_unfinished_session_recovery_keeps_live_orders_and_rotates_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal_path = Path(temp_dir) / "journal.jsonl"
+            journal = TradingJournal(journal_path)
+            journal.record_session_started(startup_mode="clean_start", recovered_orders=0)
+            submitted = ManagedOrder(
+                order_id="order-1",
+                side="SELL",
+                px=901,
+                qty=2,
+                remaining_qty=2,
+                submitted_ms=12,
+            )
+            journal.record_order_submitted(submitted)
+            journal.record_multiplier(1050.0, confidence=2, source="updated", estimate=1055.0, method="stable_level")
+            journal.record_fair_value(945, source="learned_multiplier", earnings_value=0.9)
+            journal.record_inventory(7, cash=1000)
+
+            replay = journal.load_replay_state()
+            self.assertEqual(replay.startup_mode, "crash_recovery")
+            self.assertEqual(replay.multiplier, 1050.0)
+            self.assertEqual(replay.fair_value, 945)
+            self.assertEqual(replay.inventory, 7)
+            self.assertEqual(len(replay.live_orders), 1)
+
+            prepared = journal.prepare_for_startup()
+            self.assertEqual(prepared.startup_mode, "crash_recovery")
+            self.assertEqual(len(prepared.live_orders), 1)
+            self.assertIsNotNone(prepared.archived_path)
+
+            with journal_path.open("r", encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual(
+                [record["event_type"] for record in records],
+                ["session_started", "order_submitted", "multiplier_updated", "fair_value_updated"],
+            )
+            self.assertEqual(records[0]["startup_mode"], "crash_recovery")
+            self.assertEqual(records[0]["recovered_orders"], 1)
+            self.assertEqual(records[1]["order_id"], "order-1")
+            self.assertEqual(records[2]["source"], "recovered_journal_seed")
+            self.assertEqual(records[3]["source"], "recovered_journal_seed")
+
     def test_overlay_fill_attribution_tracks_virtual_positions(self) -> None:
         strategy = self.make_strategy(
             recovered_multiplier=1100.0,
@@ -552,16 +629,16 @@ class MarketABotTests(unittest.TestCase):
         strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=26_500)
         pre_news_state = strategy.trace_state(26_500)
         self.assertEqual(pre_news_state["mode"], "PRE_NEWS_PULLBACK")
-        self.assertEqual(pre_news_state["earnings_budget"], 180)
+        self.assertEqual(pre_news_state["earnings_budget"], 200)
         self.assertEqual(pre_news_state["mm_budget"], 0)
         self.assertTrue(pre_news_state["budget_shift_active"])
 
         strategy.on_news(self.a_earnings_news(1.0, tick=150), now_ms=30_000)
         shock_state = strategy.trace_state(30_100)
         self.assertEqual(shock_state["mode"], "POST_EARNINGS_SHOCK")
-        self.assertEqual(shock_state["earnings_budget"], 180)
+        self.assertEqual(shock_state["earnings_budget"], 200)
         self.assertEqual(shock_state["mm_budget"], 0)
-        self.assertEqual(shock_state["overlay_exposures"]["earnings"]["allowed_buy"], 180)
+        self.assertEqual(shock_state["overlay_exposures"]["earnings"]["allowed_buy"], 200)
 
         strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=33_500)
         reverted_state = strategy.trace_state(33_500)
@@ -588,6 +665,46 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(plan.bid.intent, "steady_mm_passive")
         self.assertEqual(plan.ask.overlay, "earnings")
         self.assertEqual(plan.ask.intent, "unwind")
+
+    def test_news_caution_does_not_suppress_large_earnings_unwind(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_news(self.a_unstructured_news(), now_ms=40_100)
+        strategy.set_inventory(90)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=45_000)
+
+        plan = strategy.compute_quotes(now_ms=45_000)
+        self.assertEqual(plan.mode, "UNWIND")
+        self.assertEqual(strategy.earnings_phase, "UNWIND")
+        self.assertEqual(strategy.mm_phase, "NEWS_CAUTIOUS_MM")
+        self.assertEqual(plan.ask.overlay, "earnings")
+        self.assertEqual(plan.ask.intent, "unwind")
+        self.assertEqual(plan.bid.overlay, "mm")
+        self.assertEqual(plan.bid.intent, "news_cautious_mm")
+
+    def test_discovery_does_not_suppress_large_earnings_unwind(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=1100,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_news(self.a_earnings_news(1.0), now_ms=30_000)
+        strategy.set_inventory(60)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1095: 10}, asks={1105: 10}), now_ms=33_100)
+
+        plan = strategy.compute_quotes(now_ms=33_100)
+        self.assertEqual(plan.mode, "UNWIND")
+        self.assertEqual(strategy.earnings_phase, "UNWIND")
+        self.assertEqual(strategy.mm_phase, "MULTIPLIER_DISCOVERY")
+        self.assertEqual(plan.ask.overlay, "earnings")
+        self.assertEqual(plan.ask.intent, "unwind")
+        self.assertEqual(plan.bid.overlay, "mm")
+        self.assertEqual(plan.bid.intent, "multiplier_discovery_mm")
 
     def test_boundary_low_earnings_prejump_emits_bullish_earnings_orders(self) -> None:
         strategy = self.make_strategy(
@@ -644,6 +761,24 @@ class MarketABotTests(unittest.TestCase):
         self.assertIsNone(cautious_plan.bid)
         self.assertIsNone(cautious_plan.ask)
         self.assertEqual(cautious_plan.aggressive_actions, ())
+
+    def test_contaminated_discovery_blocks_prejump_until_next_structured_earnings(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1100.0,
+            recovered_multiplier_confidence=3,
+            recovered_fair_value=924,
+            recovered_earnings_value=0.84,
+        )
+        strategy.discovery_contaminated = True
+        strategy.on_book_update_at("A", FakeOrderBook(bids={922: 10}, asks={925: 10}), now_ms=29_000)
+        plan = strategy.compute_quotes(now_ms=29_000)
+        self.assertEqual(plan.mode, "PRE_NEWS_PULLBACK")
+        self.assertIsNone(plan.bid)
+        self.assertIsNone(plan.ask)
+        self.assertEqual(plan.aggressive_actions, ())
+
+        strategy.on_news(self.a_earnings_news(0.90, tick=300), now_ms=60_000)
+        self.assertFalse(strategy.discovery_contaminated)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,12 @@ class TraceTests(unittest.TestCase):
                 recover_pricing_state=False,
                 steady_quote_size=2,
                 steady_max_position=24,
+                steady_take_min_edge=3,
+                steady_take_large_inventory_edge=5,
+                discovery_max_position=2,
+                discovery_half_spread_ticks=10,
+                news_caution_max_position=2,
+                news_caution_half_spread_ticks=10,
                 steady_take_inventory_guard=8,
                 unwind_entry_position=24,
                 unwind_exit_position=12,
@@ -79,7 +85,10 @@ class TraceTests(unittest.TestCase):
         state = strategy.trace_state(45_000)
 
         self.assertEqual(state["mode"], "STEADY_MM")
-        self.assertEqual(state["allowed_buy_size"], 178)
+        self.assertEqual(state["earnings_phase"], "IDLE")
+        self.assertEqual(state["mm_phase"], "STEADY_MM")
+        self.assertFalse(state["discovery_contaminated"])
+        self.assertEqual(state["allowed_buy_size"], 198)
         self.assertEqual(state["buy_exposure"], 2)
         self.assertEqual(state["mm_position"], 0)
         self.assertEqual(state["earnings_budget"], 120)
@@ -97,6 +106,7 @@ class TraceTests(unittest.TestCase):
                 TraceConfig(
                     trace_enabled=True,
                     trace_root=Path(temp_dir),
+                    trace_detail_level="lite",
                     trace_snapshot_interval_ms=500,
                     trace_book_depth_levels=10,
                     trace_markout_windows_ms=(250, 1_000, 5_000),
@@ -139,6 +149,8 @@ class TraceTests(unittest.TestCase):
                 observe_only=False,
                 reason="steady mm",
             )
+            recorder.record_book_update(now_ms=now_ms, state=state, cash=10_000, trigger="book update")
+            recorder.record_market_trade(now_ms=now_ms, state=state, cash=10_000, price=1100, qty=1)
             recorder.record_decision(now_ms=now_ms, state=state, cash=10_000, trigger="book update", plan=plan)
             recorder.record_order_submitted(
                 now_ms=now_ms,
@@ -191,6 +203,8 @@ class TraceTests(unittest.TestCase):
             self.assertIn("order_submitted", event_types)
             self.assertIn("order_filled", event_types)
             self.assertIn("session_end", event_types)
+            self.assertNotIn("book_update", event_types)
+            self.assertNotIn("market_trade_observed", event_types)
             fill_event = next(event for event in events if event["event_type"] == "order_filled")
             self.assertEqual(fill_event["fill_qty"], 2)
             self.assertEqual(fill_event["fill_price"], 1099)
@@ -201,6 +215,7 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(summary["passive_fills"], 1)
             self.assertEqual(summary["aggressive_fills"], 0)
             self.assertEqual(summary["fills_by_overlay"]["mm"], 1)
+            self.assertIn("local_processing_durations_ms", summary)
 
     def test_load_bot_config_trace_defaults_to_saavan_analysis_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -223,11 +238,34 @@ class TraceTests(unittest.TestCase):
                         os.environ[key] = old_value
             self.assertEqual(config.trace.trace_root, Path(temp_dir).resolve() / "analysis_runs")
             self.assertFalse(config.trace.trace_enabled)
+            self.assertEqual(config.trace.trace_detail_level, "lite")
             self.assertFalse(config.market_a.recover_pricing_state)
+
+    def test_trace_recorder_full_mode_keeps_book_and_trade_events(self) -> None:
+        strategy = self.make_strategy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_detail_level="full",
+                    trace_write_summary_on_shutdown=False,
+                ),
+                session_prefix="test_trace",
+            )
+            state = strategy.trace_state(45_000)
+            recorder.record_book_update(now_ms=45_000, state=state, cash=10_000, trigger="book update")
+            recorder.record_market_trade(now_ms=45_000, state=state, cash=10_000, price=1100, qty=1)
+            recorder.finalize(now_ms=45_100, state=state, cash=10_000, note="done")
+
+            event_types = {event["event_type"] for event in load_trace_events(recorder.run_dir)}
+            self.assertIn("book_update", event_types)
+            self.assertIn("market_trade_observed", event_types)
 
     def test_recovered_pricing_state_is_ignored_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             journal = TradingJournal(Path(temp_dir) / "journal.jsonl")
+            journal.record_session_started(startup_mode="clean_start", recovered_orders=0)
             submitted = ManagedOrder(
                 order_id="order-1",
                 side="SELL",
@@ -244,6 +282,7 @@ class TraceTests(unittest.TestCase):
             ignored = select_recovered_pricing_state(replay, recover_pricing_state=False)
             restored = select_recovered_pricing_state(replay, recover_pricing_state=True)
 
+            self.assertEqual(replay.startup_mode, "crash_recovery")
             self.assertEqual(ignored, (None, 0, None, None))
             self.assertEqual(restored, (1050.0, 2, 945, 0.9))
 

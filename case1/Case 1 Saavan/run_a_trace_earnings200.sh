@@ -1,0 +1,18 @@
+#!/bin/zsh
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+source "$REPO_ROOT/.venv/bin/activate"
+
+TRACE_ENABLED=1 \
+A_TOTAL_POSITION_LIMIT=200 \
+A_EARNINGS_BASE_BUDGET=120 \
+A_MM_BASE_BUDGET=60 \
+A_EARNINGS_SHIFT_BUDGET=200 \
+A_MM_SHIFT_BUDGET=0 \
+A_SHOCK_SHIFT_MAX_POSITION=200 \
+A_STEADY_MAX_POSITION=32 \
+A_STEADY_QUOTE_SIZE=3 \
+"$REPO_ROOT/.venv/bin/python" "$SCRIPT_DIR/testing1.py"

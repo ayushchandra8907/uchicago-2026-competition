@@ -20,6 +20,8 @@ SNAPSHOT_FIELDNAMES = [
     "exchange_tick",
     "symbol",
     "mode",
+    "earnings_phase",
+    "mm_phase",
     "trigger",
     "observe_only",
     "reason",
@@ -33,6 +35,7 @@ SNAPSHOT_FIELDNAMES = [
     "fair_value",
     "trusted_multiplier",
     "multiplier_confidence",
+    "discovery_contaminated",
     "inventory",
     "earnings_position",
     "mm_position",
@@ -55,6 +58,9 @@ SNAPSHOT_FIELDNAMES = [
     "aggressive_action_count",
     "aggressive_actions_json",
     "quoted_spread",
+    "handler_duration_ms",
+    "evaluate_sync_duration_ms",
+    "order_sync_duration_ms",
     "cash",
     "mtm_pnl_estimate",
     "mtm_basis",
@@ -106,6 +112,19 @@ def _coalesce_mark_price(*values: Any) -> tuple[float | None, str]:
         if value is not None:
             return float(value), basis
     return None, "unknown"
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile
+    lower = int(rank)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = rank - lower
+    return ordered[lower] + ((ordered[upper] - ordered[lower]) * weight)
 
 
 def estimate_mtm(state: dict[str, Any], cash: int | None) -> tuple[float | None, str, float | None]:
@@ -178,6 +197,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     earnings_inventory_values: list[int] = []
     mm_inventory_values: list[int] = []
     quoted_spreads: list[int] = []
+    handler_durations_ms: list[float] = []
+    evaluate_sync_durations_ms: list[float] = []
+    order_sync_durations_ms: list[float] = []
     latest_mtm: float | None = None
     latest_mtm_basis: str | None = None
     fills_by_overlay: Counter[str] = Counter()
@@ -235,6 +257,15 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             if mtm is not None:
                 latest_mtm = float(mtm)
                 latest_mtm_basis = str(event.get("mtm_basis") or "unknown")
+            handler_duration = event.get("handler_duration_ms")
+            if handler_duration is not None:
+                handler_durations_ms.append(float(handler_duration))
+            evaluate_sync_duration = event.get("evaluate_sync_duration_ms")
+            if evaluate_sync_duration is not None:
+                evaluate_sync_durations_ms.append(float(evaluate_sync_duration))
+            order_sync_duration = event.get("order_sync_duration_ms")
+            if order_sync_duration is not None:
+                order_sync_durations_ms.append(float(order_sync_duration))
 
         if event.get("event_type") == "decision_evaluated":
             if bool(event.get("observe_only")):
@@ -314,6 +345,23 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "estimated_final_mtm_pnl": latest_mtm,
         "estimated_final_mtm_basis": latest_mtm_basis,
         "fill_markouts_by_intent": fill_markout_summary,
+        "local_processing_durations_ms": {
+            "handler": {
+                "p50": _percentile(handler_durations_ms, 0.50),
+                "p95": _percentile(handler_durations_ms, 0.95),
+                "max": max(handler_durations_ms) if handler_durations_ms else None,
+            },
+            "evaluate_sync": {
+                "p50": _percentile(evaluate_sync_durations_ms, 0.50),
+                "p95": _percentile(evaluate_sync_durations_ms, 0.95),
+                "max": max(evaluate_sync_durations_ms) if evaluate_sync_durations_ms else None,
+            },
+            "order_sync": {
+                "p50": _percentile(order_sync_durations_ms, 0.50),
+                "p95": _percentile(order_sync_durations_ms, 0.95),
+                "max": max(order_sync_durations_ms) if order_sync_durations_ms else None,
+            },
+        },
         "activity_split": {
             "passive_mm": sum(count for intent, count in fills_by_intent.items() if intent in {"opening_mm", "steady_mm_passive", "multiplier_discovery_mm", "news_cautious_mm"}),
             "steady_takes": fills_by_intent.get("steady_take", 0),
@@ -329,6 +377,7 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     fills_by_overlay = summary.get("fills_by_overlay") or {}
     mode_durations = summary.get("mode_durations_ms") or {}
     no_action = summary.get("most_common_no_action_reasons") or {}
+    local_processing = summary.get("local_processing_durations_ms") or {}
     return "\n".join(
         [
             f"# A Bot Run Summary",
@@ -347,6 +396,12 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             f"- Average quoted spread: `{summary.get('average_quoted_spread')}`",
             f"- Observe-only decisions: `{summary.get('observe_only_count', 0)}`",
             f"- Budget shift active (ms): `{summary.get('budget_shift_active_ms', 0)}`",
+            "",
+            "## Local Processing Durations (ms)",
+            *(
+                f"- `{metric}`: `p50={stats.get('p50')}` `p95={stats.get('p95')}` `max={stats.get('max')}`"
+                for metric, stats in local_processing.items()
+            ),
             "",
             "## Fills By Intent",
             *(f"- `{intent}`: `{count}`" for intent, count in fills_by_intent.items()),
@@ -424,10 +479,13 @@ class TraceRecorder:
         mtm_pnl, mtm_basis, mark_price = estimate_mtm(state, cash)
         self._latest_cash = cash if cash is not None else self._latest_cash
         return {
+            "earnings_phase": state.get("earnings_phase"),
+            "mm_phase": state.get("mm_phase"),
             "fair_value": state.get("fair_value"),
             "trusted_multiplier": state.get("trusted_multiplier"),
             "multiplier_confidence": state.get("multiplier_confidence"),
             "latest_earnings": state.get("latest_earnings"),
+            "discovery_contaminated": state.get("discovery_contaminated"),
             "shock_direction": state.get("shock_direction"),
             "shock_threshold": state.get("shock_threshold"),
             "shock_target_fair": state.get("shock_target_fair"),
@@ -514,6 +572,8 @@ class TraceRecorder:
         self._write_event(event)
 
     def record_book_update(self, *, now_ms: int, state: dict[str, Any], cash: int | None, trigger: str) -> None:
+        if self.trace_config.trace_detail_level != "full":
+            return
         event = self._base_event(
             "book_update",
             now_ms=now_ms,
@@ -525,6 +585,8 @@ class TraceRecorder:
         self._write_event(event)
 
     def record_market_trade(self, *, now_ms: int, state: dict[str, Any], cash: int | None, price: int, qty: int) -> None:
+        if self.trace_config.trace_detail_level != "full":
+            return
         event = self._base_event(
             "market_trade_observed",
             now_ms=now_ms,
@@ -592,7 +654,18 @@ class TraceRecorder:
         event["details"] = details
         self._write_event(event)
 
-    def record_decision(self, *, now_ms: int, state: dict[str, Any], cash: int | None, trigger: str, plan) -> None:
+    def record_decision(
+        self,
+        *,
+        now_ms: int,
+        state: dict[str, Any],
+        cash: int | None,
+        trigger: str,
+        plan,
+        handler_duration_ms: float | None = None,
+        evaluate_sync_duration_ms: float | None = None,
+        order_sync_duration_ms: float | None = None,
+    ) -> None:
         desired_bid = None if plan.bid is None else self._serialize_order(plan.bid.__dict__)
         desired_ask = None if plan.ask is None else self._serialize_order(plan.ask.__dict__)
         aggressive_actions = [self._serialize_order(action.__dict__) for action in plan.aggressive_actions]
@@ -613,6 +686,9 @@ class TraceRecorder:
                 "aggressive_actions": aggressive_actions,
                 "aggressive_action_count": len(aggressive_actions),
                 "quoted_spread": _quoted_spread(desired_bid, desired_ask, list(state.get("live_orders") or [])),
+                "handler_duration_ms": handler_duration_ms,
+                "evaluate_sync_duration_ms": evaluate_sync_duration_ms,
+                "order_sync_duration_ms": order_sync_duration_ms,
             }
         )
         self._write_event(event)
@@ -826,6 +902,8 @@ class TraceRecorder:
             "exchange_tick": event.get("exchange_tick"),
             "symbol": event.get("symbol"),
             "mode": event.get("mode"),
+            "earnings_phase": event.get("earnings_phase"),
+            "mm_phase": event.get("mm_phase"),
             "trigger": event.get("trigger"),
             "observe_only": event.get("observe_only"),
             "reason": event.get("reason"),
@@ -839,6 +917,7 @@ class TraceRecorder:
             "fair_value": event.get("fair_value"),
             "trusted_multiplier": event.get("trusted_multiplier"),
             "multiplier_confidence": event.get("multiplier_confidence"),
+            "discovery_contaminated": event.get("discovery_contaminated"),
             "inventory": event.get("inventory"),
             "earnings_position": event.get("earnings_position"),
             "mm_position": event.get("mm_position"),
@@ -861,6 +940,9 @@ class TraceRecorder:
             "aggressive_action_count": event.get("aggressive_action_count"),
             "aggressive_actions_json": json.dumps(event.get("aggressive_actions") or [], sort_keys=True, default=_json_default),
             "quoted_spread": event.get("quoted_spread"),
+            "handler_duration_ms": event.get("handler_duration_ms"),
+            "evaluate_sync_duration_ms": event.get("evaluate_sync_duration_ms"),
+            "order_sync_duration_ms": event.get("order_sync_duration_ms"),
             "cash": event.get("cash"),
             "mtm_pnl_estimate": event.get("mtm_pnl_estimate"),
             "mtm_basis": event.get("mtm_basis"),

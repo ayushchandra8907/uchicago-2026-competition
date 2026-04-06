@@ -45,7 +45,9 @@ class MarketABot(XChangeClient):
         )
         self.config = config
         self.journal = TradingJournal(config.paths.journal_path)
-        replay_state = self.journal.load_replay_state()
+        replay_state = self.journal.prepare_for_startup()
+        self._startup_recovery_mode = replay_state.startup_mode
+        self._startup_journal_archive = replay_state.archived_path
         (
             recovered_multiplier,
             recovered_multiplier_confidence,
@@ -65,7 +67,6 @@ class MarketABot(XChangeClient):
             recovered_earnings_value=recovered_earnings_value,
             book_depth_levels=max(10, config.trace.trace_book_depth_levels),
         )
-        self.strategy.set_inventory(replay_state.inventory)
         self.tracer = TraceRecorder.create_if_enabled(config.trace, session_prefix="a_bot_run", symbol="A")
         self._quote_lock = asyncio.Lock()
         self._position_snapshot_seen = asyncio.Event()
@@ -78,6 +79,14 @@ class MarketABot(XChangeClient):
         if replay_state.live_orders:
             restored_ids = ", ".join(order.order_id for order in replay_state.live_orders)
             LOGGER.warning("Recovered %d local A orders from journal: %s", len(replay_state.live_orders), restored_ids)
+        if self._startup_journal_archive is not None:
+            LOGGER.info("Archived previous A journal to %s", self._startup_journal_archive)
+        if self._startup_recovery_mode == "finished_session_ignored":
+            LOGGER.info("Ignoring previous finished A journal session; starting with a clean journal.")
+        elif self._startup_recovery_mode == "clean_start":
+            LOGGER.info("Starting A bot with a clean journal session.")
+        else:
+            LOGGER.info("Starting A bot in crash-recovery mode from unfinished journal session.")
         if recovered_multiplier is not None:
             LOGGER.info(
                 "Recovered last known A multiplier from journal: %.4f (confidence=%s)",
@@ -102,12 +111,17 @@ class MarketABot(XChangeClient):
                 now_ms=now_ms,
                 config_summary={
                     "host": config.exchange.host,
+                    "trace_detail_level": config.trace.trace_detail_level,
                     "trace_snapshot_interval_ms": config.trace.trace_snapshot_interval_ms,
                     "trace_book_depth_levels": config.trace.trace_book_depth_levels,
                     "trace_markout_windows_ms": list(config.trace.trace_markout_windows_ms),
                     "journal_path": str(config.paths.journal_path),
                     "trace_root": str(config.trace.trace_root),
                     "recover_pricing_state": config.market_a.recover_pricing_state,
+                    "startup_recovery_mode": self._startup_recovery_mode,
+                    "archived_journal_path": None
+                    if self._startup_journal_archive is None
+                    else str(self._startup_journal_archive),
                 },
                 recovered_orders=[self._order_to_dict(order) for order in replay_state.live_orders],
                 state=self._trace_state(now_ms),
@@ -135,6 +149,7 @@ class MarketABot(XChangeClient):
 
     async def process_message(self, msg) -> None:
         """Mirror exchange position updates into local journaled strategy state."""
+        handler_started_ns = time.perf_counter_ns()
         msg_type = msg.WhichOneof("body")
         recovery_event: tuple[str, str, bool, str | None, int | None, int | None] | None = None
         if msg_type == "cancel_response":
@@ -198,7 +213,7 @@ class MarketABot(XChangeClient):
                     cash=self._current_cash(),
                     trigger="position_update",
                 )
-            await self._evaluate_and_sync("position update")
+            await self._evaluate_and_sync("position update", handler_started_ns=handler_started_ns)
         elif msg_type == "cash_update":
             now_ms = self._now_ms()
             self.journal.record_inventory(
@@ -219,6 +234,7 @@ class MarketABot(XChangeClient):
         success: bool,
         error: Optional[str] = None,
     ) -> None:
+        handler_started_ns = time.perf_counter_ns()
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_cancel_response(order_id, success)
@@ -237,9 +253,10 @@ class MarketABot(XChangeClient):
                 order=None if order is None else self._order_to_dict(order),
             )
             self._trace_recovery_transition(was_recovery_active, "recovery order cancellation completed")
-        await self._evaluate_and_sync("cancel response")
+        await self._evaluate_and_sync("cancel response", handler_started_ns=handler_started_ns)
 
     async def bot_handle_order_fill(self, order_id: str, qty: int, price: int) -> None:
+        handler_started_ns = time.perf_counter_ns()
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_fill(order_id, qty, price)
@@ -268,9 +285,10 @@ class MarketABot(XChangeClient):
                 price=price,
             )
             self._trace_recovery_transition(was_recovery_active, "recovery order filled")
-        await self._evaluate_and_sync("fill")
+        await self._evaluate_and_sync("fill", handler_started_ns=handler_started_ns)
 
     async def bot_handle_order_rejected(self, order_id: str, reason: str) -> None:
+        handler_started_ns = time.perf_counter_ns()
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_rejection(order_id)
@@ -286,9 +304,10 @@ class MarketABot(XChangeClient):
                 order=None if order is None else self._order_to_dict(order),
             )
             self._trace_recovery_transition(was_recovery_active, "recovery order rejected")
-        await self._evaluate_and_sync("rejection")
+        await self._evaluate_and_sync("rejection", handler_started_ns=handler_started_ns)
 
     async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int) -> None:
+        handler_started_ns = time.perf_counter_ns()
         if symbol == "A":
             now_ms = self._now_ms()
             self.strategy.on_market_trade(price, qty, now_ms=now_ms)
@@ -303,6 +322,7 @@ class MarketABot(XChangeClient):
                 )
 
     async def bot_handle_book_update(self, symbol: str) -> None:
+        handler_started_ns = time.perf_counter_ns()
         if symbol != "A":
             return
         now_ms = self._now_ms()
@@ -314,12 +334,13 @@ class MarketABot(XChangeClient):
                 cash=self._current_cash(),
                 trigger="book_update",
             )
-        await self._evaluate_and_sync("book update")
+        await self._evaluate_and_sync("book update", handler_started_ns=handler_started_ns)
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool) -> None:
         LOGGER.info("Ignoring swap response in A-only bot: %s qty=%s success=%s", swap, qty, success)
 
     async def bot_handle_news(self, news_release: dict) -> None:
+        handler_started_ns = time.perf_counter_ns()
         now_ms = self._now_ms()
         mode_before_news = self.strategy.mode
         reaction = self.strategy.on_news(news_release, now_ms)
@@ -339,7 +360,7 @@ class MarketABot(XChangeClient):
             )
         if not reaction.relevant:
             if reaction.tick is not None:
-                await self._evaluate_and_sync("news tick")
+                await self._evaluate_and_sync("news tick", handler_started_ns=handler_started_ns)
             return
         if reaction.fair_value_updated and self.strategy.fair_value is not None:
             self.journal.record_fair_value(
@@ -355,7 +376,7 @@ class MarketABot(XChangeClient):
                     source="structured_news_provisional_fair",
                     details=self._reaction_to_dict(reaction),
                 )
-        await self._evaluate_and_sync("news")
+        await self._evaluate_and_sync("news", handler_started_ns=handler_started_ns)
 
     async def bot_handle_market_resolved(self, market_id: str, winning_symbol: str, tick: int):
         LOGGER.info("Ignoring market resolution %s winner=%s tick=%s in A-only bot", market_id, winning_symbol, tick)
@@ -371,6 +392,10 @@ class MarketABot(XChangeClient):
             self._shutdown.set()
             if self._refresh_task is not None:
                 self._refresh_task.cancel()
+            try:
+                self.journal.record_session_finished(note="Bot shutdown")
+            except Exception:
+                LOGGER.exception("Failed to record A journal session finish marker.")
             if self.tracer is not None:
                 now_ms = self._now_ms()
                 self.tracer.finalize(
@@ -389,7 +414,7 @@ class MarketABot(XChangeClient):
                     now_ms=now_ms,
                     state=self._trace_state(now_ms),
                     cash=self._current_cash(),
-                    reason="startup recovery began",
+                    reason=f"{self._startup_recovery_mode}: startup recovery began",
                 )
             for order in self.strategy.recovery_orders_to_cancel():
                 now_ms = self._now_ms()
@@ -416,19 +441,20 @@ class MarketABot(XChangeClient):
                     now_ms=now_ms,
                     state=self._trace_state(now_ms),
                     cash=self._current_cash(),
-                    reason="no recovery work required",
+                    reason=f"{self._startup_recovery_mode}: no recovery work required",
                 )
         await self._evaluate_and_sync("startup recovery")
 
     async def _quote_refresh_loop(self) -> None:
         while not self._shutdown.is_set():
             await asyncio.sleep(max(self.config.risk.reprice_cooldown_ms / 1000.0, 0.25))
-            await self._evaluate_and_sync("timer")
+            await self._evaluate_and_sync("timer", handler_started_ns=time.perf_counter_ns())
 
-    async def _evaluate_and_sync(self, reason: str) -> None:
+    async def _evaluate_and_sync(self, reason: str, *, handler_started_ns: int | None = None) -> None:
         if not self.connected or not self._position_snapshot_seen.is_set():
             return
         async with self._quote_lock:
+            evaluate_started_ns = time.perf_counter_ns()
             # The strategy only decides what the bot wants to own on each side.
             # The order manager turns that target state into cancel/place actions.
             now_ms = self._now_ms()
@@ -436,14 +462,6 @@ class MarketABot(XChangeClient):
             prior_multiplier = self.strategy.trusted_multiplier
             prior_confidence = self.strategy.multiplier_confidence
             plan = self.strategy.compute_quotes(now_ms=now_ms)
-            if self.tracer is not None:
-                self.tracer.record_decision(
-                    now_ms=now_ms,
-                    state=self._trace_state(now_ms),
-                    cash=self._current_cash(),
-                    trigger=reason,
-                    plan=plan,
-                )
             for event in self.strategy.drain_learning_events():
                 if event.status == "skipped":
                     LOGGER.warning("Skipped A multiplier calibration: %s", event.reason)
@@ -513,6 +531,8 @@ class MarketABot(XChangeClient):
                     self._last_observe_only_reason = plan.reason
             else:
                 self._last_observe_only_reason = None
+            decision_state = self._trace_state(now_ms)
+            order_sync_started_ns = time.perf_counter_ns()
             actions = self.strategy.order_manager.build_actions(plan, now_ms)
 
             for cancel in actions.cancels:
@@ -563,6 +583,24 @@ class MarketABot(XChangeClient):
                     placement.qty,
                     placement.px,
                     placement.reason,
+                )
+            order_sync_duration_ms = (time.perf_counter_ns() - order_sync_started_ns) / 1_000_000
+            evaluate_sync_duration_ms = (time.perf_counter_ns() - evaluate_started_ns) / 1_000_000
+            handler_duration_ms = (
+                (time.perf_counter_ns() - handler_started_ns) / 1_000_000
+                if handler_started_ns is not None
+                else None
+            )
+            if self.tracer is not None:
+                self.tracer.record_decision(
+                    now_ms=now_ms,
+                    state=decision_state,
+                    cash=self._current_cash(),
+                    trigger=reason,
+                    plan=plan,
+                    handler_duration_ms=handler_duration_ms,
+                    evaluate_sync_duration_ms=evaluate_sync_duration_ms,
+                    order_sync_duration_ms=order_sync_duration_ms,
                 )
             if self.tracer is not None:
                 self.tracer.maybe_record_periodic_snapshot(
