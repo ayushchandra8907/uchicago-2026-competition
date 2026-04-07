@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
-from typing import Literal
 
 
 class ConfigError(ValueError):
@@ -23,14 +22,12 @@ class AConfig:
     initial_fair_value: int | None = None
     recover_pricing_state: bool = False
     total_position_limit: int = 180
-    max_order_qty: int = 39
     earnings_base_budget: int = 120
     mm_base_budget: int = 60
     earnings_shift_budget: int = 180
     mm_shift_budget: int = 0
     startup_assume_fresh_round: bool = True
     pre_news_pullback_ms: int = 4_000
-    pre_news_arrival_grace_ms: int = 1_200
     calibration_min_delay_ms: int = 5_000
     calibration_max_delay_ms: int = 20_000
     calibration_sample_period_ms: int = 1_000
@@ -38,9 +35,10 @@ class AConfig:
     calibration_tolerance_fraction: float = 0.10
     calibration_min_tolerance_fraction: float = 0.03
     candidate_confirmations: int = 2
-    discovery_quote_size: int = 1
+    discovery_quote_size: int = 2
     discovery_max_position: int = 4
     discovery_half_spread_ticks: int = 8
+    news_caution_duration_ms: int = 12_000
     news_caution_quote_size: int = 1
     news_caution_max_position: int = 4
     news_caution_half_spread_ticks: int = 8
@@ -63,41 +61,21 @@ class AConfig:
     unwind_exit_position: int = 12
     unwind_aggressive_entry: int = 24
     unwind_aggressive_exit: int = 16
-    earnings_unwind_quote_size: int = 3
-    earnings_unwind_aggressive_quote_size: int = 3
-    earnings_unwind_rapid_entry: int = 9_999
-    earnings_unwind_rapid_exit: int = 9_998
-    earnings_unwind_rapid_take_edge: int = 4
     earnings_unwind_aggressive_entry: int = 48
     earnings_unwind_aggressive_exit: int = 24
     earnings_unwind_passive_exit: int = 8
     earnings_unwind_passive_take_edge: int = 8
+    post_earnings_mm_cooldown_ms: int = 10_000
+    unwind_fast_entry: int = 36
+    unwind_fast_exit: int = 12
+    unwind_fast_quote_size: int = 12
     shock_quote_size: int = 12
-    shock_entry_window_ms: int = 1_000
-    shock_entry_quote_size: int = 24
-    shock_entry_min_edge: int = 2
-    shock_entry_threshold_scale: float = 0.50
-    shock_accumulate_target_position: int = 180
-    shock_accumulate_min_quote_size: int = 12
-    shock_accumulate_max_quote_size: int = 12
-    shock_accumulate_min_edge: int = 4
-    shock_accumulate_threshold_scale: float = 1.0
-    shock_accumulate_window_ms: int = 3_000
     shock_base_max_position: int = 100
     shock_shift_max_position: int = 180
     shock_window_ms: int = 3_000
     shock_take_fraction: float = 0.25
     shock_take_min_edge: int = 4
-    shock_settle_min_hold_ms: int = 1_200
-    shock_settle_max_hold_ms: int = 4_000
-    shock_settle_band_ticks: int = 8
-    shock_settle_drift_ticks: int = 4
-    shock_settle_confirmations: int = 2
-    shock_unwind_quote_size: int = 3
-    shock_unwind_aggressive_quote_size: int = 3
-    shock_unwind_take_edge: int = 4
-    shock_unwind_exit_position: int = 8
-    prejump_enabled: bool = True
+    prejump_enabled: bool = False
     prejump_window_ms: int = 1_200
     prejump_low_threshold: float = 0.85
     prejump_high_threshold: float = 1.35
@@ -107,9 +85,26 @@ class AConfig:
 
 
 @dataclass(frozen=True)
+class BConfig:
+    enabled: bool = True
+    trading_enabled: bool = False
+    observe_only: bool = True
+    signal_snapshot_interval_ms: int = 250
+    signal_change_threshold_ticks: int = 1
+    underlying_symbol: str = "B"
+    option_symbols: tuple[str, ...] = (
+        "B_C_950",
+        "B_P_950",
+        "B_C_1000",
+        "B_P_1000",
+        "B_C_1050",
+        "B_P_1050",
+    )
+
+
+@dataclass(frozen=True)
 class RiskConfig:
     reprice_cooldown_ms: int = 250
-    passive_min_rest_ms: int = 0
     passive_reprice_threshold_ticks: int = 2
     passive_quote_ttl_ms: int = 3_000
 
@@ -129,7 +124,6 @@ class BotPaths:
 class TraceConfig:
     trace_enabled: bool = False
     trace_root: Path | None = None
-    trace_detail_level: Literal["lite", "full"] = "lite"
     trace_snapshot_interval_ms: int = 500
     trace_book_depth_levels: int = 10
     trace_markout_windows_ms: tuple[int, ...] = (250, 1_000, 5_000)
@@ -140,6 +134,7 @@ class TraceConfig:
 class BotConfig:
     exchange: ExchangeConfig
     market_a: AConfig
+    market_b: BConfig
     risk: RiskConfig
     paths: BotPaths
     trace: TraceConfig
@@ -208,17 +203,6 @@ def _optional_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(parts)
 
 
-def _optional_literal(name: str, default: str, allowed: tuple[str, ...]) -> str:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return default
-    normalized = value.strip().lower()
-    if normalized not in allowed:
-        allowed_csv = ", ".join(allowed)
-        raise ConfigError(f"Environment variable {name} must be one of: {allowed_csv}.")
-    return normalized
-
-
 def load_bot_config(
     base_dir: str | Path,
     *,
@@ -261,14 +245,12 @@ def load_bot_config(
             initial_fair_value=_optional_int("A_INITIAL_FAIR_VALUE", default_initial_fair_value),
             recover_pricing_state=_optional_bool("A_RECOVER_PRICING_STATE", False),
             total_position_limit=_optional_int("A_TOTAL_POSITION_LIMIT", 180) or 180,
-            max_order_qty=_optional_int("A_MAX_ORDER_QTY", 39) or 39,
             earnings_base_budget=_optional_int("A_EARNINGS_BASE_BUDGET", 120) or 120,
             mm_base_budget=_optional_int("A_MM_BASE_BUDGET", 60) or 60,
             earnings_shift_budget=_optional_int("A_EARNINGS_SHIFT_BUDGET", 180) or 180,
             mm_shift_budget=_optional_int("A_MM_SHIFT_BUDGET", 0) or 0,
             startup_assume_fresh_round=_optional_bool("A_STARTUP_ASSUME_FRESH_ROUND", True),
             pre_news_pullback_ms=_optional_int("A_PRE_NEWS_PULLBACK_MS", 4_000) or 4_000,
-            pre_news_arrival_grace_ms=_optional_int("A_PRE_NEWS_ARRIVAL_GRACE_MS", 1_200) or 1_200,
             calibration_min_delay_ms=_optional_int("A_CALIBRATION_MIN_DELAY_MS", 5_000) or 5_000,
             calibration_max_delay_ms=_optional_int("A_CALIBRATION_MAX_DELAY_MS", 20_000) or 20_000,
             calibration_sample_period_ms=_optional_int("A_CALIBRATION_SAMPLE_PERIOD_MS", 1_000) or 1_000,
@@ -276,9 +258,10 @@ def load_bot_config(
             calibration_tolerance_fraction=_optional_float("A_CALIBRATION_TOLERANCE_FRACTION", 0.10) or 0.10,
             calibration_min_tolerance_fraction=_optional_float("A_CALIBRATION_MIN_TOLERANCE_FRACTION", 0.03) or 0.03,
             candidate_confirmations=_optional_int("A_CANDIDATE_CONFIRMATIONS", 2) or 2,
-            discovery_quote_size=_optional_int("A_DISCOVERY_QUOTE_SIZE", 1) or 1,
+            discovery_quote_size=_optional_int("A_DISCOVERY_QUOTE_SIZE", 2) or 2,
             discovery_max_position=_optional_int("A_DISCOVERY_MAX_POSITION", 4) or 4,
             discovery_half_spread_ticks=_optional_int("A_DISCOVERY_HALF_SPREAD_TICKS", 8) or 8,
+            news_caution_duration_ms=_optional_int("A_NEWS_CAUTION_DURATION_MS", 12_000) or 12_000,
             news_caution_quote_size=_optional_int("A_NEWS_CAUTION_QUOTE_SIZE", 1) or 1,
             news_caution_max_position=_optional_int("A_NEWS_CAUTION_MAX_POSITION", 4) or 4,
             news_caution_half_spread_ticks=_optional_int("A_NEWS_CAUTION_HALF_SPREAD_TICKS", 8) or 8,
@@ -301,41 +284,21 @@ def load_bot_config(
             unwind_exit_position=_optional_int("A_UNWIND_EXIT_POSITION", 12) or 12,
             unwind_aggressive_entry=_optional_int("A_UNWIND_AGGRESSIVE_ENTRY", 24) or 24,
             unwind_aggressive_exit=_optional_int("A_UNWIND_AGGRESSIVE_EXIT", 16) or 16,
-            earnings_unwind_quote_size=_optional_int("A_EARNINGS_UNWIND_QUOTE_SIZE", 3) or 3,
-            earnings_unwind_aggressive_quote_size=_optional_int("A_EARNINGS_UNWIND_AGGRESSIVE_QUOTE_SIZE", 3) or 3,
-            earnings_unwind_rapid_entry=_optional_int("A_EARNINGS_UNWIND_RAPID_ENTRY", 9_999) or 9_999,
-            earnings_unwind_rapid_exit=_optional_int("A_EARNINGS_UNWIND_RAPID_EXIT", 9_998) or 9_998,
-            earnings_unwind_rapid_take_edge=_optional_int("A_EARNINGS_UNWIND_RAPID_TAKE_EDGE", 4) or 4,
             earnings_unwind_aggressive_entry=_optional_int("A_EARNINGS_UNWIND_AGGRESSIVE_ENTRY", 48) or 48,
             earnings_unwind_aggressive_exit=_optional_int("A_EARNINGS_UNWIND_AGGRESSIVE_EXIT", 24) or 24,
             earnings_unwind_passive_exit=_optional_int("A_EARNINGS_UNWIND_PASSIVE_EXIT", 8) or 8,
             earnings_unwind_passive_take_edge=_optional_int("A_EARNINGS_UNWIND_PASSIVE_TAKE_EDGE", 8) or 8,
+            post_earnings_mm_cooldown_ms=_optional_int("A_POST_EARNINGS_MM_COOLDOWN_MS", 10_000) or 10_000,
+            unwind_fast_entry=_optional_int("A_UNWIND_FAST_ENTRY", 36) or 36,
+            unwind_fast_exit=_optional_int("A_UNWIND_FAST_EXIT", 12) or 12,
+            unwind_fast_quote_size=_optional_int("A_UNWIND_FAST_QUOTE_SIZE", 12) or 12,
             shock_quote_size=_optional_int("A_SHOCK_QUOTE_SIZE", 12) or 12,
-            shock_entry_window_ms=_optional_int("A_SHOCK_ENTRY_WINDOW_MS", 1_000) or 1_000,
-            shock_entry_quote_size=_optional_int("A_SHOCK_ENTRY_QUOTE_SIZE", 24) or 24,
-            shock_entry_min_edge=_optional_int("A_SHOCK_ENTRY_MIN_EDGE", 2) or 2,
-            shock_entry_threshold_scale=_optional_float("A_SHOCK_ENTRY_THRESHOLD_SCALE", 0.50) or 0.50,
-            shock_accumulate_target_position=_optional_int("A_SHOCK_ACCUMULATE_TARGET_POSITION", 180) or 180,
-            shock_accumulate_min_quote_size=_optional_int("A_SHOCK_ACCUMULATE_MIN_QUOTE_SIZE", 12) or 12,
-            shock_accumulate_max_quote_size=_optional_int("A_SHOCK_ACCUMULATE_MAX_QUOTE_SIZE", 12) or 12,
-            shock_accumulate_min_edge=_optional_int("A_SHOCK_ACCUMULATE_MIN_EDGE", 4) or 4,
-            shock_accumulate_threshold_scale=_optional_float("A_SHOCK_ACCUMULATE_THRESHOLD_SCALE", 1.0) or 1.0,
-            shock_accumulate_window_ms=_optional_int("A_SHOCK_ACCUMULATE_WINDOW_MS", 3_000) or 3_000,
             shock_base_max_position=_optional_int("A_SHOCK_BASE_MAX_POSITION", 100) or 100,
             shock_shift_max_position=_optional_int("A_SHOCK_SHIFT_MAX_POSITION", 180) or 180,
             shock_window_ms=_optional_int("A_SHOCK_WINDOW_MS", 3_000) or 3_000,
             shock_take_fraction=_optional_float("A_SHOCK_TAKE_FRACTION", 0.25) or 0.25,
             shock_take_min_edge=_optional_int("A_SHOCK_TAKE_MIN_EDGE", 4) or 4,
-            shock_settle_min_hold_ms=_optional_int("A_SHOCK_SETTLE_MIN_HOLD_MS", 1_200) or 1_200,
-            shock_settle_max_hold_ms=_optional_int("A_SHOCK_SETTLE_MAX_HOLD_MS", 4_000) or 4_000,
-            shock_settle_band_ticks=_optional_int("A_SHOCK_SETTLE_BAND_TICKS", 8) or 8,
-            shock_settle_drift_ticks=_optional_int("A_SHOCK_SETTLE_DRIFT_TICKS", 4) or 4,
-            shock_settle_confirmations=_optional_int("A_SHOCK_SETTLE_CONFIRMATIONS", 2) or 2,
-            shock_unwind_quote_size=_optional_int("A_SHOCK_UNWIND_QUOTE_SIZE", 3) or 3,
-            shock_unwind_aggressive_quote_size=_optional_int("A_SHOCK_UNWIND_AGGRESSIVE_QUOTE_SIZE", 3) or 3,
-            shock_unwind_take_edge=_optional_int("A_SHOCK_UNWIND_TAKE_EDGE", 4) or 4,
-            shock_unwind_exit_position=_optional_int("A_SHOCK_UNWIND_EXIT_POSITION", 8) or 8,
-            prejump_enabled=_optional_bool("A_PREJUMP_ENABLED", True),
+            prejump_enabled=_optional_bool("A_PREJUMP_ENABLED", False),
             prejump_window_ms=_optional_int("A_PREJUMP_WINDOW_MS", 1_200) or 1_200,
             prejump_low_threshold=_optional_float("A_PREJUMP_LOW_THRESHOLD", 0.85) or 0.85,
             prejump_high_threshold=_optional_float("A_PREJUMP_HIGH_THRESHOLD", 1.35) or 1.35,
@@ -343,9 +306,15 @@ def load_bot_config(
             prejump_quote_size=_optional_int("A_PREJUMP_QUOTE_SIZE", 6) or 6,
             prejump_aggressive_edge=_optional_int("A_PREJUMP_AGGRESSIVE_EDGE", 2) or 2,
         ),
+        market_b=BConfig(
+            enabled=_optional_bool("B_ENABLED", True),
+            trading_enabled=_optional_bool("B_TRADING_ENABLED", False),
+            observe_only=_optional_bool("B_OBSERVE_ONLY", True),
+            signal_snapshot_interval_ms=_optional_int("B_SIGNAL_SNAPSHOT_INTERVAL_MS", 250) or 250,
+            signal_change_threshold_ticks=_optional_int("B_SIGNAL_CHANGE_THRESHOLD_TICKS", 1) or 1,
+        ),
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
-            passive_min_rest_ms=_optional_int("A_PASSIVE_MIN_REST_MS", 0) or 0,
             passive_reprice_threshold_ticks=_optional_int("A_PASSIVE_REPRICE_THRESHOLD_TICKS", 2) or 2,
             passive_quote_ttl_ms=_optional_int("A_PASSIVE_QUOTE_TTL_MS", 3_000) or 3_000,
         ),
@@ -356,7 +325,6 @@ def load_bot_config(
         trace=TraceConfig(
             trace_enabled=_optional_bool("TRACE_ENABLED", False),
             trace_root=trace_root,
-            trace_detail_level=_optional_literal("TRACE_DETAIL_LEVEL", "lite", ("lite", "full")),  # type: ignore[arg-type]
             trace_snapshot_interval_ms=_optional_int("TRACE_SNAPSHOT_INTERVAL_MS", 500) or 500,
             trace_book_depth_levels=_optional_int("TRACE_BOOK_DEPTH_LEVELS", 10) or 10,
             trace_markout_windows_ms=_optional_int_tuple("TRACE_MARKOUT_WINDOWS_MS", (250, 1_000, 5_000)),

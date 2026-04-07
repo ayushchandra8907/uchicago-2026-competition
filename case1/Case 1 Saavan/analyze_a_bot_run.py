@@ -32,6 +32,9 @@ def print_summary(summary: dict) -> None:
     print("A Bot Run Summary")
     print(f"Total events: {summary.get('total_events', 0)}")
     print(f"Estimated final MTM PnL: {summary.get('estimated_final_mtm_pnl')} ({summary.get('estimated_final_mtm_basis')})")
+    print(f"Relevant A structured earnings: {summary.get('a_relevant_structured_earnings_count', 0)}")
+    print(f"Irrelevant structured items: {summary.get('a_irrelevant_structured_count', 0)}")
+    print(f"Relevant A unstructured news: {summary.get('a_relevant_unstructured_count', 0)}")
     print(f"Passive fills: {summary.get('passive_fills', 0)}")
     print(f"Aggressive fills: {summary.get('aggressive_fills', 0)}")
     print(f"Largest long inventory: {summary.get('largest_inventory_long', 0)}")
@@ -43,42 +46,21 @@ def print_summary(summary: dict) -> None:
     print(f"Observe-only decisions: {summary.get('observe_only_count', 0)}")
     print(f"Budget shift active (ms): {summary.get('budget_shift_active_ms', 0)}")
     print("")
-    print("Local processing durations (ms):")
-    for metric, stats in (summary.get("local_processing_durations_ms") or {}).items():
-        print(f"  {metric}: p50={stats.get('p50')} p95={stats.get('p95')} max={stats.get('max')}")
+    print("PnL by market:")
+    for market, pnl in (summary.get("pnl_by_market") or {}).items():
+        print(f"  {market}: {pnl}")
     print("")
-    print("Order lifecycle latencies (ms):")
-    for metric in (
-        "cancel_response_latency_ms",
-        "submit_to_fill_ms",
-        "submit_to_cancel_response_ms",
-    ):
-        stats = summary.get(metric) or {}
-        print(f"  {metric}: p50={stats.get('p50')} p95={stats.get('p95')} max={stats.get('max')}")
-    print("")
-    print("Earnings episode unwind:")
-    for episode in (summary.get("shock_episode_unwind_metrics") or []):
-        print(
-            "  "
-            f"#{episode.get('episode_index')} tick={episode.get('exchange_tick')} "
-            f"earnings={episode.get('earnings_value')} direction={episode.get('shock_direction')} "
-            f"transfer_mm={episode.get('transferred_mm_inventory_at_cycle_start')} "
-            f"peak_total={episode.get('peak_signed_total_inventory')} "
-            f"peak={episode.get('peak_signed_earnings_position')} "
-            f"peak_mm={episode.get('peak_residual_mm_position')} "
-            f"target={episode.get('shock_target_total_inventory')} "
-            f"target_exceeded={episode.get('total_inventory_exceeded_target_cap')} "
-            f"shock_mm_nonzero={episode.get('shock_stage_nonzero_mm_position_count')} "
-            f"settle={episode.get('time_to_settle_ms')} "
-            f"unwind_start={episode.get('time_to_unwind_start_ms')} "
-            f"to<=20={episode.get('time_to_abs_20_ms')} "
-            f"to<=4={episode.get('time_to_abs_4_ms')} "
-            f"pre_settle_unwind={episode.get('opposite_unwind_before_settle_count')}"
-        )
+    print("PnL by strategy family:")
+    for strategy, pnl in (summary.get("pnl_by_strategy_family") or {}).items():
+        print(f"  {strategy}: {pnl}")
     print("")
     print("Fills by intent:")
     for intent, count in (summary.get("fills_by_intent") or {}).items():
         print(f"  {intent}: {count}")
+    print("")
+    print("Fills by action class:")
+    for action_class, count in (summary.get("fills_by_action_class") or {}).items():
+        print(f"  {action_class}: {count}")
     print("")
     print("Fills by overlay:")
     for overlay, count in (summary.get("fills_by_overlay") or {}).items():
@@ -96,6 +78,54 @@ def print_summary(summary: dict) -> None:
     for intent, window_map in (summary.get("fill_markouts_by_intent") or {}).items():
         formatted = ", ".join(f"{window}={value:.2f}" for window, value in window_map.items())
         print(f"  {intent}: {formatted}")
+    print("")
+    print("Average markouts by action class:")
+    for action_class, window_map in (summary.get("markouts_by_action_class") or {}).items():
+        formatted = ", ".join(f"{window}={value:.2f}" for window, value in window_map.items())
+        print(f"  {action_class}: {formatted}")
+    print("")
+    print("Top losing strategy families:")
+    for row in summary.get("top_losing_strategy_families") or []:
+        print(
+            f"  {row.get('strategy_family')}: total={row.get('total_pnl')} "
+            f"realized={row.get('realized_pnl')} unrealized={row.get('unrealized_pnl')}"
+        )
+    print("")
+    print("Top losing signal episodes:")
+    for row in summary.get("top_losing_signal_episodes") or []:
+        print(
+            f"  {row.get('market_key')} {row.get('strategy_family')} {row.get('signal_id')}: "
+            f"total={row.get('total_pnl')} fills={row.get('fill_count')} qty={row.get('fill_qty')}"
+        )
+    print("")
+    print("Derived signal counts:")
+    for strategy_family, count in (summary.get("derived_signal_counts") or {}).items():
+        print(f"  {strategy_family}: {count}")
+    print("")
+    print("A episode summaries:")
+    for row in summary.get("a_episode_summaries") or []:
+        print(
+            f"  {row.get('signal_id')}: tick={row.get('tick')} fair_jump={row.get('fair_jump')} "
+            f"mode_before={row.get('mode_before_news')} shock_qty={row.get('shock_take_qty')} "
+            f"peak_total={row.get('peak_total_inventory')} peak_earnings={row.get('peak_earnings_inventory')} "
+            f"unwind_ms={row.get('unwind_time_ms')} next_during_unwind={row.get('next_earnings_arrived_during_unwind')} "
+            f"cycle_pnl={row.get('cycle_pnl_by_strategy_owner')}"
+        )
+    print("")
+    print("A MM loss by mode:")
+    for mode, stats in (summary.get("a_mm_loss_by_mode") or {}).items():
+        print(f"  {mode}: {stats}")
+    print("")
+    print("B cost-adjusted residual stats:")
+    b_stats = summary.get("b_cost_adjusted_residual_stats") or {}
+    print(f"  composite_basis: {b_stats.get('composite_basis')}")
+    for strike, stats in (b_stats.get("by_strike") or {}).items():
+        print(f"  strike {strike}: {stats}")
+    print("")
+    print("Trace volume summary:")
+    volume = summary.get("trace_volume_summary") or {}
+    print(f"  event_counts: {volume.get('event_counts')}")
+    print(f"  symbol_counts: {volume.get('symbol_counts')}")
 
 
 def main() -> None:
