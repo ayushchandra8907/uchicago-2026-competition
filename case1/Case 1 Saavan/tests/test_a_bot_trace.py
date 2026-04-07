@@ -211,7 +211,7 @@ class TraceTests(unittest.TestCase):
     def test_load_bot_config_trace_defaults_to_saavan_analysis_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_keys = {
-                "UTC_HOST": "34.197.188.76:3333",
+                "UTC_HOST": "practice.uchicago.exchange:3333",
                 "UTC_USERNAME": "user",
                 "UTC_PASSWORD": "pass",
             }

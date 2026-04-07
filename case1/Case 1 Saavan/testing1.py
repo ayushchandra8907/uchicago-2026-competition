@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 # Quick-start defaults so clicking the IDE Run button works the same way as the
 # provided example bot. Environment variables still override these.
-DEFAULT_SERVER = "34.197.188.76:3333"
+DEFAULT_SERVER = "practice.uchicago.exchange:3333"
 DEFAULT_USERNAME = "uiuc"
 DEFAULT_PASSWORD = "mesa-lynx-octopus"
 
