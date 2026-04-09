@@ -6,6 +6,7 @@ import unittest
 from case1.ayush_work.marketA_v3.botrunner import BotRunner
 from case1.ayush_work.marketA_v3.config import BotConfig, BotPaths, ExchangeConfig, LoggerConfig, StrategyConfig
 from case1.ayush_work.marketA_v3.core.types import Decision, DesiredOrder, ManagedOrder
+from utcxchangelib import service_pb2
 
 
 def build_config() -> BotConfig:
@@ -113,8 +114,66 @@ class BotRunnerTests(unittest.TestCase):
         runner._midrun_checkpoint_started = True
         self.assertFalse(runner._midrun_checkpoint_due(7_000))
 
+    def test_c_runner_snapshot_exposes_multi_symbol_state(self):
+        runner = BotRunner(build_config(), active_strategy="C")
+        runner._inventory_estimate_by_symbol["R_HIKE"] = 10
+        runner._inventory_estimate_by_symbol["R_HOLD"] = -5
+        runner._last_trade_px_by_symbol["R_CUT"] = 444
+        snapshot = runner._snapshot(event_symbol="R_HIKE")
+        self.assertEqual(snapshot.inventory_for("R_HIKE"), 10)
+        self.assertEqual(snapshot.inventory_for("R_HOLD"), -5)
+        self.assertEqual(snapshot.last_trade_for("R_CUT"), 444)
+        self.assertEqual(snapshot.event_symbol, "R_HIKE")
+
+    def test_c_risk_adjusted_order_respects_per_contract_cap(self):
+        config = build_config()
+        config = BotConfig(
+            exchange=config.exchange,
+            strategy=config.strategy,
+            logger=config.logger,
+            paths=config.paths,
+            c_strategy=config.c_strategy.__class__(max_absolute_position_per_contract=40, shared_rate_position_budget=600),
+        )
+        runner = BotRunner(config, active_strategy="C")
+        runner._inventory_estimate_by_symbol["R_HIKE"] = 35
+        desired = DesiredOrder(side="BUY", px=500, qty=20, aggressive=True, intent="prediction_market_take", reason="test", symbol="R_HIKE")
+        adjusted = runner._risk_adjusted_order(desired)
+        self.assertIsNotNone(adjusted)
+        self.assertEqual(adjusted.qty, 5)
+
 
 class BotRunnerAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_c_runner_stops_immediately_after_market_resolved(self):
+        runner = BotRunner(build_config(), active_strategy="C")
+        msg = service_pb2.ExchangeMessageToClient(
+            index=1,
+            market_resolved=service_pb2.MarketResolvedMessage(
+                market_id="fed_rates",
+                winning_symbol="R_HOLD",
+                tick=1234,
+            ),
+        )
+
+        with self.assertRaises(EOFError):
+            await runner.process_message(msg)
+
+        self.assertTrue(runner._stop_after_c_market_resolved)
+
+    async def test_a_runner_does_not_stop_on_prediction_market_resolution(self):
+        runner = BotRunner(build_config(), active_strategy="A")
+        msg = service_pb2.ExchangeMessageToClient(
+            index=1,
+            market_resolved=service_pb2.MarketResolvedMessage(
+                market_id="fed_rates",
+                winning_symbol="R_HOLD",
+                tick=1234,
+            ),
+        )
+
+        await runner.process_message(msg)
+
+        self.assertFalse(runner._stop_after_c_market_resolved)
+
     async def test_apply_decision_submits_one_small_clip_for_large_target(self):
         runner = BotRunner(build_config())
         submitted: list[int] = []
@@ -148,6 +207,41 @@ class BotRunnerAsyncTests(unittest.IsolatedAsyncioTestCase):
         await runner._apply_decision(decision)
 
         self.assertEqual(submitted, [12])
+
+    async def test_apply_decision_for_c_submits_on_target_symbol(self):
+        runner = BotRunner(build_config(), active_strategy="C")
+        submitted: list[tuple[str, int]] = []
+
+        async def fake_place_order(symbol, qty, side, px):
+            submitted.append((str(symbol), int(qty)))
+            return f"oid-{len(submitted)}"
+
+        async def fake_cancel_order(order_id):
+            raise AssertionError("cancel_order should not be called")
+
+        runner.place_order = fake_place_order  # type: ignore[method-assign]
+        runner.cancel_order = fake_cancel_order  # type: ignore[method-assign]
+
+        decision = Decision(
+            mode="SHOCK",
+            target_inventory=30,
+            desired_order=DesiredOrder(
+                side="BUY",
+                px=520,
+                qty=30,
+                aggressive=True,
+                intent="prediction_market_take",
+                reason="test",
+                symbol="R_HOLD",
+            ),
+            cancel_all=False,
+            observe_only=False,
+            reason="test",
+        )
+
+        await runner._apply_decision(decision)
+
+        self.assertEqual(submitted, [("R_HOLD", 12)])
 
 
 if __name__ == "__main__":

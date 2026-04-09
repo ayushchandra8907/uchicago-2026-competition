@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from case1.ayush_work.marketA_v3.A_strategy import AStrategy
 from case1.ayush_work.marketA_v3.analyze_run import build_unknown_news_term_report
 from case1.ayush_work.marketA_v3.config import StrategyConfig
-from case1.ayush_work.marketA_v3.core.a_news_sentiment import score_a_unstructured_headline
 from case1.ayush_work.marketA_v3.core.types import BookLevel, BookSnapshot, NewsEvent, StrategySnapshot
+from case1.ayush_work.marketA_v3.market_A_strategy import AStrategy
+from case1.ayush_work.marketA_v3.market_A_strategy.a_news_sentiment import score_a_unstructured_headline
 
 
 def snapshot(
@@ -642,13 +642,15 @@ class UnstructuredNewsTests(unittest.TestCase):
         )
         self.assertGreater(result.score, 2.0)
         self.assertEqual(result.direction, 1)
+        self.assertNotIn("hit", result.matched_unigrams)
 
     def test_delayed_stalling_progress_headline_is_negative(self):
         result = score_a_unstructured_headline(
             "Deployment of a key strategic technology is delayed, stalling progress at A."
         )
-        self.assertLess(result.score, -2.0)
+        self.assertLess(result.score, -3.0)
         self.assertEqual(result.direction, -1)
+        self.assertIn(result.bucket, {"strong", "extreme"})
 
     def test_profit_margins_shrink_due_to_rising_costs_is_negative(self):
         result = score_a_unstructured_headline("A's profit margins shrink significantly due to rising costs.")

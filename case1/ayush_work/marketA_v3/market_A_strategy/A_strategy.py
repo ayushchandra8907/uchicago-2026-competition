@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections import deque
 from statistics import median
 
-from .config import StrategyConfig
-from .core.a_news_sentiment import SentimentResult, score_a_unstructured_headline
-from .core.types import Decision, DesiredOrder, ModeState, NewsEvent, StrategySnapshot
+from ..config import StrategyConfig
+from ..core.types import Decision, DesiredOrder, ModeState, NewsEvent, StrategySnapshot
+from .a_news_sentiment import SentimentResult, score_a_unstructured_headline
 
 
 def _sign(value: float) -> int:
@@ -61,6 +61,7 @@ class AStrategy:
         self.unknown_candidate_phrases: tuple[str, ...] = ()
         self.unknown_candidate_unigrams: tuple[str, ...] = ()
         self.unknown_candidate_bigrams: tuple[str, ...] = ()
+        self.pending_takeover_news: NewsEvent | None = None
         self.pending_unstructured_news: NewsEvent | None = None
         self.pending_news_score: float | None = None
         self.pending_news_fair: int | None = None
@@ -145,6 +146,7 @@ class AStrategy:
             "unknown_candidate_phrases": list(self.unknown_candidate_phrases),
             "unknown_candidate_unigrams": list(self.unknown_candidate_unigrams),
             "unknown_candidate_bigrams": list(self.unknown_candidate_bigrams),
+            "pending_takeover_news": None if self.pending_takeover_news is None else self.pending_takeover_news.content or self.pending_takeover_news.kind,
             "pending_news": self.pending_news,
             "pending_news_target_inventory": self.pending_news_target_inventory,
             "news_confirmation_state": self.news_confirmation_state,
@@ -309,6 +311,25 @@ class AStrategy:
         self.news_confirmed = False
         self.news_confirmation_state = "inactive"
 
+    def _queue_takeover_news(
+        self,
+        snapshot: StrategySnapshot,
+        news_event: NewsEvent,
+        *,
+        trigger: str,
+        reason: str,
+        preserve_pending_signal: bool = False,
+    ) -> Decision:
+        if not preserve_pending_signal:
+            self._clear_pending_news()
+        self.pending_takeover_news = news_event
+        self.mode = "UNWIND"
+        if self.unwind_started_ms is None:
+            self.unwind_started_ms = snapshot.now_ms
+            self.unwind_start_inventory = snapshot.inventory
+        self.news_takeover_started_ms = snapshot.now_ms
+        return self._build_takeover_flatten_decision(snapshot, trigger=trigger, reason=reason)
+
     def _clear_after_flatten(self) -> None:
         if self.active_signal_kind == "unstructured" and self.base_fair_value is not None:
             self.fair_value = self.base_fair_value
@@ -356,8 +377,16 @@ class AStrategy:
         self.base_fair_value = round(self.trusted_multiplier * self.latest_earnings)
         self.fair_value = self.base_fair_value
 
-    def _start_structured_news(self, snapshot: StrategySnapshot, news_event: NewsEvent) -> Decision:
+    def _start_structured_news(self, snapshot: StrategySnapshot, news_event: NewsEvent, *, allow_takeover: bool = True) -> Decision:
+        if allow_takeover and self._news_takeover_required(snapshot):
+            return self._queue_takeover_news(
+                snapshot,
+                news_event,
+                trigger="structured_news",
+                reason="flattening current inventory before the latest structured A earnings signal takes over",
+            )
         self._clear_pending_news()
+        self.pending_takeover_news = None
         self.active_signal_kind = "structured"
         self.news_sentiment_score = None
         self.news_sentiment_bucket = None
@@ -410,7 +439,7 @@ class AStrategy:
             self.post_event_mids.append((snapshot.now_ms, float(snapshot.book.mid)))
         return self._evaluate(snapshot, trigger="structured_news")
 
-    def _handle_unstructured_a_news(self, snapshot: StrategySnapshot, news_event: NewsEvent) -> Decision:
+    def _handle_unstructured_a_news(self, snapshot: StrategySnapshot, news_event: NewsEvent, *, allow_takeover: bool = True) -> Decision:
         self.pe_frozen = True
         self.current_event_contaminated = True
 
@@ -460,24 +489,45 @@ class AStrategy:
         self.news_confirmed = sentiment.bucket in {"strong", "extreme"} or abs(sentiment.score) >= 5.0
         self.news_confirmation_deadline_ms = None if self.news_confirmed else snapshot.now_ms + self.config.news_confirmation_timeout_ms
         self.news_confirmation_state = "immediate" if self.news_confirmed else "pending"
-        takeover_required = self._news_takeover_required(snapshot)
+        takeover_required = allow_takeover and self._news_takeover_required(snapshot)
         self.news_takeover_started_ms = snapshot.now_ms if takeover_required else None
 
         if takeover_required:
-            self.mode = "UNWIND"
-            self.unwind_started_ms = snapshot.now_ms
-            self.unwind_start_inventory = snapshot.inventory
-            self.active_signal_kind = self.active_signal_kind or "structured"
-            self.equilibrium_reached_ms = snapshot.now_ms
-            self.post_event_mids.clear()
-            if snapshot.book.mid is not None:
-                self.post_event_mids.append((snapshot.now_ms, float(snapshot.book.mid)))
             self.news_confirmation_state = "flattening"
-            return self._build_takeover_flatten_decision(snapshot, trigger="unstructured_news", reason="flattening current inventory before the latest A-news signal takes over")
+            return self._queue_takeover_news(
+                snapshot,
+                news_event,
+                trigger="unstructured_news",
+                reason="flattening current inventory before the latest A-news signal takes over",
+                preserve_pending_signal=True,
+            )
 
         if self.news_confirmed:
             return self._activate_pending_unstructured_shock(snapshot, trigger="unstructured_news")
         return self._observe_current_state(snapshot, reason="waiting for medium A-news confirmation before taking inventory")
+
+    def _handle_pending_takeover_news(self, snapshot: StrategySnapshot, *, trigger: str) -> Decision | None:
+        if self.pending_takeover_news is None:
+            return None
+        if self._news_takeover_required(snapshot):
+            self.mode = "UNWIND"
+            if self.unwind_started_ms is None:
+                self.unwind_started_ms = snapshot.now_ms
+                self.unwind_start_inventory = snapshot.inventory
+            self.news_takeover_started_ms = self.news_takeover_started_ms or snapshot.now_ms
+            return self._build_takeover_flatten_decision(
+                snapshot,
+                trigger=trigger,
+                reason="flattening current inventory before the latest A signal takes over",
+            )
+
+        takeover_news = self.pending_takeover_news
+        self.pending_takeover_news = None
+        if takeover_news.is_structured_a_earnings:
+            return self._start_structured_news(snapshot, takeover_news, allow_takeover=False)
+        if takeover_news.is_a_specific_unstructured:
+            return self._handle_unstructured_a_news(snapshot, takeover_news, allow_takeover=False)
+        return self._idle_decision(snapshot, reason="pending takeover news became non-tradable")
 
     def _handle_pending_unstructured_news(self, snapshot: StrategySnapshot, *, trigger: str) -> Decision | None:
         if self.pending_unstructured_news is None:
@@ -577,6 +627,10 @@ class AStrategy:
         return self._build_shock_decision(snapshot, trigger=trigger)
 
     def _evaluate(self, snapshot: StrategySnapshot, *, trigger: str) -> Decision:
+        takeover_decision = self._handle_pending_takeover_news(snapshot, trigger=trigger)
+        if takeover_decision is not None:
+            return takeover_decision
+
         pending_decision = self._handle_pending_unstructured_news(snapshot, trigger=trigger)
         if pending_decision is not None:
             return pending_decision
@@ -597,6 +651,19 @@ class AStrategy:
                     snapshot,
                     trigger=trigger,
                     reason="emergency dump after a sharp wrong-way move against the current shock inventory",
+                )
+            if self._should_force_time_flatten(snapshot):
+                self.mode = "UNWIND"
+                self.unwind_started_ms = snapshot.now_ms
+                self.unwind_start_inventory = snapshot.inventory
+                self.equilibrium_reached_ms = None
+                self.overshoot_active = False
+                self.overshoot_trigger_ticks = None
+                self.shock_target_inventory = 0
+                return self._build_unwind_decision(
+                    snapshot,
+                    trigger=trigger,
+                    reason="maximum post-news hold time reached; flattening all remaining A shock inventory",
                 )
             overshoot_decision = self._maybe_build_overshoot_decision(snapshot, trigger=trigger)
             if overshoot_decision is not None:
@@ -690,6 +757,11 @@ class AStrategy:
             round(initial_edge_abs * self.config.shock_emergency_dump_fraction),
         )
         return adverse_move_ticks >= float(threshold)
+
+    def _should_force_time_flatten(self, snapshot: StrategySnapshot) -> bool:
+        if self.shock_started_ms is None or snapshot.inventory == 0:
+            return False
+        return (snapshot.now_ms - self.shock_started_ms) >= self.config.shock_max_hold_ms
 
     def _maybe_apply_shock_decay(self, now_ms: int) -> None:
         if self.shock_started_ms is None or self.shock_direction == 0 or self.shock_target_inventory == 0:

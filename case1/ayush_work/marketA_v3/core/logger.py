@@ -20,6 +20,8 @@ DECISION_FIELDNAMES = [
     "monotonic_ms",
     "exchange_tick",
     "message_index",
+    "symbol",
+    "event_symbol",
     "mode",
     "trigger",
     "reason",
@@ -60,6 +62,75 @@ DECISION_FIELDNAMES = [
     "news_confirmation_state",
     "news_confirmation_deadline_ms",
     "news_takeover_started_ms",
+    "posterior_hike",
+    "posterior_hold",
+    "posterior_cut",
+    "prior_hike",
+    "prior_hold",
+    "prior_cut",
+    "fair_value_hike",
+    "fair_value_hold",
+    "fair_value_cut",
+    "expected_rate_delta_bp",
+    "rate_macro_event_id",
+    "rate_signal_source",
+    "rate_no_trade_reason",
+    "rate_relevance_score",
+    "rate_bucket",
+    "rate_target_symbol",
+    "rate_target_inventory",
+    "rate_chosen_edge_ticks",
+    "rate_no_arb_gap_ticks",
+    "rate_long_edge_hike",
+    "rate_long_edge_hold",
+    "rate_long_edge_cut",
+    "rate_short_edge_hike",
+    "rate_short_edge_hold",
+    "rate_short_edge_cut",
+    "rate_hawk_score",
+    "rate_hold_score",
+    "rate_cut_score",
+    "rate_matched_phrases",
+    "rate_matched_unigrams",
+    "rate_matched_bigrams",
+    "rate_matched_hike_terms",
+    "rate_matched_hold_terms",
+    "rate_matched_cut_terms",
+    "rate_unknown_candidate_phrases",
+    "rate_unknown_candidate_unigrams",
+    "rate_unknown_candidate_bigrams",
+    "rate_baseline_targets_by_symbol",
+    "rate_macro_targets_by_symbol",
+    "rate_macro_pair_targets_by_symbol",
+    "rate_trading_phase_targets_by_symbol",
+    "rate_probe_targets_by_symbol",
+    "rate_reversion_targets_by_symbol",
+    "rate_pair_targets_by_symbol",
+    "rate_endgame_targets_by_symbol",
+    "rate_final_phase_targets_by_symbol",
+    "rate_combined_targets_by_symbol",
+    "rate_macro_pair_symbols",
+    "rate_macro_leg_reference_mids",
+    "rate_macro_leg_fairs",
+    "rate_macro_leg_bucket",
+    "rate_reversion_active_symbols",
+    "rate_reversion_entry_px_by_symbol",
+    "rate_reversion_reason_by_symbol",
+    "rate_pair_active_pair",
+    "rate_pair_entry_px_by_symbol",
+    "rate_pair_reason_by_symbol",
+    "rate_pair_move_by_symbol",
+    "rate_pair_last_event_id",
+    "rate_pair_last_event_kind",
+    "rate_pair_last_event_pair",
+    "rate_pair_last_event_reason",
+    "rate_reversion_last_event_id",
+    "rate_reversion_last_event_kind",
+    "rate_reversion_last_event_symbol",
+    "rate_reversion_last_event_reason",
+    "rate_reversion_last_entry_px",
+    "rate_reversion_last_exit_px",
+    "desired_symbol",
     "desired_side",
     "desired_px",
     "desired_qty",
@@ -168,7 +239,15 @@ class RunLogger:
             elif kind == "snapshot" and self._snapshot_writer is not None:
                 self._snapshot_writer.write_row(payload)
 
-    def _base_event(self, event_type: str, *, now_ms: int, exchange_tick: int | None = None, message_index: int | None = None) -> dict[str, Any]:
+    def _base_event(
+        self,
+        event_type: str,
+        *,
+        now_ms: int,
+        exchange_tick: int | None = None,
+        message_index: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
         wall_time_iso, wall_time_ns = _wall_clock_fields()
         return {
             "event_type": event_type,
@@ -178,16 +257,45 @@ class RunLogger:
             "monotonic_ms": int(now_ms),
             "exchange_tick": exchange_tick,
             "message_index": message_index,
-            "symbol": self.symbol,
+            "symbol": self.symbol if symbol is None else symbol,
         }
 
-    def record_event(self, event_type: str, *, now_ms: int, exchange_tick: int | None = None, message_index: int | None = None, **fields: Any) -> None:
-        payload = self._base_event(event_type, now_ms=now_ms, exchange_tick=exchange_tick, message_index=message_index)
+    def record_event(
+        self,
+        event_type: str,
+        *,
+        now_ms: int,
+        exchange_tick: int | None = None,
+        message_index: int | None = None,
+        symbol: str | None = None,
+        **fields: Any,
+    ) -> None:
+        payload = self._base_event(
+            event_type,
+            now_ms=now_ms,
+            exchange_tick=exchange_tick,
+            message_index=message_index,
+            symbol=symbol,
+        )
         payload.update(fields)
         self._enqueue("event", payload)
 
-    def record_decision_snapshot(self, *, now_ms: int, exchange_tick: int | None, message_index: int | None, row: dict[str, Any]) -> None:
-        event_row = self._base_event("decision_evaluated", now_ms=now_ms, exchange_tick=exchange_tick, message_index=message_index)
+    def record_decision_snapshot(
+        self,
+        *,
+        now_ms: int,
+        exchange_tick: int | None,
+        message_index: int | None,
+        row: dict[str, Any],
+        symbol: str | None = None,
+    ) -> None:
+        event_row = self._base_event(
+            "decision_evaluated",
+            now_ms=now_ms,
+            exchange_tick=exchange_tick,
+            message_index=message_index,
+            symbol=symbol,
+        )
         event_row.update(row)
         self._enqueue("event", event_row)
         if self._snapshot_writer is not None:

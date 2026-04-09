@@ -7,7 +7,7 @@ from pathlib import Path
 
 from case1.ayush_work.marketA_v3.analyze_run import write_run_outputs
 from case1.ayush_work.marketA_v3.config import StrategyConfig
-from case1.ayush_work.marketA_v3.core.a_news_tracker import build_a_news_tracker_report
+from case1.ayush_work.marketA_v3.market_A_strategy.a_news_tracker import build_a_news_tracker_report
 
 
 def _event(event_type: str, monotonic_ms: int, **fields):
