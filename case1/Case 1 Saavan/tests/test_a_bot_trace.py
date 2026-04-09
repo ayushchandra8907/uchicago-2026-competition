@@ -42,7 +42,7 @@ class TraceTests(unittest.TestCase):
                 steady_take_inventory_guard=8,
                 unwind_entry_position=24,
                 unwind_exit_position=12,
-                shock_quote_size=12,
+                shock_quote_size=15,
                 shock_base_max_position=80,
                 shock_shift_max_position=160,
             ),
@@ -185,6 +185,10 @@ class TraceTests(unittest.TestCase):
             self.assertTrue((recorder.run_dir / "decision_snapshots.csv").exists())
             self.assertTrue((recorder.run_dir / "session_summary.json").exists())
             self.assertTrue((recorder.run_dir / "session_summary.md").exists())
+            self.assertTrue((recorder.run_dir / "a_news_tracker.json").exists())
+            self.assertTrue((recorder.run_dir / "a_news_tracker.md").exists())
+            self.assertTrue((recorder.run_dir / "unknown_a_news_terms.json").exists())
+            self.assertTrue((recorder.run_dir / "unknown_a_news_terms.md").exists())
 
             events = load_trace_events(recorder.run_dir)
             event_types = {event["event_type"] for event in events}
@@ -205,7 +209,11 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(summary["fills_by_overlay"]["mm"], 1)
             self.assertIn("a_episode_summaries", summary)
             self.assertIn("a_mm_loss_by_mode", summary)
+            self.assertIn("pnl_by_action_class", summary)
+            self.assertIn("a_strategy_breakdown", summary)
+            self.assertIn("a_news_summary", summary)
             self.assertIn("b_cost_adjusted_residual_stats", summary)
+            self.assertIn("b_strategy_block_reasons", summary)
             self.assertIn("trace_volume_summary", summary)
 
     def test_load_bot_config_trace_defaults_to_saavan_analysis_runs(self) -> None:
@@ -409,6 +417,19 @@ class TraceTests(unittest.TestCase):
     def test_summarize_trace_events_reports_a_episode_mm_loss_and_b_cost_stats(self) -> None:
         events = [
             {
+                "event_type": "decision_evaluated",
+                "run_id": "run-1",
+                "monotonic_ms": 900,
+                "symbol": "B",
+                "market_key": "B",
+                "mode": "OBSERVE_ONLY",
+                "observe_only": True,
+                "reason": "synthetic_dispersion_wide",
+                "aggressive_action_count": 0,
+                "desired_bid": None,
+                "desired_ask": None,
+            },
+            {
                 "event_type": "news_received",
                 "run_id": "run-1",
                 "monotonic_ms": 1_000,
@@ -530,11 +551,14 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(summary["a_episode_summaries"][0]["peak_total_inventory"], 40)
         self.assertIn("STEADY_MM", summary["a_mm_loss_by_mode"])
         self.assertEqual(summary["a_mm_loss_by_mode"]["fills_inside_earnings_cycle"], 1)
+        self.assertEqual(summary["pnl_by_action_class"]["A.shock_take"], 120.0)
+        self.assertIn("shock_take_pnl", summary["a_strategy_breakdown"])
         self.assertEqual(summary["b_cost_adjusted_residual_stats"]["by_strike"]["1000"]["positive_edge_count"], 1)
         self.assertEqual(
             summary["b_cost_adjusted_residual_stats"]["by_strike"]["1000"]["positive_edge_persistence_ms"],
             300,
         )
+        self.assertEqual(summary["b_strategy_block_reasons"]["synthetic_dispersion_wide"], 1)
         self.assertEqual(summary["trace_volume_summary"]["event_counts"]["derived_signal"], 2)
 
 

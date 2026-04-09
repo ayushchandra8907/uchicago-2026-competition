@@ -10,7 +10,13 @@ import time
 from typing import Any, Iterable
 import uuid
 
-from a_bot_config import TraceConfig
+from a_bot_config import AConfig, TraceConfig
+from a_news_tracker import (
+    build_a_news_tracker_report,
+    build_unknown_news_term_report,
+    render_a_news_tracker_markdown,
+    render_unknown_terms_markdown,
+)
 
 
 SNAPSHOT_FIELDNAMES = [
@@ -37,6 +43,7 @@ SNAPSHOT_FIELDNAMES = [
     "multiplier_confidence",
     "inventory",
     "earnings_position",
+    "news_position",
     "mm_position",
     "buy_exposure",
     "sell_exposure",
@@ -168,6 +175,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     fills_by_intent: Counter[str] = Counter()
     fills_by_overlay: Counter[str] = Counter()
     fills_by_action_class: Counter[str] = Counter()
+    fill_qty_by_action_class: Counter[str] = Counter()
     submits_by_intent: Counter[str] = Counter()
     submits_by_overlay: Counter[str] = Counter()
     submits_by_action_class: Counter[str] = Counter()
@@ -180,6 +188,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     observe_only_count = 0
     inventory_values: list[int] = []
     earnings_inventory_values: list[int] = []
+    news_inventory_values: list[int] = []
     mm_inventory_values: list[int] = []
     quoted_spreads: list[int] = []
     latest_mtm: float | None = None
@@ -199,10 +208,12 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     latest_derived_signals: dict[str, dict[str, Any]] = {}
 
     owner_buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    action_buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
     signal_buckets: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     a_cycle_events: list[dict[str, Any]] = []
     mm_mode_markouts: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     mm_fills_inside_earnings_cycle = 0
+    b_strategy_block_reasons: Counter[str] = Counter()
     trace_event_counts: Counter[str] = Counter()
     trace_symbol_counts: Counter[str] = Counter()
 
@@ -322,6 +333,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             earnings_inventory = event.get("earnings_position")
             if earnings_inventory is not None:
                 earnings_inventory_values.append(int(earnings_inventory))
+            news_inventory = event.get("news_position")
+            if news_inventory is not None:
+                news_inventory_values.append(int(news_inventory))
             mm_inventory = event.get("mm_position")
             if mm_inventory is not None:
                 mm_inventory_values.append(int(mm_inventory))
@@ -338,6 +352,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 observe_only_count += 1
             if int(event.get("aggressive_action_count") or 0) == 0 and event.get("desired_bid") is None and event.get("desired_ask") is None:
                 no_action_reasons[str(event.get("reason") or "unknown")] += 1
+                if market_key == "B":
+                    b_strategy_block_reasons[str(event.get("reason") or "unknown")] += 1
 
         elif event_type == "news_received":
             payload = event.get("raw_payload") or event.get("raw_news_payload") or {}
@@ -409,12 +425,16 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
 
             fill_price = float(event.get("fill_price") or event.get("price") or 0.0)
             fill_qty = int(event.get("fill_qty") or event.get("qty") or 0)
+            fill_qty_by_action_class[action_class] += fill_qty
             signed_qty = fill_qty if str(event.get("side")) == "BUY" else -fill_qty
             owner_key = (market_key, pnl_owner, symbol)
+            action_key = (market_key, action_class, symbol)
             signal_key = (market_key, pnl_owner, symbol, signal_id)
             owner_bucket = owner_buckets.setdefault(owner_key, _bucket())
+            action_bucket = action_buckets.setdefault(action_key, _bucket())
             signal_bucket = signal_buckets.setdefault(signal_key, _bucket())
             _apply_fill(owner_bucket, signed_qty, fill_price, now_ms)
+            _apply_fill(action_bucket, signed_qty, fill_price, now_ms)
             _apply_fill(signal_bucket, signed_qty, fill_price, now_ms)
             mm_fill_inside_active_cycle = pnl_owner == "a_market_making" and market_key == "A" and bool(event.get("active_earnings_cycle_id"))
             if mm_fill_inside_active_cycle:
@@ -449,6 +469,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
 
     pnl_by_market: dict[str, float] = defaultdict(float)
     pnl_by_strategy_family: dict[str, float] = defaultdict(float)
+    pnl_by_action_class: dict[str, float] = defaultdict(float)
     signal_episode_rows: list[dict[str, Any]] = []
     strategy_rows: dict[str, dict[str, Any]] = {}
 
@@ -485,6 +506,19 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         row["fill_qty"] += int(bucket["fill_qty"])
         row["peak_abs_inventory"] = max(int(row["peak_abs_inventory"]), int(bucket["peak_abs_inventory"]))
         row["time_in_position_ms"] += int(bucket["time_in_position_ms"])
+
+    for (market_key, action_class, symbol), bucket in action_buckets.items():
+        position = int(bucket["position"])
+        avg_cost = float(bucket["avg_cost"])
+        latest_mark = latest_mark_by_symbol.get(symbol)
+        unrealized = 0.0
+        if latest_mark is not None:
+            if position > 0:
+                unrealized = position * (latest_mark - avg_cost)
+            elif position < 0:
+                unrealized = abs(position) * (avg_cost - latest_mark)
+        total_pnl = float(bucket["realized_pnl"]) + unrealized
+        pnl_by_action_class[f"{market_key}.{action_class}"] += total_pnl
 
     for (market_key, pnl_owner, symbol, signal_id), bucket in signal_buckets.items():
         position = int(bucket["position"])
@@ -619,6 +653,23 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     if a_mm_loss_by_mode:
         a_mm_loss_by_mode["fills_inside_earnings_cycle"] = mm_fills_inside_earnings_cycle
 
+    a_strategy_breakdown = {
+        "shock_take_qty": int(fill_qty_by_action_class.get("shock_take", 0)),
+        "shock_take_pnl": round(pnl_by_action_class.get("A.shock_take", 0.0), 4),
+        "shock_unwind_pnl": round(pnl_by_action_class.get("A.shock_unwind", 0.0), 4),
+        "shock_total_pnl": round(
+            pnl_by_action_class.get("A.shock_take", 0.0) + pnl_by_action_class.get("A.shock_unwind", 0.0),
+            4,
+        ),
+        "news_take_pnl": round(pnl_by_action_class.get("A.news_take", 0.0), 4),
+        "news_unwind_pnl": round(pnl_by_action_class.get("A.news_unwind", 0.0), 4),
+        "news_takeover_flatten_pnl": round(pnl_by_action_class.get("A.news_takeover_flatten", 0.0), 4),
+        "news_caution_pnl": round(pnl_by_action_class.get("A.news_caution_mm", 0.0), 4),
+        "steady_mm_pnl": round(pnl_by_action_class.get("A.market_making", 0.0), 4),
+        "steady_take_pnl": round(pnl_by_action_class.get("A.steady_take", 0.0), 4),
+        "mode_durations_ms": mode_durations_ms,
+    }
+
     b_cost_adjusted_residual_stats: dict[str, Any] = {}
     b_residual_events = [
         event
@@ -724,6 +775,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "largest_inventory_short": min(inventory_values) if inventory_values else 0,
         "average_inventory": (sum(inventory_values) / len(inventory_values)) if inventory_values else 0.0,
         "average_earnings_inventory": (sum(earnings_inventory_values) / len(earnings_inventory_values)) if earnings_inventory_values else 0.0,
+        "average_news_inventory": (sum(news_inventory_values) / len(news_inventory_values)) if news_inventory_values else 0.0,
         "average_mm_inventory": (sum(mm_inventory_values) / len(mm_inventory_values)) if mm_inventory_values else 0.0,
         "average_quoted_spread": (sum(quoted_spreads) / len(quoted_spreads)) if quoted_spreads else None,
         "observe_only_count": observe_only_count,
@@ -736,6 +788,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "markouts_by_action_class": _average_markouts(fill_markouts_by_action_class),
         "pnl_by_market": {key: round(value, 4) for key, value in sorted(pnl_by_market.items())},
         "pnl_by_strategy_family": {key: round(value, 4) for key, value in sorted(pnl_by_strategy_family.items())},
+        "pnl_by_action_class": {key: round(value, 4) for key, value in sorted(pnl_by_action_class.items())},
         "top_losing_strategy_families": top_losing_strategy_families,
         "top_losing_signal_episodes": top_losing_signal_episodes,
         "strategy_family_stats": strategy_rows,
@@ -744,9 +797,11 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "a_relevant_unstructured_count": a_relevant_unstructured_count,
         "a_episode_summaries": a_episode_summaries,
         "a_mm_loss_by_mode": a_mm_loss_by_mode,
+        "a_strategy_breakdown": a_strategy_breakdown,
         "derived_signal_counts": dict(sorted(derived_signal_counts.items())),
         "latest_derived_signals": latest_derived_signals,
         "b_cost_adjusted_residual_stats": b_cost_adjusted_residual_stats,
+        "b_strategy_block_reasons": dict(b_strategy_block_reasons.most_common()),
         "trace_volume_summary": trace_volume_summary,
         "activity_split": {
             "passive_mm": sum(count for intent, count in fills_by_intent.items() if intent in {"opening_mm", "steady_mm_passive", "multiplier_discovery_mm", "news_cautious_mm"}),
@@ -766,10 +821,14 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     no_action = summary.get("most_common_no_action_reasons") or {}
     pnl_by_market = summary.get("pnl_by_market") or {}
     pnl_by_strategy = summary.get("pnl_by_strategy_family") or {}
+    pnl_by_action_class = summary.get("pnl_by_action_class") or {}
     losing_strategies = summary.get("top_losing_strategy_families") or []
     a_episode_summaries = summary.get("a_episode_summaries") or []
     a_mm_loss_by_mode = summary.get("a_mm_loss_by_mode") or {}
+    a_strategy_breakdown = summary.get("a_strategy_breakdown") or {}
+    a_news_summary = summary.get("a_news_summary") or {}
     b_cost_stats = summary.get("b_cost_adjusted_residual_stats") or {}
+    b_strategy_block_reasons = summary.get("b_strategy_block_reasons") or {}
     trace_volume_summary = summary.get("trace_volume_summary") or {}
     return "\n".join(
         [
@@ -785,6 +844,7 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             f"- Largest short inventory: `{summary.get('largest_inventory_short', 0)}`",
             f"- Average inventory: `{summary.get('average_inventory', 0.0):.2f}`",
             f"- Average earnings inventory: `{summary.get('average_earnings_inventory', 0.0):.2f}`",
+            f"- Average news inventory: `{summary.get('average_news_inventory', 0.0):.2f}`",
             f"- Average MM inventory: `{summary.get('average_mm_inventory', 0.0):.2f}`",
             f"- Average quoted spread: `{summary.get('average_quoted_spread')}`",
             f"- Observe-only decisions: `{summary.get('observe_only_count', 0)}`",
@@ -798,6 +858,9 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "",
             "## PnL By Strategy Family",
             *(f"- `{strategy}`: `{pnl}`" for strategy, pnl in pnl_by_strategy.items()),
+            "",
+            "## PnL By Action Class",
+            *(f"- `{action_class}`: `{pnl}`" for action_class, pnl in pnl_by_action_class.items()),
             "",
             "## Fills By Intent",
             *(f"- `{intent}`: `{count}`" for intent, count in fills_by_intent.items()),
@@ -836,12 +899,21 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
                 for mode, stats in a_mm_loss_by_mode.items()
             ),
             "",
+            "## A Strategy Breakdown",
+            *(f"- `{key}`: `{value}`" for key, value in a_strategy_breakdown.items()),
+            "",
+            "## A News Summary",
+            *(f"- `{key}`: `{value}`" for key, value in a_news_summary.items()),
+            "",
             "## B Cost-Adjusted Residual Stats",
             f"- Composite basis: `{b_cost_stats.get('composite_basis')}`",
             *(
                 f"- Strike `{strike}`: `{stats}`"
                 for strike, stats in (b_cost_stats.get("by_strike") or {}).items()
             ),
+            "",
+            "## B Strategy Block Reasons",
+            *(f"- `{reason}`: `{count}`" for reason, count in b_strategy_block_reasons.items()),
             "",
             "## Trace Volume Summary",
             f"- Event counts: `{trace_volume_summary.get('event_counts')}`",
@@ -868,6 +940,10 @@ class TraceRecorder:
         self.snapshots_path = self.run_dir / "decision_snapshots.csv"
         self.summary_json_path = self.run_dir / "session_summary.json"
         self.summary_md_path = self.run_dir / "session_summary.md"
+        self.a_news_tracker_json_path = self.run_dir / "a_news_tracker.json"
+        self.a_news_tracker_md_path = self.run_dir / "a_news_tracker.md"
+        self.unknown_a_news_terms_json_path = self.run_dir / "unknown_a_news_terms.json"
+        self.unknown_a_news_terms_md_path = self.run_dir / "unknown_a_news_terms.md"
         self._events_handle = self.events_path.open("a", encoding="utf-8")
         self._snapshot_writer = AppendSafeCsvWriter(self.snapshots_path, SNAPSHOT_FIELDNAMES)
         self._last_snapshot_ms_by_symbol: dict[str, int] = {}
@@ -924,7 +1000,26 @@ class TraceRecorder:
             "news_caution_remaining_ms": state.get("news_caution_remaining_ms"),
             "inventory": state.get("inventory"),
             "earnings_position": state.get("earnings_position"),
+            "news_position": state.get("news_position"),
             "mm_position": state.get("mm_position"),
+            "active_signal_kind": state.get("active_signal_kind"),
+            "base_fair_value": state.get("base_fair_value"),
+            "news_fair_value": state.get("news_fair_value"),
+            "news_sentiment_score": state.get("news_sentiment_score"),
+            "news_sentiment_bucket": state.get("news_sentiment_bucket"),
+            "news_confirmation_state": state.get("news_confirmation_state"),
+            "news_target_inventory": state.get("news_target_inventory"),
+            "pending_news_target_inventory": state.get("pending_news_target_inventory"),
+            "pending_news_signal_id": state.get("pending_news_signal_id"),
+            "active_news_signal_id": state.get("active_news_signal_id"),
+            "news_started_ms": state.get("news_started_ms"),
+            "pe_frozen": state.get("pe_frozen"),
+            "news_matched_phrases": state.get("news_matched_phrases"),
+            "news_matched_unigrams": state.get("news_matched_unigrams"),
+            "news_matched_bigrams": state.get("news_matched_bigrams"),
+            "unknown_candidate_phrases": state.get("unknown_candidate_phrases"),
+            "unknown_candidate_unigrams": state.get("unknown_candidate_unigrams"),
+            "unknown_candidate_bigrams": state.get("unknown_candidate_bigrams"),
             "earnings_budget": state.get("earnings_budget"),
             "mm_budget": state.get("mm_budget"),
             "budget_shift_active": state.get("budget_shift_active"),
@@ -1072,6 +1167,19 @@ class TraceRecorder:
                 "old_fair_value": reaction.get("old_fair_value"),
                 "new_fair_value": reaction.get("new_fair_value"),
                 "earnings_value": reaction.get("earnings_value"),
+                "news_sentiment_score": reaction.get("news_sentiment_score"),
+                "news_sentiment_bucket": reaction.get("news_sentiment_bucket"),
+                "base_fair_value": reaction.get("base_fair_value"),
+                "news_fair_value": reaction.get("news_fair_value"),
+                "pending_news_target_inventory": reaction.get("pending_news_target_inventory"),
+                "news_confirmation_state": reaction.get("news_confirmation_state"),
+                "active_news_signal_id": reaction.get("active_news_signal_id"),
+                "news_matched_phrases": list(reaction.get("news_matched_phrases") or []),
+                "news_matched_unigrams": list(reaction.get("news_matched_unigrams") or []),
+                "news_matched_bigrams": list(reaction.get("news_matched_bigrams") or []),
+                "unknown_candidate_phrases": list(reaction.get("unknown_candidate_phrases") or []),
+                "unknown_candidate_unigrams": list(reaction.get("unknown_candidate_unigrams") or []),
+                "unknown_candidate_bigrams": list(reaction.get("unknown_candidate_bigrams") or []),
                 "shock_direction": reaction.get("shock_direction"),
                 "shock_threshold": reaction.get("shock_threshold"),
                 "note": reaction.get("note"),
@@ -1428,6 +1536,7 @@ class TraceRecorder:
             "multiplier_confidence": event.get("multiplier_confidence"),
             "inventory": event.get("inventory"),
             "earnings_position": event.get("earnings_position"),
+            "news_position": event.get("news_position"),
             "mm_position": event.get("mm_position"),
             "buy_exposure": event.get("buy_exposure"),
             "sell_exposure": event.get("sell_exposure"),
@@ -1472,9 +1581,41 @@ class TraceRecorder:
         self._events_handle.close()
         self._snapshot_writer.close()
         if self.trace_config.trace_write_summary_on_shutdown:
-            summary = summarize_trace_events(load_trace_events(self.run_dir), markout_windows_ms=self.trace_config.trace_markout_windows_ms)
+            events = load_trace_events(self.run_dir)
+            summary = summarize_trace_events(events, markout_windows_ms=self.trace_config.trace_markout_windows_ms)
+            tracker_report = build_a_news_tracker_report(events, config=AConfig())
+            unknown_terms_report = build_unknown_news_term_report(events)
+            headline_rows = tracker_report.get("headline_analyses") or []
+            recommendation_rows = tracker_report.get("term_recommendations") or []
+            summary["a_news_summary"] = {
+                "headline_count": len(headline_rows),
+                "traded_count": sum(1 for row in headline_rows if row.get("traded")),
+                "missed_no_trade_count": sum(1 for row in headline_rows if row.get("verdict") == "missed_no_trade"),
+                "undersized_count": sum(1 for row in headline_rows if row.get("verdict") == "undersized"),
+                "wrong_direction_count": sum(1 for row in headline_rows if row.get("verdict") == "wrong_direction"),
+                "a_news_pnl": round(float((summary.get("pnl_by_strategy_family") or {}).get("a_news", 0.0)), 4),
+                "fill_count": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_count", 0)),
+                "fill_qty": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_qty", 0)),
+                "top_recommendations": [
+                    {
+                        "term": row.get("term"),
+                        "suggested_action": row.get("suggested_action"),
+                        "suggested_weight_delta": row.get("suggested_weight_delta"),
+                    }
+                    for row in recommendation_rows
+                    if row.get("suggested_action") not in {None, "review"}
+                ][:10],
+            }
             with self.summary_json_path.open("w", encoding="utf-8") as handle:
                 json.dump(summary, handle, indent=2, sort_keys=True, default=_json_default)
             with self.summary_md_path.open("w", encoding="utf-8") as handle:
                 handle.write(render_summary_markdown(summary, self.run_id, self.run_dir))
+            with self.a_news_tracker_json_path.open("w", encoding="utf-8") as handle:
+                json.dump(tracker_report, handle, indent=2, sort_keys=True, default=_json_default)
+            with self.a_news_tracker_md_path.open("w", encoding="utf-8") as handle:
+                handle.write(render_a_news_tracker_markdown(tracker_report, self.run_dir))
+            with self.unknown_a_news_terms_json_path.open("w", encoding="utf-8") as handle:
+                json.dump(unknown_terms_report, handle, indent=2, sort_keys=True, default=_json_default)
+            with self.unknown_a_news_terms_md_path.open("w", encoding="utf-8") as handle:
+                handle.write(render_unknown_terms_markdown(unknown_terms_report, self.run_dir))
         self._closed = True

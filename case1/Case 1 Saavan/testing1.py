@@ -11,6 +11,7 @@ from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import MarketAStrategy
 from a_bot_trace import TraceRecorder
 from b_observer import MarketBObserver
+from b_underlying_mm import BUnderlyingMMStrategy
 
 try:
     from utcxchangelib import Side, XChangeClient
@@ -35,7 +36,7 @@ DEFAULT_A_INITIAL_FAIR_VALUE: int | None = None
 
 
 class MarketABot(XChangeClient):
-    """Live multi-market runtime with A trading and B observe-only analytics."""
+    """Live multi-market runtime with active A trading and B underlying MM."""
 
     def __init__(self, config: BotConfig):
         subscribed_symbols = ["A"]
@@ -53,6 +54,15 @@ class MarketABot(XChangeClient):
             depth_levels=max(10, config.trace.trace_book_depth_levels),
             signal_snapshot_interval_ms=config.market_b.signal_snapshot_interval_ms,
             signal_change_threshold_ticks=config.market_b.signal_change_threshold_ticks,
+        )
+        self.b_strategy = (
+            BUnderlyingMMStrategy(
+                config.market_b,
+                config.risk,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
+            if config.market_b.enabled and config.market_b.trading_enabled
+            else None
         )
         if hasattr(self.journal, "prepare_for_startup"):
             replay_state = self.journal.prepare_for_startup()
@@ -138,6 +148,8 @@ class MarketABot(XChangeClient):
         a_position = int(self.positions.get("A", 0))
         cash_value = int(self.positions.get("cash", 0))
         self.strategy.sync_inventory_from_exchange(a_position)
+        if self.b_strategy is not None:
+            self.b_strategy.sync_inventory_from_exchange(int(self.positions.get(self.config.market_b.underlying_symbol, 0)))
         for symbol in self.b_observer.symbols:
             self.b_observer.sync_inventory(symbol, int(self.positions.get(symbol, 0)))
         self.journal.record_inventory(a_position, cash=cash_value)
@@ -229,6 +241,8 @@ class MarketABot(XChangeClient):
             now_ms = self._now_ms()
             symbol = msg.position_update.symbol
             self.b_observer.sync_inventory(symbol, int(msg.position_update.value))
+            if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                self.b_strategy.sync_inventory_from_exchange(int(msg.position_update.value))
             if self.tracer is not None:
                 self.tracer.record_inventory_update(
                     now_ms=now_ms,
@@ -236,6 +250,8 @@ class MarketABot(XChangeClient):
                     cash=self._current_cash(),
                     trigger="position_update",
                 )
+            if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                await self._evaluate_and_sync_b("position update")
         elif msg_type == "cash_update":
             now_ms = self._now_ms()
             self.journal.record_inventory(
@@ -256,6 +272,23 @@ class MarketABot(XChangeClient):
         success: bool,
         error: Optional[str] = None,
     ) -> None:
+        if self.b_strategy is not None and order_id in self.b_strategy.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.b_strategy.on_cancel_response(order_id, success)
+            if self.tracer is not None:
+                self.tracer.record_cancel_response(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    success=success,
+                    error=error,
+                    side=None if order is None else order.side,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync_b("cancel response")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_cancel_response(order_id, success)
@@ -277,6 +310,23 @@ class MarketABot(XChangeClient):
         await self._evaluate_and_sync("cancel response")
 
     async def bot_handle_order_fill(self, order_id: str, qty: int, price: int) -> None:
+        if self.b_strategy is not None and order_id in self.b_strategy.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.b_strategy.on_fill(order_id, qty, price)
+            self.b_observer.sync_inventory(self.config.market_b.underlying_symbol, self.b_strategy.inventory)
+            if self.tracer is not None:
+                self.tracer.record_fill(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                    cash=self._current_cash(),
+                    order=None if order is None else self._order_to_dict(order),
+                    order_id=order_id,
+                    qty=qty,
+                    price=price,
+                )
+            await self._evaluate_and_sync_b("fill")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_fill(order_id, qty, price)
@@ -308,6 +358,22 @@ class MarketABot(XChangeClient):
         await self._evaluate_and_sync("fill")
 
     async def bot_handle_order_rejected(self, order_id: str, reason: str) -> None:
+        if self.b_strategy is not None and order_id in self.b_strategy.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.b_strategy.on_rejection(order_id)
+            LOGGER.warning("B order %s rejected: %s", order_id, reason)
+            if self.tracer is not None:
+                self.tracer.record_rejection(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    reason=reason,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync_b("rejection")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_rejection(order_id)
@@ -343,6 +409,8 @@ class MarketABot(XChangeClient):
         if self.config.market_b.enabled and symbol in self.b_observer.symbols:
             now_ms = self._now_ms()
             self.b_observer.on_market_trade(symbol, price, qty, now_ms=now_ms)
+            if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                self.b_strategy.on_market_trade(price, qty, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.record_market_trade(
                     now_ms=now_ms,
@@ -352,6 +420,8 @@ class MarketABot(XChangeClient):
                     qty=qty,
                 )
                 self._record_b_signal(now_ms)
+            if self.b_strategy is not None:
+                await self._evaluate_and_sync_b(f"market trade:{symbol}")
 
     async def bot_handle_book_update(self, symbol: str) -> None:
         if symbol == "A":
@@ -372,6 +442,8 @@ class MarketABot(XChangeClient):
 
         now_ms = self._now_ms()
         self.b_observer.on_book_update(symbol, self.order_books[symbol])
+        if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+            self.b_strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
         if self.tracer is not None:
             self.tracer.record_book_update(
                 now_ms=now_ms,
@@ -386,6 +458,8 @@ class MarketABot(XChangeClient):
                 trigger="book_update",
             )
             self._record_b_signal(now_ms)
+        if self.b_strategy is not None:
+            await self._evaluate_and_sync_b(f"book update:{symbol}")
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool) -> None:
         LOGGER.info("Ignoring swap response in A-only bot: %s qty=%s success=%s", swap, qty, success)
@@ -492,11 +566,15 @@ class MarketABot(XChangeClient):
                     reason="no recovery work required",
                 )
         await self._evaluate_and_sync("startup recovery")
+        if self.b_strategy is not None:
+            await self._evaluate_and_sync_b("startup")
 
     async def _quote_refresh_loop(self) -> None:
         while not self._shutdown.is_set():
             await asyncio.sleep(max(self.config.risk.reprice_cooldown_ms / 1000.0, 0.25))
             await self._evaluate_and_sync("timer")
+            if self.b_strategy is not None:
+                await self._evaluate_and_sync_b("timer")
 
     async def _evaluate_and_sync(self, reason: str) -> None:
         if not self.connected or not self._position_snapshot_seen.is_set():
@@ -651,6 +729,90 @@ class MarketABot(XChangeClient):
                     trigger=reason,
                 )
 
+    async def _evaluate_and_sync_b(self, reason: str) -> None:
+        if (
+            self.b_strategy is None
+            or not self.connected
+            or not self._position_snapshot_seen.is_set()
+            or not self.config.market_b.enabled
+            or not self.config.market_b.trading_enabled
+        ):
+            return
+        async with self._quote_lock:
+            now_ms = self._now_ms()
+            residual_payload = self.b_observer.compute_residuals()
+            plan = self.b_strategy.compute_quotes(now_ms=now_ms, residual_payload=residual_payload)
+            if self.tracer is not None:
+                self.tracer.record_decision(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                    cash=self._current_cash(),
+                    trigger=reason,
+                    plan=plan,
+                )
+
+            actions = self.b_strategy.order_manager.build_actions(plan, now_ms)
+            for cancel in actions.cancels:
+                order = self.b_strategy.order_manager.mark_cancel_requested(cancel.order_id, now_ms)
+                if self.tracer is not None:
+                    self.tracer.record_cancel_requested(
+                        now_ms=now_ms,
+                        state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                        cash=self._current_cash(),
+                        order_id=cancel.order_id,
+                        side=cancel.side,
+                        cancel_reason=cancel.reason,
+                        mode_at_cancel=plan.mode,
+                        order=None if order is None else self._order_to_dict(order),
+                    )
+                await self.cancel_order(cancel.order_id)
+                LOGGER.info("Cancelling B %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
+
+            for placement in actions.placements:
+                side = Side.BUY if placement.side == "BUY" else Side.SELL
+                order_id = await self.place_order(self.config.market_b.underlying_symbol, placement.qty, side, placement.px)
+                managed_order = self.b_strategy.order_manager.note_submitted(
+                    order_id=order_id,
+                    side=placement.side,
+                    px=placement.px,
+                    qty=placement.qty,
+                    now_ms=now_ms,
+                    overlay=placement.overlay,
+                    aggressive=placement.aggressive,
+                    intent=placement.intent,
+                    mode_at_submit=placement.mode_at_submit,
+                    evaluation_reason=placement.evaluation_reason,
+                    market_key=placement.market_key,
+                    strategy_family=placement.strategy_family,
+                    action_class=placement.action_class,
+                    pnl_owner=placement.pnl_owner,
+                    signal_id=placement.signal_id,
+                    trade_group_id=placement.trade_group_id,
+                    leg_role=placement.leg_role,
+                )
+                if self.tracer is not None:
+                    self.tracer.record_order_submitted(
+                        now_ms=now_ms,
+                        state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                        cash=self._current_cash(),
+                        order=self._order_to_dict(managed_order),
+                    )
+                LOGGER.info(
+                    "Placed passive %s order %s for B: qty=%s px=%s reason=%s",
+                    placement.side,
+                    order_id,
+                    placement.qty,
+                    placement.px,
+                    placement.reason,
+                )
+            if self.tracer is not None:
+                self.tracer.maybe_record_periodic_snapshot(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.market_b.underlying_symbol, now_ms),
+                    cash=self._current_cash(),
+                    trigger=reason,
+                )
+
     @staticmethod
     def _now_ms() -> int:
         return int(time.monotonic() * 1000)
@@ -668,6 +830,8 @@ class MarketABot(XChangeClient):
     def _trace_state_for_symbol(self, symbol: str, now_ms: int) -> dict:
         if symbol == "A":
             return self.strategy.trace_state(now_ms)
+        if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+            return self.b_strategy.trace_state(now_ms)
         return self.b_observer.trace_state(symbol, now_ms)
 
     def _record_b_signal(self, now_ms: int) -> None:
@@ -721,8 +885,21 @@ class MarketABot(XChangeClient):
             "fair_value_updated": reaction.fair_value_updated,
             "note": reaction.note,
             "earnings_value": reaction.earnings_value,
+            "news_sentiment_score": reaction.news_sentiment_score,
+            "news_sentiment_bucket": reaction.news_sentiment_bucket,
             "old_fair_value": reaction.old_fair_value,
             "new_fair_value": reaction.new_fair_value,
+            "base_fair_value": reaction.base_fair_value,
+            "news_fair_value": reaction.news_fair_value,
+            "pending_news_target_inventory": reaction.pending_news_target_inventory,
+            "news_confirmation_state": reaction.news_confirmation_state,
+            "active_news_signal_id": reaction.active_news_signal_id,
+            "news_matched_phrases": reaction.news_matched_phrases,
+            "news_matched_unigrams": reaction.news_matched_unigrams,
+            "news_matched_bigrams": reaction.news_matched_bigrams,
+            "unknown_candidate_phrases": reaction.unknown_candidate_phrases,
+            "unknown_candidate_unigrams": reaction.unknown_candidate_unigrams,
+            "unknown_candidate_bigrams": reaction.unknown_candidate_bigrams,
             "shock_direction": reaction.shock_direction,
             "shock_threshold": reaction.shock_threshold,
             "tick": reaction.tick,
