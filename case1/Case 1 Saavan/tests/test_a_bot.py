@@ -134,7 +134,10 @@ class MarketABotTests(unittest.TestCase):
             "tick": tick,
             "kind": "unstructured",
             "symbol": "A",
-            "content": content,
+            "new_data": {
+                "content": content,
+                "type": "News",
+            },
         }
 
     @staticmethod
@@ -404,21 +407,14 @@ class MarketABotTests(unittest.TestCase):
         )
         strategy.on_book_update_at("A", FakeOrderBook(bids={999: 20}, asks={1001: 20}), now_ms=40_000)
 
-        reaction = strategy.on_news(
-            {
-                "tick": 205,
-                "kind": "unstructured",
-                "symbol": "A",
-                "content": "A's mobile services division exceeds subscriber growth forecasts.",
-            },
-            now_ms=40_100,
-        )
+        reaction = strategy.on_news(self.a_unstructured_news(tick=205, content="A's mobile services division exceeds subscriber growth forecasts."), now_ms=40_100)
         plan = strategy.compute_quotes(now_ms=40_100)
 
         self.assertTrue(reaction.relevant)
         self.assertEqual(strategy.active_signal_kind, "news")
         self.assertEqual(strategy.mode, "POST_NEWS_SHOCK")
         self.assertEqual(plan.mode, "POST_NEWS_SHOCK")
+        self.assertEqual(reaction.resolved_news_text_source, "new_data.content")
         self.assertTrue(any(action.side == "BUY" and action.intent == "news_take" for action in plan.aggressive_actions))
 
     def test_medium_a_news_waits_for_confirmation_then_trades(self) -> None:
@@ -430,15 +426,7 @@ class MarketABotTests(unittest.TestCase):
         )
         strategy.on_book_update_at("A", FakeOrderBook(bids={999: 20}, asks={1001: 20}), now_ms=40_000)
 
-        reaction = strategy.on_news(
-            {
-                "tick": 205,
-                "kind": "unstructured",
-                "symbol": "A",
-                "content": "A expands margins.",
-            },
-            now_ms=40_100,
-        )
+        reaction = strategy.on_news(self.a_unstructured_news(tick=205, content="A expands margins."), now_ms=40_100)
         pending_plan = strategy.compute_quotes(now_ms=40_100)
         strategy.on_book_update_at("A", FakeOrderBook(bids={1004: 20}, asks={1006: 20}), now_ms=40_400)
         activated_plan = strategy.compute_quotes(now_ms=40_400)
@@ -448,6 +436,28 @@ class MarketABotTests(unittest.TestCase):
         self.assertEqual(pending_plan.mode, "NEWS_CONFIRMATION")
         self.assertEqual(strategy.mode, "POST_NEWS_SHOCK")
         self.assertTrue(any(action.side == "BUY" and action.intent == "news_take" for action in activated_plan.aggressive_actions))
+
+    def test_live_unstructured_payload_shape_scores_missed_headlines(self) -> None:
+        strategy = self.make_strategy(
+            recovered_multiplier=1000.0,
+            recovered_multiplier_confidence=2,
+            recovered_fair_value=1000,
+            recovered_earnings_value=1.0,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={999: 20}, asks={1001: 20}), now_ms=40_000)
+
+        headlines = [
+            "A takes a leading position in a growing niche market.",
+            "High-profile investor acquires significant stake in A.",
+            "International market growth accelerates thanks to A’s latest partnership.",
+            "A's expansion into new market proves unsuccessful.",
+        ]
+
+        for offset, headline in enumerate(headlines, start=1):
+            with self.subTest(headline=headline):
+                reaction = strategy.on_news(self.a_unstructured_news(tick=205 + offset, content=headline), now_ms=40_000 + (offset * 100))
+                self.assertNotEqual(reaction.news_sentiment_score, 0.0)
+                self.assertEqual(reaction.resolved_news_text_source, "new_data.content")
 
     def test_event_driven_mode_does_not_enter_scheduled_pre_news_pullback(self) -> None:
         strategy = self.make_strategy(

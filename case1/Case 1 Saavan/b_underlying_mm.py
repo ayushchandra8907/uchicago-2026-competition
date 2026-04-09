@@ -14,6 +14,7 @@ class BFairSnapshot:
     reference_fair: int | None
     composite_synthetic_fair: float | None
     synthetic_dispersion: float | None
+    composite_basis: float | None
     block_reason: str | None
     reduce_only: bool
 
@@ -35,6 +36,7 @@ class BUnderlyingMMStrategy:
         self.last_reference_fair: int | None = None
         self.last_composite_synthetic_fair: float | None = None
         self.last_synthetic_dispersion: float | None = None
+        self.last_composite_basis: float | None = None
         self.last_block_reason: str | None = None
         self.last_mode = "OBSERVE_ONLY"
 
@@ -75,6 +77,7 @@ class BUnderlyingMMStrategy:
         self.last_reference_fair = fair_snapshot.reference_fair
         self.last_composite_synthetic_fair = fair_snapshot.composite_synthetic_fair
         self.last_synthetic_dispersion = fair_snapshot.synthetic_dispersion
+        self.last_composite_basis = fair_snapshot.composite_basis
         self.last_block_reason = fair_snapshot.block_reason
 
         spread = self.book.spread
@@ -127,8 +130,63 @@ class BUnderlyingMMStrategy:
             self.last_mode = "REDUCE_ONLY"
             return self._reduce_only_plan(anchor, reason=f"reduce_only_{fair_snapshot.block_reason}", signal_id=signal_id)
 
+        basis = float(fair_snapshot.composite_basis or 0.0)
+        imbalance = self.book.top_of_book_imbalance
+        if abs(basis) < float(self.b_config.basis_entry_threshold_ticks):
+            if self.inventory != 0:
+                self.last_mode = "REDUCE_ONLY"
+                return self._reduce_only_plan(anchor, reason="reduce_only_basis_too_small", signal_id=signal_id)
+            self.last_mode = "OBSERVE_ONLY"
+            return QuotePlan(
+                mode="OBSERVE_ONLY",
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=True,
+                reason="basis_too_small",
+            )
+
+        imbalance_threshold = float(self.b_config.imbalance_confirmation_threshold)
+        if imbalance is not None:
+            if basis > 0 and imbalance < -imbalance_threshold:
+                if self.inventory != 0:
+                    self.last_mode = "REDUCE_ONLY"
+                    return self._reduce_only_plan(anchor, reason="reduce_only_basis_imbalance_conflict", signal_id=signal_id)
+                self.last_mode = "OBSERVE_ONLY"
+                return QuotePlan(
+                    mode="OBSERVE_ONLY",
+                    bid=None,
+                    ask=None,
+                    aggressive_actions=(),
+                    observe_only=True,
+                    reason="basis_imbalance_conflict",
+                )
+            if basis < 0 and imbalance > imbalance_threshold:
+                if self.inventory != 0:
+                    self.last_mode = "REDUCE_ONLY"
+                    return self._reduce_only_plan(anchor, reason="reduce_only_basis_imbalance_conflict", signal_id=signal_id)
+                self.last_mode = "OBSERVE_ONLY"
+                return QuotePlan(
+                    mode="OBSERVE_ONLY",
+                    bid=None,
+                    ask=None,
+                    aggressive_actions=(),
+                    observe_only=True,
+                    reason="basis_imbalance_conflict",
+                )
+
+        signal_direction = 1 if basis > 0 else -1
+        if self.inventory != 0 and ((self.inventory > 0 and signal_direction < 0) or (self.inventory < 0 and signal_direction > 0)):
+            self.last_mode = "REDUCE_ONLY"
+            return self._reduce_only_plan(anchor, reason="reduce_only_signal_flip", signal_id=signal_id)
+
         self.last_mode = "UNDERLYING_MM"
-        return self._market_make_plan(fair_snapshot.reference_fair or round(anchor), reason="b_underlying_mm", signal_id=signal_id)
+        return self._market_make_plan(
+            fair_snapshot.reference_fair or round(anchor),
+            basis=basis,
+            reason="b_underlying_mm",
+            signal_id=signal_id,
+        )
 
     def trace_state(self, now_ms: int) -> dict[str, Any]:
         return {
@@ -177,6 +235,7 @@ class BUnderlyingMMStrategy:
             "current_news_signal_id": None,
             "composite_synthetic_fair": self.last_composite_synthetic_fair,
             "synthetic_dispersion": self.last_synthetic_dispersion,
+            "composite_basis": self.last_composite_basis,
             "block_reason": self.last_block_reason,
         }
 
@@ -187,6 +246,7 @@ class BUnderlyingMMStrategy:
                 reference_fair=None,
                 composite_synthetic_fair=None,
                 synthetic_dispersion=None,
+                composite_basis=None,
                 block_reason="missing_composite_synthetic_fair",
                 reduce_only=self.inventory != 0,
             )
@@ -203,6 +263,7 @@ class BUnderlyingMMStrategy:
                 reference_fair=None,
                 composite_synthetic_fair=None if composite_synthetic_fair is None else float(composite_synthetic_fair),
                 synthetic_dispersion=synthetic_dispersion,
+                composite_basis=None,
                 block_reason="missing_composite_synthetic_fair",
                 reduce_only=self.inventory != 0,
             )
@@ -212,15 +273,18 @@ class BUnderlyingMMStrategy:
                 reference_fair=None,
                 composite_synthetic_fair=float(composite_synthetic_fair),
                 synthetic_dispersion=synthetic_dispersion,
+                composite_basis=float(residual_payload.get("composite_basis") or 0.0),
                 block_reason="synthetic_dispersion_wide",
                 reduce_only=self.inventory != 0,
             )
 
         reference_fair = round((0.5 * float(microprice)) + (0.5 * float(composite_synthetic_fair)))
+        composite_basis = float(residual_payload.get("composite_basis") or 0.0)
         return BFairSnapshot(
             reference_fair=reference_fair,
             composite_synthetic_fair=float(composite_synthetic_fair),
             synthetic_dispersion=synthetic_dispersion,
+            composite_basis=composite_basis,
             block_reason=None,
             reduce_only=False,
         )
@@ -275,14 +339,22 @@ class BUnderlyingMMStrategy:
             )
         return QuotePlan(mode="REDUCE_ONLY", bid=None, ask=None, aggressive_actions=(), observe_only=True, reason=reason)
 
-    def _market_make_plan(self, reference_fair: int, *, reason: str, signal_id: str) -> QuotePlan:
+    def _market_make_plan(self, reference_fair: int, *, basis: float, reason: str, signal_id: str) -> QuotePlan:
         allowed_buy, allowed_sell = self._allowed_sizes()
         quote_size = max(0, int(self.b_config.quote_size))
         inventory = int(self.inventory)
         if abs(inventory) >= self.b_config.passive_reduce_full:
             return self._reduce_only_plan(float(reference_fair), reason="reduce_only_full_inventory", signal_id=signal_id)
 
-        center = float(reference_fair) - (float(self.b_config.inventory_skew_ticks_per_unit) * float(inventory))
+        basis_shift = max(
+            -float(self.b_config.basis_strong_threshold_ticks),
+            min(float(self.b_config.basis_strong_threshold_ticks), float(basis)),
+        )
+        center = (
+            float(reference_fair)
+            + (0.5 * basis_shift)
+            - (float(self.b_config.inventory_skew_ticks_per_unit) * float(inventory))
+        )
         bid_px = int(floor(center - self.b_config.base_half_spread_ticks))
         ask_px = int(ceil(center + self.b_config.base_half_spread_ticks))
         if self.book.best_ask is not None:
@@ -299,10 +371,20 @@ class BUnderlyingMMStrategy:
         elif inventory <= -self.b_config.passive_reduce_start:
             ask_qty = 0
 
+        far_side_widen = max(0, int(self.b_config.far_side_widen_ticks))
+        if basis > 0:
+            ask_qty = min(ask_qty, max(0, inventory))
+            if ask_qty > 0:
+                ask_px += far_side_widen
+        else:
+            bid_qty = min(bid_qty, max(0, -inventory))
+            if bid_qty > 0:
+                bid_px -= far_side_widen
+
         return QuotePlan(
             mode="UNDERLYING_MM",
-            bid=None if bid_qty <= 0 else self._desired("BUY", bid_px, bid_qty, "passive B bid around composite fair", signal_id=signal_id),
-            ask=None if ask_qty <= 0 else self._desired("SELL", ask_px, ask_qty, "passive B ask around composite fair", signal_id=signal_id),
+            bid=None if bid_qty <= 0 else self._desired("BUY", bid_px, bid_qty, "signal-aware passive B bid around composite fair", signal_id=signal_id),
+            ask=None if ask_qty <= 0 else self._desired("SELL", ask_px, ask_qty, "signal-aware passive B ask around composite fair", signal_id=signal_id),
             aggressive_actions=(),
             observe_only=False,
             reason=reason,

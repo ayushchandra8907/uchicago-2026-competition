@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import sys
@@ -16,6 +17,7 @@ from a_bot_config import AConfig, RiskConfig, TraceConfig, load_bot_config
 from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import DesiredOrder, ManagedOrder, MarketAStrategy, QuotePlan
 from a_bot_trace import TraceRecorder, load_trace_events, summarize_trace_events
+from ayush_a_port import AyushPortStrategy
 from b_observer import MarketBObserver
 
 
@@ -91,6 +93,126 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(state["book"]["best_ask_px"], 1105)
         self.assertEqual(len(state["book"]["bid_levels"]), 2)
         self.assertIsNotNone(state["book"]["microprice"])
+
+    def test_trace_snapshot_row_captures_ayush_news_fields(self) -> None:
+        strategy = AyushPortStrategy(
+            risk=RiskConfig(
+                reprice_cooldown_ms=0,
+                passive_reprice_threshold_ticks=2,
+                passive_quote_ttl_ms=3_000,
+            ),
+            book_depth_levels=5,
+        )
+        strategy.on_book_update_at("A", FakeOrderBook(bids={1098: 10}, asks={1102: 10}), now_ms=1_000)
+        strategy.on_news(
+            {
+                "tick": 321,
+                "kind": "unstructured",
+                "symbol": "A",
+                "new_data": {
+                    "content": "Analysts predict strong revenue growth for A.",
+                    "type": "News",
+                },
+            },
+            now_ms=1_100,
+        )
+        plan = strategy.compute_quotes(now_ms=1_100)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_snapshot_interval_ms=500,
+                    trace_book_depth_levels=10,
+                    trace_markout_windows_ms=(250, 1_000, 5_000),
+                    trace_write_summary_on_shutdown=False,
+                ),
+                session_prefix="test_trace",
+            )
+            now_ms = 1_100
+            recorder.record_decision(
+                now_ms=now_ms,
+                state=strategy.trace_state(now_ms),
+                cash=10_000,
+                trigger="news",
+                plan=plan,
+            )
+            recorder.finalize(now_ms=1_200, state=strategy.trace_state(1_200), cash=10_000, note="done")
+
+            with recorder.snapshots_path.open("r", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["mode"], "NEWS_CONFIRMATION")
+            self.assertEqual(row["news_sentiment_bucket"], "medium")
+            self.assertEqual(row["news_confirmation_state"], "pending")
+            self.assertEqual(row["pending_news_target_inventory"], "36")
+            self.assertIn("strong revenue growth", row["pending_news_json"])
+
+    def test_trace_recorder_writes_runtime_lifecycle_events(self) -> None:
+        strategy = self.make_strategy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_snapshot_interval_ms=500,
+                    trace_book_depth_levels=10,
+                    trace_markout_windows_ms=(250, 1_000, 5_000),
+                    trace_write_summary_on_shutdown=False,
+                ),
+                session_prefix="test_trace",
+            )
+            state = strategy.trace_state(45_000)
+            recorder.record_runtime_event(
+                event_type="market_resolved_observed",
+                now_ms=45_000,
+                state=state,
+                cash=10_000,
+                reason="market_resolved",
+                details={"market_id": "market-1", "winning_symbol": "A", "tick": 3975},
+            )
+            recorder.record_runtime_event(
+                event_type="settlement_payout_observed",
+                now_ms=45_100,
+                state=state,
+                cash=10_000,
+                reason="settlement_payout",
+                details={"market_id": "market-1", "amount": 100, "tick": 4000},
+            )
+            recorder.record_runtime_event(
+                event_type="runtime_disconnect",
+                now_ms=45_200,
+                state=state,
+                cash=10_000,
+                reason="eof",
+                details={"elapsed_runtime_ms": 1_000},
+            )
+            recorder.record_runtime_event(
+                event_type="runtime_reconnect_attempt",
+                now_ms=45_300,
+                state=state,
+                cash=10_000,
+                reason="unexpected eof before round-end cutoff",
+                details={"attempt": 1},
+            )
+            recorder.record_runtime_event(
+                event_type="runtime_reconnect_succeeded",
+                now_ms=45_400,
+                state=state,
+                cash=10_000,
+                reason="first message received after reconnect",
+                details={"message_type": "position_snapshot"},
+            )
+            recorder.finalize(now_ms=45_500, state=state, cash=10_000, note="done")
+
+            event_types = [event["event_type"] for event in load_trace_events(recorder.run_dir)]
+            self.assertIn("market_resolved_observed", event_types)
+            self.assertIn("settlement_payout_observed", event_types)
+            self.assertIn("runtime_disconnect", event_types)
+            self.assertIn("runtime_reconnect_attempt", event_types)
+            self.assertIn("runtime_reconnect_succeeded", event_types)
 
     def test_trace_recorder_writes_run_files_and_summary(self) -> None:
         strategy = self.make_strategy()
@@ -223,11 +345,17 @@ class TraceTests(unittest.TestCase):
                 "UTC_USERNAME": "user",
                 "UTC_PASSWORD": "pass",
             }
-            old_values = {key: os.environ.get(key) for key in env_keys}
+            optional_keys = {
+                "TRACE_ROOT",
+                "TRACE_ENABLED",
+                "AUTO_STOP_ON_FOLLOWUP_POSITION_SNAPSHOT",
+                "AUTO_STOP_ON_MARKET_RESOLVED",
+            }
+            old_values = {key: os.environ.get(key) for key in {*env_keys, *optional_keys}}
             try:
                 os.environ.update(env_keys)
-                os.environ.pop("TRACE_ROOT", None)
-                os.environ.pop("TRACE_ENABLED", None)
+                for key in optional_keys:
+                    os.environ.pop(key, None)
                 config = load_bot_config(Path(temp_dir))
             finally:
                 for key, old_value in old_values.items():
@@ -238,6 +366,11 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(config.trace.trace_root, Path(temp_dir).resolve() / "analysis_runs")
             self.assertFalse(config.trace.trace_enabled)
             self.assertFalse(config.market_a.recover_pricing_state)
+            self.assertTrue(config.auto_stop_after_round_complete)
+            self.assertEqual(config.assumed_round_duration_ms, 900_000)
+            self.assertEqual(config.round_completion_grace_ms, 5_000)
+            self.assertFalse(config.auto_stop_on_followup_position_snapshot)
+            self.assertFalse(config.auto_stop_on_market_resolved)
 
     def test_recovered_pricing_state_is_ignored_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

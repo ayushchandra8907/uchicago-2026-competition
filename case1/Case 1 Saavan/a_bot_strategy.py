@@ -212,6 +212,8 @@ class NewsReaction:
     unknown_candidate_phrases: tuple[str, ...] = ()
     unknown_candidate_unigrams: tuple[str, ...] = ()
     unknown_candidate_bigrams: tuple[str, ...] = ()
+    resolved_news_text: str | None = None
+    resolved_news_text_source: str | None = None
     shock_direction: int = 0
     shock_threshold: int | None = None
     tick: int | None = None
@@ -1757,6 +1759,24 @@ class MarketAStrategy:
         self.unknown_candidate_unigrams = sentiment.unknown_candidate_unigrams
         self.unknown_candidate_bigrams = sentiment.unknown_candidate_bigrams
 
+    @staticmethod
+    def _extract_unstructured_news_text(news_release: dict) -> tuple[str, str]:
+        new_data = news_release.get("new_data") or {}
+        candidates = (
+            ("new_data.content", new_data.get("content")),
+            ("raw_content", news_release.get("raw_content")),
+            ("content", news_release.get("content")),
+            ("headline", news_release.get("headline")),
+            ("text", news_release.get("text")),
+        )
+        for source, raw_value in candidates:
+            if raw_value is None:
+                continue
+            text = str(raw_value).strip()
+            if text:
+                return text, source
+        return "", "missing"
+
     def _handle_unstructured_a_news(self, news_release: dict, now_ms: int) -> NewsReaction:
         self.news_event_seq += 1
         signal_id = f"a_news_{self.news_event_seq}"
@@ -1770,7 +1790,8 @@ class MarketAStrategy:
         if self.a_config.freeze_multiplier_after_unstructured_news:
             self.pe_frozen = True
 
-        sentiment = score_a_unstructured_headline(str(news_release.get("raw_content") or news_release.get("content") or ""))
+        headline_text, headline_text_source = self._extract_unstructured_news_text(news_release)
+        sentiment = score_a_unstructured_headline(headline_text)
         self._record_news_sentiment(sentiment)
         base_fair = self._base_fair_for_unstructured()
         news_fair = None if base_fair is None else base_fair + (self._news_offset_ticks(sentiment.score, sentiment.bucket) * sentiment.direction)
@@ -1807,6 +1828,8 @@ class MarketAStrategy:
                 unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
                 unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
                 unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+                resolved_news_text=headline_text,
+                resolved_news_text_source=headline_text_source,
             )
 
         if not sentiment.matched_phrases or sentiment.direction == 0 or target_inventory == 0:
@@ -1829,6 +1852,8 @@ class MarketAStrategy:
                 unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
                 unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
                 unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+                resolved_news_text=headline_text,
+                resolved_news_text_source=headline_text_source,
             )
 
         immediate = sentiment.bucket in {"strong", "extreme"} or abs(sentiment.score) >= 5.0
@@ -1854,6 +1879,8 @@ class MarketAStrategy:
                 unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
                 unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
                 unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+                resolved_news_text=headline_text,
+                resolved_news_text_source=headline_text_source,
             )
 
         self.news_confirmation_deadline_ms = now_ms + self.a_config.news_confirmation_timeout_ms
@@ -1876,6 +1903,8 @@ class MarketAStrategy:
             unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
             unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
             unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+            resolved_news_text=headline_text,
+            resolved_news_text_source=headline_text_source,
         )
 
     def _activate_pending_unstructured_news(self, now_ms: int) -> None:

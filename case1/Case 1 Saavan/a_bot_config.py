@@ -146,6 +146,10 @@ class BConfig:
     passive_reduce_full: int = 8
     min_book_spread: int = 6
     max_synthetic_dispersion: int = 4
+    basis_entry_threshold_ticks: float = 1.25
+    basis_strong_threshold_ticks: float = 2.5
+    imbalance_confirmation_threshold: float = 0.15
+    far_side_widen_ticks: int = 4
     underlying_symbol: str = "B"
     option_symbols: tuple[str, ...] = (
         "B_C_950",
@@ -193,6 +197,12 @@ class BotConfig:
     risk: RiskConfig
     paths: BotPaths
     trace: TraceConfig
+    a_strategy_mode: str = "ayush_port"
+    auto_stop_after_round_complete: bool = True
+    assumed_round_duration_ms: int = 900_000
+    round_completion_grace_ms: int = 5_000
+    auto_stop_on_followup_position_snapshot: bool = False
+    auto_stop_on_market_resolved: bool = False
     trading_enabled: bool = True
     trading_disabled_reason: str | None = None
 
@@ -440,4 +450,10 @@ def load_bot_config(
             trace_markout_windows_ms=_optional_int_tuple("TRACE_MARKOUT_WINDOWS_MS", (250, 1_000, 5_000)),
             trace_write_summary_on_shutdown=_optional_bool("TRACE_WRITE_SUMMARY_ON_SHUTDOWN", True),
         ),
+        a_strategy_mode=str(os.getenv("A_STRATEGY_MODE", "ayush_port") or "ayush_port").strip().lower(),
+        auto_stop_after_round_complete=_optional_bool("AUTO_STOP_AFTER_ROUND_COMPLETE", True),
+        assumed_round_duration_ms=_optional_int("ASSUMED_ROUND_DURATION_MS", 900_000) or 900_000,
+        round_completion_grace_ms=_optional_int("ROUND_COMPLETION_GRACE_MS", 5_000) or 5_000,
+        auto_stop_on_followup_position_snapshot=_optional_bool("AUTO_STOP_ON_FOLLOWUP_POSITION_SNAPSHOT", False),
+        auto_stop_on_market_resolved=_optional_bool("AUTO_STOP_ON_MARKET_RESOLVED", False),
     )

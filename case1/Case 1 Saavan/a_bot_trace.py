@@ -71,6 +71,27 @@ SNAPSHOT_FIELDNAMES = [
     "news_caution_remaining_ms",
     "last_relevant_a_earnings_ms",
     "active_earnings_cycle_id",
+    "active_signal_kind",
+    "current_earnings_signal_id",
+    "current_news_signal_id",
+    "active_news_signal_id",
+    "pending_news_signal_id",
+    "news_sentiment_score",
+    "news_sentiment_bucket",
+    "base_fair_value",
+    "news_fair_value",
+    "pending_news_target_inventory",
+    "pending_news_json",
+    "news_confirmation_state",
+    "news_confirmation_deadline_ms",
+    "news_takeover_started_ms",
+    "pe_frozen",
+    "news_matched_phrases_json",
+    "news_matched_unigrams_json",
+    "news_matched_bigrams_json",
+    "unknown_candidate_phrases_json",
+    "unknown_candidate_unigrams_json",
+    "unknown_candidate_bigrams_json",
 ]
 
 
@@ -1013,6 +1034,9 @@ class TraceRecorder:
             "pending_news_signal_id": state.get("pending_news_signal_id"),
             "active_news_signal_id": state.get("active_news_signal_id"),
             "news_started_ms": state.get("news_started_ms"),
+            "pending_news": state.get("pending_news"),
+            "news_confirmation_deadline_ms": state.get("news_confirmation_deadline_ms"),
+            "news_takeover_started_ms": state.get("news_takeover_started_ms"),
             "pe_frozen": state.get("pe_frozen"),
             "news_matched_phrases": state.get("news_matched_phrases"),
             "news_matched_unigrams": state.get("news_matched_unigrams"),
@@ -1098,6 +1122,32 @@ class TraceRecorder:
         )
         self._write_event(event)
 
+    def record_runtime_event(
+        self,
+        *,
+        event_type: str,
+        now_ms: int,
+        state: dict[str, Any],
+        cash: int | None,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        event = self._base_event(
+            event_type,
+            now_ms=now_ms,
+            exchange_tick=state.get("exchange_tick"),
+            mode=state.get("mode"),
+            symbol=state.get("symbol"),
+        )
+        event.update(self._state_fields(state, cash))
+        event.update(
+            {
+                "reason": reason,
+                "details": details or {},
+            }
+        )
+        self._write_event(event)
+
     def record_recovery_state(self, *, now_ms: int, state: dict[str, Any], cash: int | None, reason: str) -> None:
         event = self._base_event(
             "recovery_state_changed",
@@ -1160,6 +1210,7 @@ class TraceRecorder:
             {
                 "raw_payload": news_payload,
                 "raw_news_payload": news_payload,
+                "content": reaction.get("resolved_news_text"),
                 "news_kind": reaction.get("news_kind"),
                 "relevant": reaction.get("relevant"),
                 "mode_before_news": reaction.get("mode_before_news"),
@@ -1180,6 +1231,7 @@ class TraceRecorder:
                 "unknown_candidate_phrases": list(reaction.get("unknown_candidate_phrases") or []),
                 "unknown_candidate_unigrams": list(reaction.get("unknown_candidate_unigrams") or []),
                 "unknown_candidate_bigrams": list(reaction.get("unknown_candidate_bigrams") or []),
+                "resolved_news_text_source": reaction.get("resolved_news_text_source"),
                 "shock_direction": reaction.get("shock_direction"),
                 "shock_threshold": reaction.get("shock_threshold"),
                 "note": reaction.get("note"),
@@ -1562,6 +1614,29 @@ class TraceRecorder:
             "mtm_basis": event.get("mtm_basis"),
             "mark_price": event.get("mark_price"),
             "news_caution_remaining_ms": event.get("news_caution_remaining_ms"),
+            "last_relevant_a_earnings_ms": event.get("last_relevant_a_earnings_ms"),
+            "active_earnings_cycle_id": event.get("active_earnings_cycle_id"),
+            "active_signal_kind": event.get("active_signal_kind"),
+            "current_earnings_signal_id": event.get("current_earnings_signal_id"),
+            "current_news_signal_id": event.get("current_news_signal_id"),
+            "active_news_signal_id": event.get("active_news_signal_id"),
+            "pending_news_signal_id": event.get("pending_news_signal_id"),
+            "news_sentiment_score": event.get("news_sentiment_score"),
+            "news_sentiment_bucket": event.get("news_sentiment_bucket"),
+            "base_fair_value": event.get("base_fair_value"),
+            "news_fair_value": event.get("news_fair_value"),
+            "pending_news_target_inventory": event.get("pending_news_target_inventory"),
+            "pending_news_json": json.dumps(event.get("pending_news"), sort_keys=True, default=_json_default),
+            "news_confirmation_state": event.get("news_confirmation_state"),
+            "news_confirmation_deadline_ms": event.get("news_confirmation_deadline_ms"),
+            "news_takeover_started_ms": event.get("news_takeover_started_ms"),
+            "pe_frozen": event.get("pe_frozen"),
+            "news_matched_phrases_json": json.dumps(event.get("news_matched_phrases") or [], sort_keys=True, default=_json_default),
+            "news_matched_unigrams_json": json.dumps(event.get("news_matched_unigrams") or [], sort_keys=True, default=_json_default),
+            "news_matched_bigrams_json": json.dumps(event.get("news_matched_bigrams") or [], sort_keys=True, default=_json_default),
+            "unknown_candidate_phrases_json": json.dumps(event.get("unknown_candidate_phrases") or [], sort_keys=True, default=_json_default),
+            "unknown_candidate_unigrams_json": json.dumps(event.get("unknown_candidate_unigrams") or [], sort_keys=True, default=_json_default),
+            "unknown_candidate_bigrams_json": json.dumps(event.get("unknown_candidate_bigrams") or [], sort_keys=True, default=_json_default),
         }
 
     def finalize(self, *, now_ms: int, state: dict[str, Any], cash: int | None, note: str | None = None) -> None:

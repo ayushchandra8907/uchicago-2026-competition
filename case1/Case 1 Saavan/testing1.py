@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 import time
 from pathlib import Path
 from typing import Optional
 
+import grpc
+
 from a_bot_config import BotConfig, ConfigError, load_bot_config
 from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import MarketAStrategy
 from a_bot_trace import TraceRecorder
+from ayush_a_port import AyushPortStrategy
 from b_observer import MarketBObserver
 from b_underlying_mm import BUnderlyingMMStrategy
 
@@ -36,7 +40,9 @@ DEFAULT_A_INITIAL_FAIR_VALUE: int | None = None
 
 
 class MarketABot(XChangeClient):
-    """Live multi-market runtime with active A trading and B underlying MM."""
+    """Live multi-market runtime with switchable A strategy modes and B MM research."""
+
+    _UNEXPECTED_DISCONNECT_RETRY_DELAY_S = 2.0
 
     def __init__(self, config: BotConfig):
         subscribed_symbols = ["A"]
@@ -55,13 +61,16 @@ class MarketABot(XChangeClient):
             signal_snapshot_interval_ms=config.market_b.signal_snapshot_interval_ms,
             signal_change_threshold_ticks=config.market_b.signal_change_threshold_ticks,
         )
+        self._ayush_port_mode = config.a_strategy_mode == "ayush_port"
+        self._b_observe_only = bool(config.market_b.observe_only or self._ayush_port_mode)
+        self._b_trading_enabled = bool(config.market_b.enabled and config.market_b.trading_enabled and not self._b_observe_only)
         self.b_strategy = (
             BUnderlyingMMStrategy(
                 config.market_b,
                 config.risk,
                 book_depth_levels=max(10, config.trace.trace_book_depth_levels),
             )
-            if config.market_b.enabled and config.market_b.trading_enabled
+            if self._b_trading_enabled
             else None
         )
         if hasattr(self.journal, "prepare_for_startup"):
@@ -77,24 +86,45 @@ class MarketABot(XChangeClient):
             replay_state,
             recover_pricing_state=config.market_a.recover_pricing_state,
         )
-        self.strategy = MarketAStrategy(
-            a_config=config.market_a,
-            risk=config.risk,
-            restored_orders=replay_state.live_orders,
-            recovered_multiplier=recovered_multiplier,
-            recovered_multiplier_confidence=recovered_multiplier_confidence,
-            recovered_fair_value=recovered_fair_value,
-            recovered_earnings_value=recovered_earnings_value,
-            book_depth_levels=max(10, config.trace.trace_book_depth_levels),
-        )
+        if config.a_strategy_mode == "ayush_port":
+            self.strategy = AyushPortStrategy(
+                risk=config.risk,
+                restored_orders=replay_state.live_orders,
+                recovered_multiplier=recovered_multiplier,
+                recovered_multiplier_confidence=recovered_multiplier_confidence,
+                recovered_fair_value=recovered_fair_value,
+                recovered_earnings_value=recovered_earnings_value,
+                initial_multiplier=config.market_a.initial_multiplier,
+                initial_fair_value=config.market_a.initial_fair_value,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
+        else:
+            self.strategy = MarketAStrategy(
+                a_config=config.market_a,
+                risk=config.risk,
+                restored_orders=replay_state.live_orders,
+                recovered_multiplier=recovered_multiplier,
+                recovered_multiplier_confidence=recovered_multiplier_confidence,
+                recovered_fair_value=recovered_fair_value,
+                recovered_earnings_value=recovered_earnings_value,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
         self.tracer = TraceRecorder.create_if_enabled(config.trace, session_prefix="a_bot_run", symbol="A")
         self._quote_lock = asyncio.Lock()
         self._position_snapshot_seen = asyncio.Event()
         self._shutdown = asyncio.Event()
         self._refresh_task: asyncio.Task | None = None
+        self._round_end_task: asyncio.Task | None = None
         self._recovery_task: asyncio.Task | None = None
         self._last_observe_only_reason: str | None = None
         self._last_mode: str | None = None
+        self._position_snapshot_count = 0
+        self._auto_stop_requested = False
+        self._shutdown_note = "Bot shutdown"
+        self._runtime_started_ms = self._now_ms()
+        self._connected_once = False
+        self._awaiting_reconnect_success = False
+        self._reconnect_attempt_count = 0
 
         if replay_state.live_orders:
             restored_ids = ", ".join(order.order_id for order in replay_state.live_orders)
@@ -111,6 +141,7 @@ class MarketABot(XChangeClient):
             )
         if recovered_fair_value is not None:
             LOGGER.info("Recovered last known A fair value from journal: %s", recovered_fair_value)
+        LOGGER.info("Using A strategy mode: %s", config.a_strategy_mode)
         if config.market_a.initial_multiplier is not None and recovered_multiplier is None:
             LOGGER.info("Seeding A multiplier from config: %.4f", config.market_a.initial_multiplier)
         else:
@@ -130,11 +161,14 @@ class MarketABot(XChangeClient):
                     "journal_path": str(config.paths.journal_path),
                     "trace_root": str(config.trace.trace_root),
                     "recover_pricing_state": config.market_a.recover_pricing_state,
+                    "a_strategy_mode": config.a_strategy_mode,
                     "market_b_enabled": config.market_b.enabled,
-                    "market_b_trading_enabled": config.market_b.trading_enabled,
-                    "market_b_observe_only": config.market_b.observe_only,
+                    "market_b_trading_enabled": self._b_trading_enabled,
+                    "market_b_observe_only": self._b_observe_only,
                     "market_b_signal_snapshot_interval_ms": config.market_b.signal_snapshot_interval_ms,
                     "market_b_signal_change_threshold_ticks": config.market_b.signal_change_threshold_ticks,
+                    "auto_stop_on_market_resolved": config.auto_stop_on_market_resolved,
+                    "auto_stop_on_followup_position_snapshot": config.auto_stop_on_followup_position_snapshot,
                 },
                 recovered_orders=[self._order_to_dict(order) for order in replay_state.live_orders],
                 state=self._trace_state_for_symbol("A", now_ms),
@@ -145,9 +179,13 @@ class MarketABot(XChangeClient):
         """Use the exchange snapshot as the anchor for inventory and recovery startup."""
         super().handle_position_snapshot(msg)
         now_ms = self._now_ms()
+        should_stop_after_snapshot = self._on_position_snapshot_received(now_ms)
         a_position = int(self.positions.get("A", 0))
         cash_value = int(self.positions.get("cash", 0))
-        self.strategy.sync_inventory_from_exchange(a_position)
+        if self._ayush_port_mode:
+            self.strategy.sync_inventory_from_exchange(a_position, now_ms=now_ms)
+        else:
+            self.strategy.sync_inventory_from_exchange(a_position)
         if self.b_strategy is not None:
             self.b_strategy.sync_inventory_from_exchange(int(self.positions.get(self.config.market_b.underlying_symbol, 0)))
         for symbol in self.b_observer.symbols:
@@ -167,13 +205,25 @@ class MarketABot(XChangeClient):
                     cash=cash_value,
                     trigger="position_snapshot",
                 )
+        if should_stop_after_snapshot:
+            return
         if not self._position_snapshot_seen.is_set():
             self._position_snapshot_seen.set()
             self._recovery_task = asyncio.create_task(self._start_recovery_after_snapshot())
 
     async def process_message(self, msg) -> None:
         """Mirror exchange position updates into local journaled strategy state."""
+        if msg == grpc.aio.EOF:
+            raise EOFError("End of gRPC stream")
+        self._connected_once = True
         msg_type = msg.WhichOneof("body")
+        if self._awaiting_reconnect_success:
+            self._awaiting_reconnect_success = False
+            self._record_runtime_event(
+                "runtime_reconnect_succeeded",
+                reason="first message received after reconnect",
+                details={"message_type": msg_type, "reconnect_attempt_count": self._reconnect_attempt_count},
+            )
         recovery_event: tuple[str, str, bool, str | None, int | None, int | None] | None = None
         if msg_type == "cancel_response":
             order_id = msg.cancel_response.id
@@ -227,7 +277,10 @@ class MarketABot(XChangeClient):
         if msg_type == "position_update" and msg.position_update.symbol == "A":
             now_ms = self._now_ms()
             inventory = int(msg.position_update.value)
-            self.strategy.sync_inventory_from_exchange(inventory)
+            if self._ayush_port_mode:
+                self.strategy.sync_inventory_from_exchange(inventory, now_ms=now_ms)
+            else:
+                self.strategy.sync_inventory_from_exchange(inventory)
             self.journal.record_inventory(inventory, cash=int(self.positions.get("cash", 0)))
             if self.tracer is not None:
                 self.tracer.record_inventory_update(
@@ -503,29 +556,192 @@ class MarketABot(XChangeClient):
         await self._evaluate_and_sync("news")
 
     async def bot_handle_market_resolved(self, market_id: str, winning_symbol: str, tick: int):
-        LOGGER.info("Ignoring market resolution %s winner=%s tick=%s in A-only bot", market_id, winning_symbol, tick)
+        LOGGER.info("Received market resolution %s winner=%s tick=%s", market_id, winning_symbol, tick)
+        self._record_runtime_event(
+            "market_resolved_observed",
+            reason="market_resolved",
+            details={"market_id": market_id, "winning_symbol": winning_symbol, "tick": int(tick)},
+        )
+        if self.config.auto_stop_after_round_complete and self.config.auto_stop_on_market_resolved:
+            self._request_round_complete_stop("market_resolved")
 
     async def bot_handle_settlement_payout(self, user: str, market_id: str, amount: int, tick: int):
         LOGGER.info("Settlement payout user=%s market=%s amount=%s tick=%s", user, market_id, amount, tick)
+        self._record_runtime_event(
+            "settlement_payout_observed",
+            reason="settlement_payout",
+            details={"user": user, "market_id": market_id, "amount": int(amount), "tick": int(tick)},
+        )
+        if self.config.auto_stop_after_round_complete:
+            self._request_round_complete_stop("settlement_payout")
+
+    def _on_position_snapshot_received(self, now_ms: int) -> bool:
+        self._position_snapshot_count += 1
+        if self._position_snapshot_count == 1:
+            self._ensure_round_end_watcher()
+            return False
+        if self.config.auto_stop_after_round_complete and self.config.auto_stop_on_followup_position_snapshot:
+            self._request_round_complete_stop("followup_position_snapshot")
+            return True
+        return False
+
+    def _ensure_round_end_watcher(self) -> None:
+        if self._round_end_task is not None or not self.config.auto_stop_after_round_complete:
+            return
+        if not self.config.market_a.startup_assume_fresh_round:
+            return
+        self._round_end_task = asyncio.create_task(self._round_completion_watch_loop())
+
+    async def _round_completion_watch_loop(self) -> None:
+        timeout_s = max(0.0, (self.config.assumed_round_duration_ms + self.config.round_completion_grace_ms) / 1000.0)
+        try:
+            await asyncio.wait_for(self._shutdown.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            self._request_round_complete_stop("wall_clock_round_timeout")
+
+    def _request_round_complete_stop(self, reason: str) -> None:
+        if self._auto_stop_requested:
+            return
+        self._auto_stop_requested = True
+        self._shutdown_note = f"round_complete_auto_stop:{reason}"
+        LOGGER.info("Round completion detected via %s; shutting down after finalization.", reason)
+        self._shutdown.set()
+        if self.call is not None:
+            self.call.cancel()
 
     async def start(self) -> None:
         self._refresh_task = asyncio.create_task(self._quote_refresh_loop())
         try:
-            await self.connect()
+            while not self._shutdown.is_set():
+                try:
+                    await self.connect()
+                    break
+                except EOFError:
+                    self.connected = False
+                    self._record_runtime_event(
+                        "runtime_disconnect",
+                        reason="eof",
+                        details={"elapsed_runtime_ms": self._elapsed_runtime_ms()},
+                    )
+                    if self._should_retry_unexpected_disconnect():
+                        self._reconnect_attempt_count += 1
+                        self._awaiting_reconnect_success = True
+                        self._record_runtime_event(
+                            "runtime_reconnect_attempt",
+                            reason="unexpected eof before round-end cutoff",
+                            details={
+                                "elapsed_runtime_ms": self._elapsed_runtime_ms(),
+                                "attempt": self._reconnect_attempt_count,
+                            },
+                        )
+                        LOGGER.warning(
+                            "Exchange stream ended unexpectedly after %.1fs; retrying in %.1fs.",
+                            self._elapsed_runtime_ms() / 1000.0,
+                            self._UNEXPECTED_DISCONNECT_RETRY_DELAY_S,
+                        )
+                        await asyncio.sleep(self._UNEXPECTED_DISCONNECT_RETRY_DELAY_S)
+                        continue
+                    if not self._auto_stop_requested and self._shutdown_note == "Bot shutdown":
+                        self._shutdown_note = "exchange_stream_closed"
+                    LOGGER.info("Exchange stream closed cleanly (%s).", self._shutdown_note)
+                    break
+                except grpc.aio.AioRpcError as exc:
+                    if self._auto_stop_requested and exc.code() == grpc.StatusCode.CANCELLED:
+                        LOGGER.info("Exchange stream cancelled cleanly (%s).", self._shutdown_note)
+                        break
+                    self.connected = False
+                    self._record_runtime_event(
+                        "runtime_disconnect",
+                        reason=f"grpc:{exc.code().name}",
+                        details={"elapsed_runtime_ms": self._elapsed_runtime_ms(), "details": exc.details()},
+                    )
+                    if self._is_retryable_stream_error(exc) and self._should_retry_unexpected_disconnect():
+                        self._reconnect_attempt_count += 1
+                        self._awaiting_reconnect_success = True
+                        self._record_runtime_event(
+                            "runtime_reconnect_attempt",
+                            reason=f"retryable grpc {exc.code().name} before round-end cutoff",
+                            details={
+                                "elapsed_runtime_ms": self._elapsed_runtime_ms(),
+                                "attempt": self._reconnect_attempt_count,
+                                "grpc_details": exc.details(),
+                            },
+                        )
+                        LOGGER.warning(
+                            "Exchange stream failed with retryable %s after %.1fs: %s. Retrying in %.1fs.",
+                            exc.code().name,
+                            self._elapsed_runtime_ms() / 1000.0,
+                            exc.details(),
+                            self._UNEXPECTED_DISCONNECT_RETRY_DELAY_S,
+                        )
+                        await asyncio.sleep(self._UNEXPECTED_DISCONNECT_RETRY_DELAY_S)
+                        continue
+                    raise
+        except asyncio.CancelledError:
+            if not self._auto_stop_requested:
+                raise
+            LOGGER.info("Exchange stream task cancelled cleanly (%s).", self._shutdown_note)
         finally:
             self._shutdown.set()
             if self._refresh_task is not None:
                 self._refresh_task.cancel()
+                try:
+                    await self._refresh_task
+                except asyncio.CancelledError:
+                    pass
+            if self._round_end_task is not None:
+                self._round_end_task.cancel()
+                try:
+                    await self._round_end_task
+                except asyncio.CancelledError:
+                    pass
             if hasattr(self.journal, "record_session_finished"):
-                self.journal.record_session_finished(note="Bot shutdown")
+                self.journal.record_session_finished(note=self._shutdown_note)
             if self.tracer is not None:
                 now_ms = self._now_ms()
                 self.tracer.finalize(
                     now_ms=now_ms,
                     state=self._trace_state_for_symbol("A", now_ms),
                     cash=self._current_cash(),
-                    note="Bot shutdown",
+                    note=self._shutdown_note,
                 )
+
+    def _elapsed_runtime_ms(self) -> int:
+        return max(0, self._now_ms() - self._runtime_started_ms)
+
+    def _unexpected_disconnect_retry_cutoff_ms(self) -> int:
+        assumed = max(0, int(self.config.assumed_round_duration_ms))
+        return assumed + max(0, int(self.config.round_completion_grace_ms))
+
+    def _should_retry_unexpected_disconnect(self) -> bool:
+        if self._shutdown.is_set() or self._auto_stop_requested:
+            return False
+        if not self._connected_once or not self._position_snapshot_seen.is_set():
+            return True
+        return self._elapsed_runtime_ms() < self._unexpected_disconnect_retry_cutoff_ms()
+
+    @staticmethod
+    def _is_retryable_stream_error(exc: grpc.aio.AioRpcError) -> bool:
+        retryable_codes = {
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.INTERNAL,
+            grpc.StatusCode.UNKNOWN,
+            grpc.StatusCode.CANCELLED,
+        }
+        return exc.code() in retryable_codes
+
+    def _record_runtime_event(self, event_type: str, *, reason: str, details: dict | None = None) -> None:
+        if getattr(self, "tracer", None) is None:
+            return
+        now_ms = self._now_ms()
+        self.tracer.record_runtime_event(
+            event_type=event_type,
+            now_ms=now_ms,
+            state=self._trace_state_for_symbol("A", now_ms),
+            cash=self._current_cash(),
+            reason=reason,
+            details=details,
+        )
 
     async def _start_recovery_after_snapshot(self) -> None:
         if self.strategy.recovery_active:
@@ -537,10 +753,13 @@ class MarketABot(XChangeClient):
                     state=self._trace_state_for_symbol("A", now_ms),
                     cash=self._current_cash(),
                     reason="startup recovery began",
-                )
+            )
             for order in self.strategy.recovery_orders_to_cancel():
                 now_ms = self._now_ms()
-                tracked_order = self.strategy.order_manager.mark_cancel_requested(order.order_id, now_ms)
+                if self._ayush_port_mode:
+                    tracked_order = self.strategy.mark_cancel_requested(order.order_id, now_ms)
+                else:
+                    tracked_order = self.strategy.order_manager.mark_cancel_requested(order.order_id, now_ms)
                 self.journal.record_cancel_requested(order.order_id)
                 if self.tracer is not None:
                     self.tracer.record_cancel_requested(
@@ -572,12 +791,17 @@ class MarketABot(XChangeClient):
     async def _quote_refresh_loop(self) -> None:
         while not self._shutdown.is_set():
             await asyncio.sleep(max(self.config.risk.reprice_cooldown_ms / 1000.0, 0.25))
+            if self._shutdown.is_set():
+                break
             await self._evaluate_and_sync("timer")
-            if self.b_strategy is not None:
+            if self._b_trading_enabled and self.b_strategy is not None:
                 await self._evaluate_and_sync_b("timer")
 
     async def _evaluate_and_sync(self, reason: str) -> None:
-        if not self.connected or not self._position_snapshot_seen.is_set():
+        if self._ayush_port_mode:
+            await self._evaluate_and_sync_ayush(reason)
+            return
+        if self._shutdown.is_set() or not self.connected or not self._position_snapshot_seen.is_set():
             return
         async with self._quote_lock:
             # The strategy only decides what the bot wants to own on each side.
@@ -729,8 +953,141 @@ class MarketABot(XChangeClient):
                     trigger=reason,
                 )
 
+    async def _evaluate_and_sync_ayush(self, reason: str) -> None:
+        if self._shutdown.is_set() or not self.connected or not self._position_snapshot_seen.is_set():
+            return
+        async with self._quote_lock:
+            now_ms = self._now_ms()
+            prior_fair = self.strategy.fair_value
+            prior_multiplier = self.strategy.trusted_multiplier
+            prior_confidence = self.strategy.multiplier_confidence
+            decision, plan = self.strategy.evaluate_runtime(now_ms=now_ms)
+            if self.tracer is not None:
+                self.tracer.record_decision(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    trigger=reason,
+                    plan=plan,
+                )
+            if self.strategy.fair_value is not None and self.strategy.fair_value != prior_fair:
+                self.journal.record_fair_value(
+                    fair_value=self.strategy.fair_value,
+                    source=self.strategy.valuation.last_source,
+                    earnings_value=self.strategy.valuation.last_earnings_value,
+                )
+                if prior_fair is None:
+                    LOGGER.info("Ayush A fair value initialized at %s.", self.strategy.fair_value)
+                elif self.strategy.trusted_multiplier != prior_multiplier or self.strategy.multiplier_confidence != prior_confidence:
+                    LOGGER.info(
+                        "Ayush A fair value refreshed from %s to %s after multiplier update.",
+                        prior_fair,
+                        self.strategy.fair_value,
+                    )
+            if plan.mode != self._last_mode:
+                LOGGER.info(
+                    "Ayush A mode -> %s fair=%s inventory=%s reason=%s",
+                    plan.mode,
+                    self.strategy.fair_value,
+                    self.strategy.inventory,
+                    plan.reason,
+                )
+                self._last_mode = plan.mode
+            if plan.observe_only:
+                if plan.reason != self._last_observe_only_reason:
+                    LOGGER.info("Ayush A observe-only: %s", plan.reason)
+                    self._last_observe_only_reason = plan.reason
+            else:
+                self._last_observe_only_reason = None
+            await self._apply_ayush_decision(decision, now_ms=now_ms)
+            if self.tracer is not None:
+                self.tracer.maybe_record_periodic_snapshot(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    trigger=reason,
+                )
+
+    async def _apply_ayush_decision(self, decision, *, now_ms: int) -> None:
+        if self.strategy.recovery_active:
+            return
+        current_orders = self.strategy.current_orders()
+        desired = None if decision is None else self.strategy.normalize_desired_order(decision)
+
+        if self.strategy.any_cancel_pending():
+            return
+
+        if current_orders:
+            cancel_reason = getattr(decision, "reason", "") if desired is None else "replace"
+            if desired is None or bool(getattr(decision, "cancel_all", False)) or not self.strategy.can_keep_orders(current_orders, desired, now_ms):
+                await self._cancel_ayush_orders(current_orders, now_ms=now_ms, cancel_reason=cancel_reason)
+                return
+
+        if desired is None:
+            return
+
+        live_matching_qty = sum(
+            order.remaining_qty
+            for order in current_orders
+            if self.strategy.order_matches(order, desired, now_ms)
+        )
+        remaining_target_qty = max(0, int(desired.qty) - live_matching_qty)
+        if remaining_target_qty <= 0:
+            return
+
+        slice_qty = self.strategy.next_slice_qty(remaining_target_qty)
+        staged_desired = replace(desired, qty=slice_qty)
+        adjusted = self.strategy.risk_adjusted_order(staged_desired)
+        if adjusted is None:
+            return
+        await self._submit_ayush_order(adjusted, now_ms=now_ms)
+
+    async def _cancel_ayush_orders(self, orders, *, now_ms: int, cancel_reason: str) -> None:
+        for order in orders:
+            if order.cancel_pending:
+                continue
+            tracked_order = self.strategy.mark_cancel_requested(order.order_id, now_ms)
+            self.journal.record_cancel_requested(order.order_id)
+            if self.tracer is not None:
+                self.tracer.record_cancel_requested(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=order.order_id,
+                    side=order.side,
+                    cancel_reason=cancel_reason,
+                    mode_at_cancel=self.strategy.mode,
+                    order=None if tracked_order is None else self._order_to_dict(tracked_order),
+                )
+            await self.cancel_order(order.order_id)
+            LOGGER.info("Cancelling Ayush A %s order %s because %s", order.side, order.order_id, cancel_reason)
+
+    async def _submit_ayush_order(self, desired, *, now_ms: int) -> None:
+        side = Side.BUY if desired.side == "BUY" else Side.SELL
+        order_id = await self.place_order("A", desired.qty, side, desired.px)
+        managed_order = self.strategy.note_submitted(order_id=order_id, desired=desired, now_ms=now_ms)
+        self.journal.record_order_submitted(managed_order)
+        if self.tracer is not None:
+            self.tracer.record_order_submitted(
+                now_ms=now_ms,
+                state=self._trace_state_for_symbol("A", now_ms),
+                cash=self._current_cash(),
+                order=self._order_to_dict(managed_order),
+            )
+        LOGGER.info(
+            "Placed %s %s order %s for Ayush A: qty=%s px=%s reason=%s",
+            "aggressive" if desired.aggressive else "passive",
+            desired.side,
+            order_id,
+            desired.qty,
+            desired.px,
+            desired.reason,
+        )
+
     async def _evaluate_and_sync_b(self, reason: str) -> None:
         if (
+            self._shutdown.is_set()
+            or
             self.b_strategy is None
             or not self.connected
             or not self._position_snapshot_seen.is_set()
@@ -900,6 +1257,8 @@ class MarketABot(XChangeClient):
             "unknown_candidate_phrases": reaction.unknown_candidate_phrases,
             "unknown_candidate_unigrams": reaction.unknown_candidate_unigrams,
             "unknown_candidate_bigrams": reaction.unknown_candidate_bigrams,
+            "resolved_news_text": reaction.resolved_news_text,
+            "resolved_news_text_source": reaction.resolved_news_text_source,
             "shock_direction": reaction.shock_direction,
             "shock_threshold": reaction.shock_threshold,
             "tick": reaction.tick,

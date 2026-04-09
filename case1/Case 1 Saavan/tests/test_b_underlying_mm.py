@@ -35,6 +35,10 @@ class BUnderlyingMMTests(unittest.TestCase):
                 passive_reduce_full=8,
                 min_book_spread=6,
                 max_synthetic_dispersion=4,
+                basis_entry_threshold_ticks=1.25,
+                basis_strong_threshold_ticks=2.5,
+                imbalance_confirmation_threshold=0.15,
+                far_side_widen_ticks=4,
             ),
             RiskConfig(
                 reprice_cooldown_ms=0,
@@ -55,7 +59,29 @@ class BUnderlyingMMTests(unittest.TestCase):
         observer.on_book_update("B_P_1050", FakeOrderBook(bids={0: 10}, asks={4: 10}))
         return observer.compute_residuals()
 
-    def test_quotes_underlying_when_composite_fair_and_guards_pass(self) -> None:
+    @staticmethod
+    def seed_positive_basis_chain(observer: MarketBObserver, *, b_bid: int = 1096, b_ask: int = 1104) -> dict:
+        observer.on_book_update("B", FakeOrderBook(bids={b_bid: 10}, asks={b_ask: 10}))
+        observer.on_book_update("B_C_950", FakeOrderBook(bids={153: 10}, asks={155: 10}))
+        observer.on_book_update("B_P_950", FakeOrderBook(bids={0: 10}, asks={2: 10}))
+        observer.on_book_update("B_C_1000", FakeOrderBook(bids={103: 10}, asks={105: 10}))
+        observer.on_book_update("B_P_1000", FakeOrderBook(bids={0: 10}, asks={2: 10}))
+        observer.on_book_update("B_C_1050", FakeOrderBook(bids={53: 10}, asks={55: 10}))
+        observer.on_book_update("B_P_1050", FakeOrderBook(bids={0: 10}, asks={2: 10}))
+        return observer.compute_residuals()
+
+    @staticmethod
+    def seed_negative_basis_chain(observer: MarketBObserver, *, b_bid: int = 1096, b_ask: int = 1104) -> dict:
+        observer.on_book_update("B", FakeOrderBook(bids={b_bid: 10}, asks={b_ask: 10}))
+        observer.on_book_update("B_C_950", FakeOrderBook(bids={147: 10}, asks={149: 10}))
+        observer.on_book_update("B_P_950", FakeOrderBook(bids={2: 10}, asks={4: 10}))
+        observer.on_book_update("B_C_1000", FakeOrderBook(bids={97: 10}, asks={99: 10}))
+        observer.on_book_update("B_P_1000", FakeOrderBook(bids={2: 10}, asks={4: 10}))
+        observer.on_book_update("B_C_1050", FakeOrderBook(bids={47: 10}, asks={49: 10}))
+        observer.on_book_update("B_P_1050", FakeOrderBook(bids={2: 10}, asks={4: 10}))
+        return observer.compute_residuals()
+
+    def test_stays_observe_only_when_basis_is_too_small(self) -> None:
         observer = MarketBObserver(depth_levels=5)
         payload = self.seed_consistent_chain(observer)
         strategy = self.make_strategy()
@@ -63,13 +89,9 @@ class BUnderlyingMMTests(unittest.TestCase):
 
         plan = strategy.compute_quotes(now_ms=1_000, residual_payload=payload)
 
-        self.assertEqual(plan.mode, "UNDERLYING_MM")
-        self.assertFalse(plan.observe_only)
-        self.assertIsNotNone(plan.bid)
-        self.assertIsNotNone(plan.ask)
-        self.assertEqual(plan.bid.qty, 1)
-        self.assertEqual(plan.ask.qty, 1)
-        self.assertEqual(plan.aggressive_actions, ())
+        self.assertEqual(plan.mode, "OBSERVE_ONLY")
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "basis_too_small")
 
     def test_blocks_when_synthetic_dispersion_is_too_wide(self) -> None:
         observer = MarketBObserver(depth_levels=5)
@@ -108,11 +130,23 @@ class BUnderlyingMMTests(unittest.TestCase):
         self.assertIsNotNone(plan.ask)
         self.assertEqual(plan.ask.side, "SELL")
 
-    def test_stays_within_reduce_start_and_full_thresholds(self) -> None:
+    def test_quotes_one_sided_bid_when_basis_is_positive(self) -> None:
         observer = MarketBObserver(depth_levels=5)
-        payload = self.seed_consistent_chain(observer)
+        payload = self.seed_positive_basis_chain(observer)
         strategy = self.make_strategy()
-        strategy.sync_inventory_from_exchange(4)
+        strategy.on_book_update_at("B", FakeOrderBook(bids={1096: 10}, asks={1104: 10}), now_ms=1_000)
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=payload)
+
+        self.assertEqual(plan.mode, "UNDERLYING_MM")
+        self.assertIsNotNone(plan.bid)
+        self.assertIsNone(plan.ask)
+        self.assertEqual(plan.bid.qty, 1)
+
+    def test_quotes_one_sided_ask_when_basis_is_negative(self) -> None:
+        observer = MarketBObserver(depth_levels=5)
+        payload = self.seed_negative_basis_chain(observer)
+        strategy = self.make_strategy()
         strategy.on_book_update_at("B", FakeOrderBook(bids={1096: 10}, asks={1104: 10}), now_ms=1_000)
 
         plan = strategy.compute_quotes(now_ms=1_000, residual_payload=payload)
@@ -121,6 +155,18 @@ class BUnderlyingMMTests(unittest.TestCase):
         self.assertIsNone(plan.bid)
         self.assertIsNotNone(plan.ask)
         self.assertEqual(plan.ask.qty, 1)
+
+    def test_reduces_only_when_inventory_opposes_signal(self) -> None:
+        observer = MarketBObserver(depth_levels=5)
+        payload = self.seed_negative_basis_chain(observer)
+        strategy = self.make_strategy()
+        strategy.sync_inventory_from_exchange(2)
+        strategy.on_book_update_at("B", FakeOrderBook(bids={1096: 10}, asks={1104: 10}), now_ms=1_000)
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=payload)
+
+        self.assertEqual(plan.mode, "REDUCE_ONLY")
+        self.assertIsNotNone(plan.ask)
 
 
 if __name__ == "__main__":

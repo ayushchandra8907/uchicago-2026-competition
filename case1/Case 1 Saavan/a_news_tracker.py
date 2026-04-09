@@ -262,7 +262,7 @@ def _analyze_a_news_event(
 ) -> ANewsHeadlineAnalysis:
     event_ms = int(news_event.get("monotonic_ms", 0))
     window_end_ms = min(event_ms + 8_000, next_event_ms) if next_event_ms is not None else event_ms + 8_000
-    headline = str(news_event.get("content") or (news_event.get("raw_payload") or {}).get("content") or "")
+    headline = _headline_from_news_event(news_event)
     matched_unigrams = tuple(_as_term_list(news_event.get("news_matched_unigrams"), fallback=_split_terms(news_event.get("news_matched_phrases"), size=1)))
     matched_bigrams = tuple(_as_term_list(news_event.get("news_matched_bigrams"), fallback=_split_terms(news_event.get("news_matched_phrases"), size=2)))
     unknown_unigrams = tuple(_as_term_list(news_event.get("unknown_candidate_unigrams"), fallback=_split_terms(news_event.get("unknown_candidate_phrases"), size=1)))
@@ -587,6 +587,25 @@ def _is_a_unstructured_news_event(event: dict[str, Any]) -> bool:
     new_data = raw_payload.get("new_data") or {}
     asset = str(new_data.get("asset") or "").upper()
     return symbol == "A" or asset == "A"
+
+
+def _headline_from_news_event(event: dict[str, Any]) -> str:
+    raw_payload = event.get("raw_payload") or {}
+    new_data = raw_payload.get("new_data") or {}
+    candidates = (
+        event.get("content"),
+        new_data.get("content"),
+        raw_payload.get("content"),
+        raw_payload.get("headline"),
+        raw_payload.get("text"),
+    )
+    for raw_value in candidates:
+        if raw_value is None:
+            continue
+        text = str(raw_value).strip()
+        if text:
+            return text
+    return ""
 
 
 def _as_term_list(raw_value: Any, *, fallback: list[str]) -> list[str]:
