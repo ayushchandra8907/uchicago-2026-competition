@@ -17,6 +17,7 @@ from a_bot_config import AConfig, RiskConfig, TraceConfig, load_bot_config
 from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import DesiredOrder, ManagedOrder, MarketAStrategy, QuotePlan
 from a_bot_trace import TraceRecorder, load_trace_events, summarize_trace_events
+from a_news_tracker import build_a_news_tracker_report
 from ayush_a_port import AyushPortStrategy
 from b_observer import MarketBObserver
 
@@ -334,7 +335,9 @@ class TraceTests(unittest.TestCase):
             self.assertIn("pnl_by_action_class", summary)
             self.assertIn("a_strategy_breakdown", summary)
             self.assertIn("a_news_summary", summary)
+            self.assertIn("a_news_episode_summaries", summary)
             self.assertIn("b_cost_adjusted_residual_stats", summary)
+            self.assertIn("b_shadow_underlying_mm", summary)
             self.assertIn("b_strategy_block_reasons", summary)
             self.assertIn("trace_volume_summary", summary)
 
@@ -693,6 +696,225 @@ class TraceTests(unittest.TestCase):
         )
         self.assertEqual(summary["b_strategy_block_reasons"]["synthetic_dispersion_wide"], 1)
         self.assertEqual(summary["trace_volume_summary"]["event_counts"]["derived_signal"], 2)
+
+    def test_a_news_tracker_joins_ayush_port_orders_by_signal_id(self) -> None:
+        events = [
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "exchange_tick": 100,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "POST_NEWS_SHOCK",
+                "news_kind": "unstructured",
+                "relevant": True,
+                "content": "A takes a leading position in a growing niche market.",
+                "news_sentiment_score": 3.8,
+                "news_sentiment_bucket": "strong",
+                "news_matched_bigrams": ["leading position", "growing niche"],
+                "active_news_signal_id": "ayush_news_1",
+                "pending_news_signal_id": "ayush_news_1",
+                "news_fair_value": 1048,
+                "news_target_inventory": 90,
+                "mid": 1000.0,
+                "raw_payload": {
+                    "kind": "unstructured",
+                    "symbol": "A",
+                    "new_data": {"content": "A takes a leading position in a growing niche market."},
+                },
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_010,
+                "symbol": "A",
+                "market_key": "A",
+                "strategy_family": "a_news",
+                "action_class": "news_take",
+                "pnl_owner": "a_news",
+                "signal_id": "ayush_news_1",
+                "intent": "post_news_shock_take",
+                "side": "BUY",
+                "qty": 12,
+                "price": 1002,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_020,
+                "symbol": "A",
+                "market_key": "A",
+                "strategy_family": "a_news",
+                "action_class": "news_take",
+                "pnl_owner": "a_news",
+                "signal_id": "ayush_news_1",
+                "intent": "post_news_shock_take",
+                "side": "BUY",
+                "fill_qty": 12,
+                "fill_price": 1002,
+                "mid": 1002.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 4_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mid": 1030.0,
+            },
+        ]
+
+        report = build_a_news_tracker_report(events, config=AConfig())
+        row = report["headline_analyses"][0]
+        self.assertTrue(row["traded"])
+        self.assertEqual(row["signal_id"], "ayush_news_1")
+        self.assertEqual(row["first_desired_side"], "BUY")
+        self.assertEqual(row["first_desired_qty"], 12)
+        self.assertEqual(row["first_fill_side"], "BUY")
+        self.assertEqual(row["first_fill_qty"], 12)
+        self.assertEqual(row["target_inventory"], 90)
+        self.assertNotEqual(row["verdict"], "missed_no_trade")
+
+    def test_summarize_trace_events_reports_news_episodes_and_counterfactuals(self) -> None:
+        events = [
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "exchange_tick": 100,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "POST_NEWS_SHOCK",
+                "news_kind": "unstructured",
+                "relevant": True,
+                "content": "A takes a leading position in a growing niche market.",
+                "news_sentiment_score": 3.8,
+                "news_sentiment_bucket": "strong",
+                "active_news_signal_id": "ayush_news_1",
+                "pending_news_signal_id": "ayush_news_1",
+                "news_fair_value": 1048,
+                "news_target_inventory": 90,
+                "mid": 1000.0,
+                "raw_payload": {
+                    "kind": "unstructured",
+                    "symbol": "A",
+                    "new_data": {"content": "A takes a leading position in a growing niche market."},
+                },
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_010,
+                "symbol": "A",
+                "market_key": "A",
+                "strategy_family": "a_news",
+                "action_class": "news_take",
+                "pnl_owner": "a_news",
+                "signal_id": "ayush_news_1",
+                "side": "BUY",
+                "fill_qty": 12,
+                "fill_price": 1001,
+                "news_position": 12,
+                "mid": 1001.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 3_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "POST_NEWS_SHOCK",
+                "news_position": 12,
+                "mid": 1030.0,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 4_000,
+                "symbol": "A",
+                "market_key": "A",
+                "strategy_family": "a_news",
+                "action_class": "news_unwind",
+                "pnl_owner": "a_news",
+                "signal_id": "ayush_news_1",
+                "side": "SELL",
+                "fill_qty": 12,
+                "fill_price": 1020,
+                "news_position": 0,
+                "mid": 1020.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 6_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "AYUSH_IDLE",
+                "news_position": 0,
+                "mid": 1040.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        row = summary["a_news_episode_summaries"][0]
+        self.assertEqual(row["signal_id"], "ayush_news_1")
+        self.assertEqual(row["target_inventory"], 90)
+        self.assertEqual(row["fill_qty"], 24)
+        self.assertEqual(row["peak_news_inventory"], 12)
+        self.assertEqual(row["avg_entry_px"], 1001.0)
+        self.assertEqual(row["avg_exit_px"], 1020.0)
+        self.assertIn("hold_2s", row["counterfactual_holds"])
+        self.assertGreater(row["counterfactual_holds"]["hold_2s"]["estimated_pnl"], row["realized_episode_pnl"])
+
+    def test_b_shadow_underlying_mm_summary_is_observe_only(self) -> None:
+        events = [
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "B",
+                "market_key": "B",
+                "strategy_family": "b_observe_only",
+                "best_bid_px": 999,
+                "best_ask_px": 1005,
+                "spread": 6,
+                "microprice": 1002.0,
+                "top_of_book_imbalance": 0.0,
+                "payload": {
+                    "composite_synthetic_fair": 1006.0,
+                    "composite_basis": 4.0,
+                    "synthetic_forward_by_strike": {"950": 1005.0, "1000": 1006.0, "1050": 1007.0},
+                    "parity_residual_by_strike": {"1000": 1.0},
+                    "parity_edge_after_cost_by_strike": {"1000": -5.0},
+                },
+            },
+            {
+                "event_type": "market_trade_observed",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "symbol": "B",
+                "market_key": "B",
+                "price": 999,
+                "qty": 1,
+                "mid": 1000.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 6_500,
+                "symbol": "B",
+                "market_key": "B",
+                "mid": 1004.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        shadow = summary["b_shadow_underlying_mm"]
+        self.assertTrue(shadow["observe_only"])
+        self.assertEqual(shadow["candidate_quote_count"], 1)
+        self.assertEqual(shadow["hypothetical_fill_count"], 1)
+        self.assertIn("BUY", shadow["hypothetical_quote_counts"])
 
 
 if __name__ == "__main__":

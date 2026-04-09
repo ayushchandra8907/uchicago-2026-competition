@@ -167,10 +167,12 @@ def main() -> None:
         recommendation_rows = tracker_report.get("term_recommendations") or []
         summary["a_news_summary"] = {
             "headline_count": len(headline_rows),
+            "episode_count": len(summary.get("a_news_episode_summaries") or []),
             "traded_count": sum(1 for row in headline_rows if row.get("traded")),
             "missed_no_trade_count": sum(1 for row in headline_rows if row.get("verdict") == "missed_no_trade"),
             "undersized_count": sum(1 for row in headline_rows if row.get("verdict") == "undersized"),
             "wrong_direction_count": sum(1 for row in headline_rows if row.get("verdict") == "wrong_direction"),
+            "under_harvest_candidate_count": sum(1 for row in (summary.get("a_news_episode_summaries") or []) if row.get("under_harvest_candidate")),
             "a_news_pnl": round(float((summary.get("pnl_by_strategy_family") or {}).get("a_news", 0.0)), 4),
             "fill_count": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_count", 0)),
             "fill_qty": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_qty", 0)),

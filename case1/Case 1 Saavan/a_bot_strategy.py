@@ -203,6 +203,7 @@ class NewsReaction:
     new_fair_value: int | None = None
     base_fair_value: int | None = None
     news_fair_value: int | None = None
+    news_target_inventory: int | None = None
     pending_news_target_inventory: int | None = None
     news_confirmation_state: str | None = None
     active_news_signal_id: str | None = None

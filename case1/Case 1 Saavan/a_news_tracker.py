@@ -16,6 +16,7 @@ from a_news_sentiment import get_a_news_term_polarity, get_a_news_term_weight
 class ANewsHeadlineAnalysis:
     tick: int | None
     monotonic_ms: int
+    signal_id: str | None
     headline: str
     matched_unigrams: tuple[str, ...]
     matched_bigrams: tuple[str, ...]
@@ -63,6 +64,7 @@ def build_a_news_tracker_report(events: list[dict[str, Any]], config: AConfig | 
     mid_points = _mid_series(ordered)
     midpoint_times = [item[0] for item in mid_points]
     decisions = [event for event in ordered if event.get("event_type") == "decision_evaluated"]
+    submissions = [event for event in ordered if event.get("event_type") == "order_submitted"]
     fills = [event for event in ordered if event.get("event_type") == "order_filled"]
     a_news_events = [event for event in ordered if _is_a_unstructured_news_event(event)]
 
@@ -75,6 +77,7 @@ def build_a_news_tracker_report(events: list[dict[str, Any]], config: AConfig | 
             _analyze_a_news_event(
                 news_event,
                 decisions=decisions,
+                submissions=submissions,
                 fills=fills,
                 mid_points=mid_points,
                 midpoint_times=midpoint_times,
@@ -109,6 +112,7 @@ def render_a_news_tracker_markdown(report: dict[str, Any], run_dir: Path) -> str
                 [
                     f"### `{row['headline']}`",
                     f"- Time: `{row['monotonic_ms']}`",
+                    f"- Signal ID: `{row['signal_id']}`",
                     f"- Score / bucket: `{row['sentiment_score']}` / `{row['sentiment_bucket']}`",
                     f"- Matched bigrams: `{row['matched_bigrams']}`",
                     f"- Matched unigrams: `{row['matched_unigrams']}`",
@@ -254,6 +258,7 @@ def _analyze_a_news_event(
     news_event: dict[str, Any],
     *,
     decisions: list[dict[str, Any]],
+    submissions: list[dict[str, Any]],
     fills: list[dict[str, Any]],
     mid_points: list[tuple[int, float]],
     midpoint_times: list[int],
@@ -262,6 +267,7 @@ def _analyze_a_news_event(
 ) -> ANewsHeadlineAnalysis:
     event_ms = int(news_event.get("monotonic_ms", 0))
     window_end_ms = min(event_ms + 8_000, next_event_ms) if next_event_ms is not None else event_ms + 8_000
+    signal_id = _news_signal_id(news_event)
     headline = _headline_from_news_event(news_event)
     matched_unigrams = tuple(_as_term_list(news_event.get("news_matched_unigrams"), fallback=_split_terms(news_event.get("news_matched_phrases"), size=1)))
     matched_bigrams = tuple(_as_term_list(news_event.get("news_matched_bigrams"), fallback=_split_terms(news_event.get("news_matched_phrases"), size=2)))
@@ -285,20 +291,31 @@ def _analyze_a_news_event(
         decisions,
         lambda event: (
             event_ms <= int(event.get("monotonic_ms", 0)) <= window_end_ms
+            and _matches_signal(event, signal_id)
             and any(
                 (
-                    action.get("intent") == "news_take"
+                    _is_news_take_event(action)
                     and action.get("side") in {"BUY", "SELL"}
                 )
                 for action in (event.get("aggressive_actions") or [])
             )
         ),
     )
+    first_submit = _first_matching_event(
+        submissions,
+        lambda event: (
+            event_ms <= int(event.get("monotonic_ms", 0)) <= window_end_ms
+            and _matches_signal(event, signal_id)
+            and _is_news_take_event(event)
+            and event.get("side") in {"BUY", "SELL"}
+        ),
+    )
     first_fill = _first_matching_event(
         fills,
         lambda event: (
             event_ms <= int(event.get("monotonic_ms", 0)) <= window_end_ms
-            and str(event.get("intent") or "") == "news_take"
+            and _matches_signal(event, signal_id)
+            and _is_news_take_event(event)
             and event.get("side") in {"BUY", "SELL"}
         ),
     )
@@ -306,25 +323,40 @@ def _analyze_a_news_event(
     first_action = None
     if first_trade_decision is not None:
         for action in first_trade_decision.get("aggressive_actions") or []:
-            if action.get("intent") == "news_take" and action.get("side") in {"BUY", "SELL"}:
+            if _is_news_take_event(action) and action.get("side") in {"BUY", "SELL"}:
                 first_action = action
                 break
 
-    first_desired_side = None if first_action is None else str(first_action.get("side"))
-    first_desired_qty = None if first_action is None or first_action.get("qty") is None else int(first_action.get("qty"))
+    first_desired_event = first_action or first_submit
+    first_desired_side = None if first_desired_event is None else str(first_desired_event.get("side"))
+    first_desired_qty = None if first_desired_event is None or first_desired_event.get("qty") is None else int(first_desired_event.get("qty"))
     first_fill_side = None if first_fill is None else str(first_fill.get("side"))
     first_fill_qty = None if first_fill is None or first_fill.get("fill_qty") is None else int(first_fill.get("fill_qty"))
 
     target_inventory = news_event.get("pending_news_target_inventory")
     if target_inventory is None:
         target_inventory = news_event.get("news_target_inventory")
+    if target_inventory is None:
+        target_inventory = news_event.get("original_shock_target_inventory")
+    if target_inventory is None:
+        target_inventory = news_event.get("shock_target_inventory")
     if first_trade_decision is not None and first_trade_decision.get("news_target_inventory") is not None:
         target_inventory = int(first_trade_decision.get("news_target_inventory"))
+    elif first_submit is not None and first_submit.get("news_target_inventory") is not None:
+        target_inventory = int(first_submit.get("news_target_inventory"))
     elif target_inventory is not None:
         target_inventory = int(target_inventory)
+    elif news_event.get("news_fair_value") is not None:
+        target_inventory = _ideal_inventory_from_move(
+            delta_ticks=float(news_event.get("news_fair_value")) - base_mid,
+            score=float(news_event.get("news_sentiment_score") or 0.0),
+            bucket=str(news_event.get("news_sentiment_bucket") or "none"),
+            config=config,
+        )
 
-    traded = first_trade_decision is not None or first_fill is not None
-    first_trade_direction = 0 if first_desired_side is None else (1 if first_desired_side == "BUY" else -1)
+    traded = first_trade_decision is not None or first_submit is not None or first_fill is not None
+    first_direction_side = first_desired_side or first_fill_side
+    first_trade_direction = 0 if first_direction_side is None else (1 if first_direction_side == "BUY" else -1)
     ideal_inventory = _ideal_inventory_from_move(
         delta_ticks=delta_3s,
         score=float(news_event.get("news_sentiment_score") or 0.0),
@@ -343,6 +375,7 @@ def _analyze_a_news_event(
     return ANewsHeadlineAnalysis(
         tick=None if news_event.get("exchange_tick") is None else int(news_event.get("exchange_tick")),
         monotonic_ms=event_ms,
+        signal_id=signal_id,
         headline=headline,
         matched_unigrams=matched_unigrams,
         matched_bigrams=matched_bigrams,
@@ -587,6 +620,41 @@ def _is_a_unstructured_news_event(event: dict[str, Any]) -> bool:
     new_data = raw_payload.get("new_data") or {}
     asset = str(new_data.get("asset") or "").upper()
     return symbol == "A" or asset == "A"
+
+
+def _news_signal_id(event: dict[str, Any]) -> str | None:
+    for key in ("active_news_signal_id", "pending_news_signal_id", "current_news_signal_id", "signal_id", "trade_group_id"):
+        value = event.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _event_signal_ids(event: dict[str, Any]) -> set[str]:
+    return {
+        str(value)
+        for key in ("signal_id", "trade_group_id", "active_news_signal_id", "pending_news_signal_id", "current_news_signal_id")
+        for value in (event.get(key),)
+        if value
+    }
+
+
+def _matches_signal(event: dict[str, Any], signal_id: str | None) -> bool:
+    if signal_id is None:
+        return True
+    event_ids = _event_signal_ids(event)
+    return not event_ids or signal_id in event_ids
+
+
+def _is_news_take_event(event: dict[str, Any]) -> bool:
+    action_class = str(event.get("action_class") or "")
+    intent = str(event.get("intent") or "")
+    strategy_family = str(event.get("strategy_family") or "")
+    return (
+        action_class == "news_take"
+        or intent in {"news_take", "post_news_shock_take"}
+        or (strategy_family == "a_news" and action_class in {"", "unknown"})
+    )
 
 
 def _headline_from_news_event(event: dict[str, Any]) -> str:

@@ -1248,6 +1248,7 @@ class MarketABot(XChangeClient):
             "new_fair_value": reaction.new_fair_value,
             "base_fair_value": reaction.base_fair_value,
             "news_fair_value": reaction.news_fair_value,
+            "news_target_inventory": reaction.news_target_inventory,
             "pending_news_target_inventory": reaction.pending_news_target_inventory,
             "news_confirmation_state": reaction.news_confirmation_state,
             "active_news_signal_id": reaction.active_news_signal_id,
