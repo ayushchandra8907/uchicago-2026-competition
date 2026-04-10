@@ -497,6 +497,10 @@ class TraceTests(unittest.TestCase):
                 "ETF_MIN_HOLD_MS",
                 "ETF_MIN_EVAL_INTERVAL_MS",
                 "ETF_UNWIND_REPRICE_THRESHOLD_TICKS",
+                "ETF_ENTRY_RETRY_REPRICE_MS",
+                "ETF_CHURN_WINDOW_MS",
+                "ETF_CHURN_MAX_TOP_OF_BOOK_UPDATES",
+                "ETF_CHURN_RESUME_STABLE_MS",
                 "AUTO_STOP_ON_FOLLOWUP_POSITION_SNAPSHOT",
                 "AUTO_STOP_ON_MARKET_RESOLVED",
             }
@@ -528,8 +532,8 @@ class TraceTests(unittest.TestCase):
             self.assertTrue(config.market_b.mm_cancel_on_bad_book)
             self.assertEqual(config.market_b.mm_bad_fill_cooldown_ms, 750)
             self.assertTrue(config.market_b.meanrev_enabled)
-            self.assertEqual(config.market_b.meanrev_max_position, 8)
-            self.assertEqual(config.market_b.meanrev_quote_size, 1)
+            self.assertEqual(config.market_b.meanrev_max_position, 16)
+            self.assertEqual(config.market_b.meanrev_quote_size, 2)
             self.assertEqual(config.market_b.meanrev_ema_fast_ms, 30_000)
             self.assertEqual(config.market_b.meanrev_ema_slow_ms, 180_000)
             self.assertEqual(config.market_b.meanrev_vol_ewma_ms, 60_000)
@@ -543,12 +547,24 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(config.market_b.meanrev_cooldown_ms, 1_500)
             self.assertEqual(config.market_b.meanrev_aggressive_entry_z, 2.75)
             self.assertTrue(config.market_b.meanrev_aggressive_exit)
+            self.assertEqual(config.market_b.meanrev_entry_ticks, 10)
+            self.assertEqual(config.market_b.meanrev_full_entry_ticks, 15)
+            self.assertEqual(config.market_b.meanrev_exit_ticks, 3)
+            self.assertEqual(config.market_b.meanrev_base_target, 6)
+            self.assertEqual(config.market_b.meanrev_full_target, 16)
+            self.assertEqual(config.market_b.meanrev_extreme_entry_ticks, 20)
+            self.assertEqual(config.market_b.meanrev_risk_off_deviation_ticks, 35)
+            self.assertEqual(config.market_b.meanrev_turn_confirm_ms, 300)
+            self.assertEqual(config.market_b.meanrev_min_healthy_book_age_ms, 500)
+            self.assertEqual(config.market_b.meanrev_bad_fill_cooldown_ms, 1_000)
             self.assertTrue(config.market_b.option_lottery_enabled)
             self.assertEqual(config.market_b.option_lottery_max_ask, 3)
             self.assertEqual(config.market_b.option_lottery_total_premium_budget, 1_500)
             self.assertEqual(config.market_b.option_lottery_wing_max_position, 200)
             self.assertEqual(config.market_b.option_lottery_atm_max_position, 40)
             self.assertEqual(config.market_b.option_lottery_wing_premium_budget, 600)
+            self.assertEqual(config.market_b.option_lottery_c1050_premium_budget, 450)
+            self.assertEqual(config.market_b.option_lottery_p950_premium_budget, 450)
             self.assertEqual(config.market_b.option_lottery_atm_total_premium_budget, 300)
             self.assertTrue(config.market_b.option_lottery_profit_take_enabled)
             self.assertTrue(config.market_b.option_hedge_enabled)
@@ -565,6 +581,12 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(config.etf.min_hold_ms, 3_000)
             self.assertEqual(config.etf.min_eval_interval_ms, 100)
             self.assertEqual(config.etf.unwind_reprice_threshold_ticks, 8)
+            self.assertEqual(config.etf.entry_retry_window_ms, 1_500)
+            self.assertEqual(config.etf.entry_force_aggressive_ms, 250)
+            self.assertEqual(config.etf.entry_retry_reprice_ms, 125)
+            self.assertEqual(config.etf.churn_window_ms, 250)
+            self.assertEqual(config.etf.churn_max_top_of_book_updates, 25)
+            self.assertEqual(config.etf.churn_resume_stable_ms, 500)
             self.assertTrue(config.auto_stop_after_round_complete)
             self.assertEqual(config.assumed_round_duration_ms, 900_000)
             self.assertEqual(config.round_completion_grace_ms, 5_000)
@@ -975,6 +997,11 @@ class TraceTests(unittest.TestCase):
                 "pnl_owner": "b_mean_reversion",
                 "action_class": "mean_reversion_entry",
                 "b_meanrev_z": 1.5,
+                "b_meanrev_deviation_ticks": 10.0,
+                "b_meanrev_mean_reference": 1000.0,
+                "b_meanrev_mean_reference_ema_component": 650.0,
+                "b_meanrev_mean_reference_synth_component": 350.0,
+                "b_meanrev_entry_style": "normal",
                 "side": "SELL",
                 "price": 1004,
                 "qty": 1,
@@ -990,6 +1017,7 @@ class TraceTests(unittest.TestCase):
                 "pnl_owner": "b_mean_reversion",
                 "action_class": "mean_reversion_risk_off",
                 "b_meanrev_risk_off_forced": False,
+                "b_meanrev_deviation_ticks": 36.0,
                 "side": "BUY",
                 "price": 1001,
                 "qty": 1,
@@ -1004,6 +1032,7 @@ class TraceTests(unittest.TestCase):
                 "pnl_owner": "b_mean_reversion",
                 "action_class": "mean_reversion_entry",
                 "intent": "b_mean_reversion",
+                "b_meanrev_entry_style": "normal",
                 "side": "SELL",
                 "fill_price": 1004,
                 "fill_qty": 1,
@@ -1040,7 +1069,13 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(meanrev["fill_count"], 1)
         self.assertEqual(meanrev["fill_qty"], 1)
         self.assertEqual(meanrev["avg_entry_abs_z"], 1.5)
+        self.assertEqual(meanrev["avg_entry_abs_deviation"], 10.0)
+        self.assertEqual(meanrev["avg_entry_mean_reference"], 1000.0)
+        self.assertEqual(meanrev["avg_entry_mean_reference_ema_component"], 650.0)
+        self.assertEqual(meanrev["avg_entry_mean_reference_synth_component"], 350.0)
+        self.assertEqual(meanrev["entry_style_counts"]["normal"], 1)
         self.assertGreater(meanrev["entry_markouts"]["250ms"], 0)
+        self.assertGreater(meanrev["entry_markouts_normal"]["250ms"], 0)
 
     def test_summarize_trace_events_reports_a_episode_mm_loss_and_b_cost_stats(self) -> None:
         events = [
@@ -1470,6 +1505,86 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(calibration["by_horizon_ms"]["1000"]["mean_etf_over_a_fair_shift"], 0.2)
         self.assertEqual(calibration["by_horizon_ms"]["1000"]["mean_configured_alpha"], 0.25)
         self.assertEqual(calibration["by_source_kind"]["structured_earnings"]["1000"]["directional_hit_rate"], 1.0)
+
+    def test_summarize_trace_events_reports_etf_entry_summary(self) -> None:
+        events = [
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "a_shock_projection",
+                "signal_id": "etf_a_1",
+                "payload": {
+                    "source_kind": "structured_earnings",
+                    "alpha": 0.60,
+                    "a_fair_shift": 100.0,
+                    "projected_etf_shift": 60.0,
+                    "base_mid": 500.0,
+                    "target_inventory": 60,
+                    "target_fair": 560.0,
+                },
+            },
+            {
+                "event_type": "decision_evaluated",
+                "run_id": "run-1",
+                "monotonic_ms": 1_010,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mode": "ETF_CHURN_GUARD",
+                "etf_signal_id": "etf_a_1",
+                "reason": "etf_quote_churn_guard",
+                "observe_only": True,
+                "aggressive_action_count": 0,
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_120,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "etf_shock_take",
+                "signal_id": "etf_a_1",
+                "side": "BUY",
+                "qty": 16,
+                "price": 502,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_160,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "etf_shock_take",
+                "signal_id": "etf_a_1",
+                "side": "BUY",
+                "fill_qty": 16,
+                "fill_price": 502,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 520.0,
+                "inventory": 16,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+
+        etf_entry = summary["etf_entry_summary"]
+        self.assertEqual(etf_entry["signal_count"], 1)
+        self.assertEqual(etf_entry["total_entry_attempt_count"], 1)
+        self.assertEqual(etf_entry["avg_first_order_attempt_latency_ms"], 120)
+        self.assertEqual(etf_entry["avg_first_fill_latency_ms"], 160)
+        self.assertEqual(etf_entry["mean_target_fill_ratio"], round(16 / 60, 4))
+        self.assertEqual(etf_entry["churn_guard_count"], 1)
 
 
 if __name__ == "__main__":

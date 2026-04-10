@@ -357,11 +357,11 @@ class BOptionLotteryStrategy:
         if bid_px >= avg_entry * 5.0:
             max_sell = position
         elif bid_px >= avg_entry * 3.0:
-            max_sell = max(1, position // 2)
+            max_sell = max(1, int(ceil(position * 0.75)))
         elif self.underlying_inventory == 0 and symbol in {"B_C_1000", "B_P_1000"}:
             max_sell = max(1, position // 2)
         else:
-            max_sell = max(1, int(ceil(position / 4.0)))
+            max_sell = max(1, int(ceil(position / 2.0)))
         qty = min(
             max_sell,
             max(1, int(self.config.option_lottery_profit_take_quote_size)),
@@ -495,10 +495,13 @@ class BOptionLotteryStrategy:
         return int(self.config.option_lottery_max_position_per_symbol)
 
     def _premium_remaining(self, symbol: str) -> int:
-        total_remaining = int(self.config.option_lottery_total_premium_budget) - self.premium_spent - self._outstanding_premium()
+        lottery_premium_spent = max(0, int(self.premium_spent) - int(self.hedge_premium_spent))
+        total_remaining = int(self.config.option_lottery_total_premium_budget) - lottery_premium_spent - self._outstanding_premium()
         symbol_spent = self._symbol_open_premium(symbol) + self._symbol_outstanding_premium(symbol)
-        if symbol in {"B_C_1050", "B_P_950"}:
-            symbol_remaining = int(self.config.option_lottery_wing_premium_budget) - symbol_spent
+        if symbol == "B_C_1050":
+            symbol_remaining = int(self.config.option_lottery_c1050_premium_budget) - symbol_spent
+        elif symbol == "B_P_950":
+            symbol_remaining = int(self.config.option_lottery_p950_premium_budget) - symbol_spent
         elif symbol in {"B_C_1000", "B_P_1000"}:
             atm_spent = sum(self._symbol_open_premium(item) + self._symbol_outstanding_premium(item) for item in ("B_C_1000", "B_P_1000"))
             symbol_remaining = int(self.config.option_lottery_atm_total_premium_budget) - atm_spent
@@ -544,7 +547,12 @@ class BOptionLotteryStrategy:
         total = 0
         for manager in self.order_managers.values():
             for order in manager.orders.values():
-                if order.remaining_qty > 0 and not order.cancel_pending and order.side == "BUY":
+                if (
+                    order.remaining_qty > 0
+                    and not order.cancel_pending
+                    and order.side == "BUY"
+                    and order.action_class != "atm_option_hedge"
+                ):
                     total += int(order.remaining_qty) * max(0, int(order.px))
         return total
 

@@ -59,3 +59,39 @@ class ANewsSentimentParityTests(unittest.TestCase):
                 self.assertEqual(ours.score, ayush.score)
                 self.assertEqual(ours.bucket, ayush.bucket)
                 self.assertEqual(ours.direction, ayush.direction)
+
+    def test_new_positive_phrase_family_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Revenue growth surges in a previously underperforming division at A."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("growth surges", "previously underperforming", "underperforming division")
+            )
+        )
+
+    def test_automation_cost_reduction_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Through advanced automation, A successfully reduces costs across its operations."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertIn("advanced automation", result.matched_bigrams)
+        self.assertTrue(
+            "successfully reduces" in result.matched_bigrams or "reduces costs" in result.matched_bigrams
+        )
+
+    def test_analyst_commendation_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Analysts commend A for successful product differentiation in a competitive market."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertIn("analysts commend", result.matched_bigrams)
+        self.assertIn("product differentiation", result.matched_bigrams)

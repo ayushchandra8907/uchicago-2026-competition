@@ -30,6 +30,12 @@ class ETFAFollowerTests(unittest.TestCase):
                 target_position_per_etf_tick=1.0,
                 min_a_fair_shift_ticks=20,
                 min_projected_edge_ticks=3,
+                entry_retry_window_ms=1_500,
+                entry_force_aggressive_ms=250,
+                entry_retry_reprice_ms=125,
+                churn_window_ms=250,
+                churn_max_top_of_book_updates=25,
+                churn_resume_stable_ms=500,
             ),
             RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=1, passive_quote_ttl_ms=3_000),
             book_depth_levels=5,
@@ -56,8 +62,10 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(plan.mode, "ETF_A_SHOCK")
         self.assertEqual(len(plan.aggressive_actions), 1)
         self.assertEqual(plan.aggressive_actions[0].side, "BUY")
+        self.assertTrue(plan.aggressive_actions[0].aggressive)
         self.assertEqual(plan.aggressive_actions[0].strategy_family, "etf_a_follower")
         self.assertEqual(plan.aggressive_actions[0].action_class, "etf_shock_take")
+        self.assertEqual(strategy.trace_state(1_100)["etf_entry_order_attempt_count"], 1)
 
     def test_structured_a_shock_target_inventory_can_scale_etf_target(self) -> None:
         strategy = ETFAFollowerStrategy(
@@ -69,6 +77,12 @@ class ETFAFollowerTests(unittest.TestCase):
                 target_position_per_a_shock_inventory=0.35,
                 min_a_fair_shift_ticks=20,
                 min_projected_edge_ticks=3,
+                entry_retry_window_ms=1_500,
+                entry_force_aggressive_ms=250,
+                entry_retry_reprice_ms=125,
+                churn_window_ms=250,
+                churn_max_top_of_book_updates=25,
+                churn_resume_stable_ms=500,
             ),
             RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=1, passive_quote_ttl_ms=3_000),
             book_depth_levels=5,
@@ -132,6 +146,16 @@ class ETFAFollowerTests(unittest.TestCase):
 
     def test_fill_after_position_update_does_not_double_count_inventory(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
         strategy.order_manager.note_submitted(
             order_id="etf-buy-1",
             side="BUY",
@@ -148,6 +172,62 @@ class ETFAFollowerTests(unittest.TestCase):
         strategy.on_fill("etf-buy-1", 8, 1002, authoritative_inventory=8, now_ms=1_121)
 
         self.assertEqual(strategy.inventory, 8)
+        self.assertEqual(strategy.trace_state(1_121)["etf_first_fill_latency_ms"], 21)
+
+    def test_signal_retries_until_entry_window_expires(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+
+        first = strategy.compute_quotes(now_ms=1_100)
+        second = strategy.compute_quotes(now_ms=1_500)
+        expired = strategy.compute_quotes(now_ms=2_700)
+
+        self.assertEqual(len(first.aggressive_actions), 1)
+        self.assertEqual(len(second.aggressive_actions), 1)
+        self.assertTrue(second.aggressive_actions[0].aggressive)
+        self.assertEqual(expired.reason, "etf_entry_retry_window_expired")
+        self.assertIsNone(strategy.active_signal)
+
+    def test_cancel_response_does_not_clear_unfilled_signal(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        plan = strategy.compute_quotes(now_ms=1_100)
+        order = plan.aggressive_actions[0]
+        managed = strategy.order_manager.note_submitted(
+            order_id="etf-entry-1",
+            side=order.side,
+            px=order.px,
+            qty=order.qty,
+            now_ms=1_100,
+            aggressive=order.aggressive,
+            intent=order.intent,
+            mode_at_submit=order.mode_at_submit,
+            action_class=order.action_class,
+        )
+
+        strategy.on_cancel_response(managed.order_id, True)
+        retry = strategy.compute_quotes(now_ms=1_250)
+
+        self.assertIsNotNone(strategy.active_signal)
+        self.assertEqual(len(retry.aggressive_actions), 1)
 
     def test_unwind_does_not_cross_zero_after_authoritative_fill(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
@@ -222,8 +302,81 @@ class ETFAFollowerTests(unittest.TestCase):
         plan = strategy.compute_quotes(now_ms=1_200)
 
         self.assertTrue(plan.observe_only)
-        self.assertEqual(plan.reason, "etf_book_crossed_or_locked")
+        self.assertEqual(plan.mode, "ETF_CHURN_GUARD")
+        self.assertEqual(plan.reason, "crossed_or_locked_etf_book")
         self.assertEqual(len(plan.aggressive_actions), 0)
+        self.assertIsNotNone(strategy.active_signal)
+
+    def test_quote_churn_guard_blocks_entry_without_clearing_signal(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        for offset in range(26):
+            strategy.on_book_update_at(
+                "ETF",
+                FakeOrderBook(
+                    bids={998 + offset: 10},
+                    asks={1002 + offset: 10},
+                ),
+                now_ms=1_200 + offset,
+            )
+
+        plan = strategy.compute_quotes(now_ms=1_230)
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.mode, "ETF_CHURN_GUARD")
+        self.assertEqual(plan.reason, "etf_quote_churn_guard")
+        self.assertIsNotNone(strategy.active_signal)
+
+    def test_churn_guard_clears_after_stable_book_period(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        strategy.on_book_update_at("ETF", FakeOrderBook(bids={1003: 10}, asks={1001: 10}), now_ms=1_200)
+        blocked = strategy.compute_quotes(now_ms=1_200)
+        strategy.on_book_update_at("ETF", FakeOrderBook(bids={998: 10}, asks={1002: 10}), now_ms=1_300)
+        still_blocked = strategy.compute_quotes(now_ms=1_600)
+        resumed = strategy.compute_quotes(now_ms=1_800)
+
+        self.assertEqual(blocked.reason, "crossed_or_locked_etf_book")
+        self.assertEqual(still_blocked.reason, "crossed_or_locked_etf_book")
+        self.assertEqual(len(resumed.aggressive_actions), 1)
+        self.assertTrue(resumed.aggressive_actions[0].aggressive)
+
+    def test_retry_window_reports_guard_reason_if_guard_persists(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        strategy.on_book_update_at("ETF", FakeOrderBook(bids={1003: 10}, asks={1001: 10}), now_ms=1_200)
+
+        expired = strategy.compute_quotes(now_ms=2_700)
+
+        self.assertEqual(expired.reason, "crossed_or_locked_etf_book")
+        self.assertIsNone(strategy.active_signal)
 
 
 if __name__ == "__main__":

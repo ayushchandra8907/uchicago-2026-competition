@@ -32,6 +32,8 @@ class BOptionLotteryTests(unittest.TestCase):
                 option_lottery_atm_max_position=40,
                 option_lottery_total_premium_budget=12,
                 option_lottery_wing_premium_budget=9,
+                option_lottery_c1050_premium_budget=9,
+                option_lottery_p950_premium_budget=9,
                 option_lottery_atm_total_premium_budget=6,
                 option_lottery_near_strike_ticks=80,
                 option_lottery_min_momentum_ticks=1,
@@ -117,6 +119,7 @@ class BOptionLotteryTests(unittest.TestCase):
                 option_lottery_wing_max_position=200,
                 option_lottery_total_premium_budget=1_500,
                 option_lottery_wing_premium_budget=600,
+                option_lottery_p950_premium_budget=450,
                 option_lottery_rebuy_cooldown_ms=0,
             ),
             RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=1, passive_quote_ttl_ms=3_000),
@@ -132,6 +135,18 @@ class BOptionLotteryTests(unittest.TestCase):
         self.assertIsNotNone(plan.bid)
         self.assertEqual(plan.bid.qty, 50)
         self.assertEqual(strategy.trace_state("B_P_950", 1_200)["position_cap"], 200)
+
+    def test_c1050_spend_does_not_consume_p950_symbol_budget(self) -> None:
+        strategy = self.make_strategy()
+        strategy.premium_spent = 9
+        strategy.open_cost_basis["B_C_1050"] = 9.0
+        strategy.costed_qty["B_C_1050"] = 3
+        strategy.on_book_update_at("B_P_950", FakeOrderBook(bids={1: 10}, asks={3: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_P_950", now_ms=1_200, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.bid)
 
     def test_atm_symbols_share_smaller_premium_budget(self) -> None:
         strategy = self.make_strategy()
@@ -219,7 +234,7 @@ class BOptionLotteryTests(unittest.TestCase):
         self.assertFalse(plan.observe_only)
         self.assertIsNotNone(plan.ask)
         self.assertEqual(plan.ask.side, "SELL")
-        self.assertLessEqual(plan.ask.qty, 5)
+        self.assertLessEqual(plan.ask.qty, 8)
         self.assertEqual(plan.ask.action_class, "cheap_option_profit_take")
 
     def test_two_x_profit_take_for_three_tick_entry(self) -> None:
@@ -234,6 +249,33 @@ class BOptionLotteryTests(unittest.TestCase):
         self.assertIsNotNone(plan.ask)
         self.assertEqual(plan.ask.side, "SELL")
         self.assertLessEqual(plan.ask.qty, 4)
+
+    def test_three_x_profit_take_scales_out_more_aggressively(self) -> None:
+        strategy = self.make_strategy()
+        strategy.positions["B_P_950"] = 8
+        strategy.costed_qty["B_P_950"] = 8
+        strategy.open_cost_basis["B_P_950"] = 24.0
+        strategy.on_book_update_at("B_P_950", FakeOrderBook(bids={9: 10}, asks={10: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_P_950", now_ms=1_200, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.ask)
+        self.assertGreaterEqual(plan.ask.qty, 6)
+        self.assertLessEqual(plan.ask.qty, 8)
+
+    def test_five_x_profit_take_can_exit_full_remaining_long(self) -> None:
+        strategy = self.make_strategy()
+        strategy.positions["B_C_1050"] = 5
+        strategy.costed_qty["B_C_1050"] = 5
+        strategy.open_cost_basis["B_C_1050"] = 10.0
+        strategy.on_book_update_at("B_C_1050", FakeOrderBook(bids={10: 10}, asks={11: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_C_1050", now_ms=1_200, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.ask)
+        self.assertEqual(plan.ask.qty, 5)
 
     def test_profit_take_keeps_existing_sell_and_blocks_rebuy_churn(self) -> None:
         strategy = self.make_strategy()

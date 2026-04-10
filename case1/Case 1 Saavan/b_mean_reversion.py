@@ -13,8 +13,13 @@ from a_bot_strategy import BookSnapshot, DesiredOrder, OrderManager, QuotePlan
 class BMeanReversionSignal:
     ema_fast: float | None
     ema_slow: float | None
+    mean_reference: float | None
+    mean_reference_ema_component: float | None
+    mean_reference_synth_component: float | None
+    used_synthetic_reference: bool
     sigma: float | None
     z_score: float | None
+    deviation_ticks: float | None
     target_inventory: int
     regime_block_reason: str | None
 
@@ -38,20 +43,40 @@ class BMeanReversionStrategy:
         self.ewma_var: float | None = None
         self.last_mid: float | None = None
         self.last_update_ms: int | None = None
+        self.healthy_book_since_ms: int | None = None
+        self.last_bad_book_ms: int | None = None
+        self.last_bad_book_fill_ms: int | None = None
         self.last_entry_ms: int | None = None
         self.position_entry_ms: int | None = None
         self.last_target_inventory = 0
         self.last_z_score: float | None = None
         self.last_sigma: float | None = None
+        self.last_deviation_ticks: float | None = None
+        self.last_mean_reference: float | None = None
+        self.last_mean_reference_ema_component: float | None = None
+        self.last_mean_reference_synth_component: float | None = None
+        self.last_used_synthetic_reference = False
+        self.last_fast_slope: float | None = None
+        self.last_extension_ms: int | None = None
+        self.last_abs_deviation: float | None = None
+        self.last_deviation_sign: int = 0
         self.last_mode = "OBSERVE_ONLY"
         self.last_block_reason: str | None = None
         self.last_risk_off_forced = False
-        self.last_signal = BMeanReversionSignal(None, None, None, None, 0, "not_started")
+        self.last_entry_style: str | None = None
+        self.last_signal = BMeanReversionSignal(None, None, None, None, None, False, None, None, None, 0, "not_started")
 
     def on_book_update_at(self, symbol: str, book, now_ms: int) -> bool:
         if symbol != self.symbol:
             return False
         self.book = BookSnapshot.from_order_book(book, depth_levels=self.book_depth_levels)
+        if self._book_is_healthy():
+            if self.healthy_book_since_ms is None:
+                self.healthy_book_since_ms = int(now_ms)
+        else:
+            self.healthy_book_since_ms = None
+            if self._book_is_bad():
+                self.last_bad_book_ms = int(now_ms)
         if self.book.mid is not None:
             self._update_ema_state(float(self.book.mid), int(now_ms))
         return True
@@ -81,6 +106,8 @@ class BMeanReversionStrategy:
         self.last_trade_px = int(price)
         self.last_trade_qty = int(qty)
         self.last_trade_ms = now_ms
+        if self._book_is_bad():
+            self.last_bad_book_fill_ms = now_ms
         return order
 
     def on_cancel_response(self, order_id: str, success: bool) -> Any | None:
@@ -92,22 +119,30 @@ class BMeanReversionStrategy:
     def compute_quotes(self, *, now_ms: int, residual_payload: dict[str, Any] | None) -> QuotePlan:
         self.last_block_reason = None
         self.last_risk_off_forced = False
+        self.last_entry_style = None
         signal_id = f"b_meanrev_{int(now_ms)}"
 
         if self.book.best_bid is None or self.book.best_ask is None or self.book.spread is None or self.book.mid is None:
             return self._observe("missing_b_book")
 
-        z = self._current_z()
+        mean_reference = self._compute_mean_reference(residual_payload)
+        z = self._current_z(mean_reference)
         if z is None:
             return self._observe("warming_up_b_meanrev")
 
-        target, mode, action_class, reason, aggressive = self._target_and_mode(z, now_ms, residual_payload)
+        deviation = self._current_deviation(mean_reference)
+        target, mode, action_class, reason, aggressive = self._target_and_mode(z, deviation, now_ms, residual_payload)
         self.last_target_inventory = target
         self.last_signal = BMeanReversionSignal(
             ema_fast=self.ema_fast,
             ema_slow=self.ema_slow,
+            mean_reference=self.last_mean_reference,
+            mean_reference_ema_component=self.last_mean_reference_ema_component,
+            mean_reference_synth_component=self.last_mean_reference_synth_component,
+            used_synthetic_reference=self.last_used_synthetic_reference,
             sigma=self.last_sigma,
             z_score=z,
+            deviation_ticks=deviation,
             target_inventory=target,
             regime_block_reason=self.last_block_reason,
         )
@@ -184,22 +219,46 @@ class BMeanReversionStrategy:
             "block_reason": self.last_block_reason,
             "b_meanrev_ema_fast": self.ema_fast,
             "b_meanrev_ema_slow": self.ema_slow,
+            "b_meanrev_mean_reference": self.last_mean_reference,
+            "b_meanrev_mean_reference_ema_component": self.last_mean_reference_ema_component,
+            "b_meanrev_mean_reference_synth_component": self.last_mean_reference_synth_component,
+            "b_meanrev_used_synthetic_reference": self.last_used_synthetic_reference,
             "b_meanrev_sigma": self.last_sigma,
             "b_meanrev_z": self.last_z_score,
+            "b_meanrev_deviation_ticks": self.last_deviation_ticks,
+            "b_meanrev_healthy_book_age_ms": (
+                None if self.healthy_book_since_ms is None else max(0, int(now_ms) - int(self.healthy_book_since_ms))
+            ),
+            "b_meanrev_last_bad_book_fill_age_ms": (
+                None if self.last_bad_book_fill_ms is None else max(0, int(now_ms) - int(self.last_bad_book_fill_ms))
+            ),
+            "b_meanrev_turn_confirmed": self._turn_confirmed(self.last_deviation_ticks, int(now_ms)),
             "b_meanrev_target_inventory": self.last_target_inventory,
             "b_meanrev_hold_ms": hold_ms,
             "b_meanrev_regime_block_reason": self.last_block_reason,
             "b_meanrev_risk_off_forced": self.last_risk_off_forced,
+            "b_meanrev_entry_style": self.last_entry_style,
         }
 
     def _target_and_mode(
         self,
         z: float,
+        deviation: float | None,
         now_ms: int,
         residual_payload: dict[str, Any] | None,
     ) -> tuple[int, str, str, str, bool]:
         abs_z = abs(z)
-        if abs_z >= float(self.config.meanrev_stop_z):
+        abs_deviation = abs(float(deviation or 0.0))
+        book_block = self._book_entry_block(now_ms)
+        if book_block is not None:
+            self.last_block_reason = book_block
+            return int(self.inventory), "OBSERVE_ONLY", "observe_only", book_block, False
+
+        risk_off = (
+            abs_z >= float(self.config.meanrev_stop_z)
+            or abs_deviation >= float(self.config.meanrev_risk_off_deviation_ticks)
+        )
+        if risk_off:
             self.last_block_reason = "b_meanrev_stop_z"
             force_exit = abs(int(self.inventory)) >= int(self.config.meanrev_max_position)
             self.last_risk_off_forced = force_exit
@@ -231,27 +290,34 @@ class BMeanReversionStrategy:
             self.last_block_reason = "b_meanrev_max_hold_elapsed"
             return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion max hold exit", bool(self.config.meanrev_aggressive_exit)
 
-        if abs_z <= float(self.config.meanrev_exit_z) and self.inventory != 0:
+        if abs_deviation <= float(self.config.meanrev_exit_ticks) and self.inventory != 0:
             return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean reverted inside exit band", False
 
-        book_block = self._book_entry_block()
-        if book_block is not None:
-            self.last_block_reason = book_block
-            if self.inventory != 0:
-                return 0, "B_MEANREV_EXIT", "mean_reversion_exit", f"{book_block}; reducing B mean-reversion inventory", False
-            return 0, "OBSERVE_ONLY", "observe_only", book_block, False
-
-        residual_block = self._residual_entry_block(z, residual_payload)
+        residual_block = self._residual_entry_block(deviation, residual_payload)
         if residual_block is not None:
             self.last_block_reason = residual_block
             if self.inventory != 0:
                 return 0, "B_MEANREV_EXIT", "mean_reversion_exit", f"{residual_block}; reducing B mean-reversion inventory", False
             return 0, "OBSERVE_ONLY", "observe_only", residual_block, False
 
-        if abs_z < float(self.config.meanrev_entry_z):
+        if self._recent_bad_fill_blocks_entry(now_ms):
+            self.last_block_reason = "b_meanrev_recent_bad_book_fill"
+            if self.inventory != 0:
+                return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "recent bad-book fill; reducing B inventory", False
+            return 0, "OBSERVE_ONLY", "observe_only", "recent bad-book fill cooldown", False
+
+        if abs_deviation < float(self.config.meanrev_entry_ticks):
             if self.inventory != 0:
                 return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion signal below entry; reducing", False
             return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion waiting for z-score entry", False
+
+        if (
+            self.inventory == 0
+            and abs_deviation < float(self.config.meanrev_extreme_entry_ticks)
+            and not self._turn_confirmed(deviation, now_ms)
+        ):
+            self.last_block_reason = "b_meanrev_waiting_for_turn_confirmation"
+            return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion waiting for turn confirmation", False
 
         if self.inventory == 0 and self.last_entry_ms is not None:
             cooldown_remaining = int(self.config.meanrev_cooldown_ms) - (int(now_ms) - int(self.last_entry_ms))
@@ -259,22 +325,43 @@ class BMeanReversionStrategy:
                 self.last_block_reason = "b_meanrev_entry_cooldown"
                 return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion entry cooldown", False
 
-        direction = -1 if z > 0 else 1
-        size = int(self.config.meanrev_max_position) if abs_z >= float(self.config.meanrev_entry_z2) else min(3, int(self.config.meanrev_max_position))
+        direction = -1 if float(deviation or 0.0) > 0 else 1
+        size = (
+            int(self.config.meanrev_full_target)
+            if abs_deviation >= float(self.config.meanrev_full_entry_ticks)
+            else int(self.config.meanrev_base_target)
+        )
         target = direction * max(0, min(int(self.config.meanrev_max_position), size))
-        aggressive = abs_z >= float(self.config.meanrev_aggressive_entry_z)
-        return target, "B_MEANREV_ENTRY", "mean_reversion_entry", "B mean-reversion z-score entry", aggressive
+        if abs_deviation >= float(self.config.meanrev_extreme_entry_ticks):
+            aggressive = True
+            entry_style = "extreme"
+            reason = "B mean-reversion extreme tick-deviation entry"
+        elif abs_deviation >= float(self.config.meanrev_full_entry_ticks):
+            aggressive = self.inventory == 0
+            entry_style = "full"
+            reason = "B mean-reversion full tick-deviation entry"
+        else:
+            aggressive = False
+            entry_style = "normal"
+            reason = "B mean-reversion tick-deviation entry"
+        self.last_entry_style = entry_style
+        return target, "B_MEANREV_ENTRY", "mean_reversion_entry", reason, aggressive
 
-    def _book_entry_block(self) -> str | None:
+    def _book_entry_block(self, now_ms: int) -> str | None:
         if self.book.best_bid is None or self.book.best_ask is None or self.book.spread is None:
             return "missing_b_book"
         if int(self.book.spread) <= 0:
             return "b_meanrev_book_crossed_or_locked"
         if int(self.book.spread) < int(self.config.meanrev_min_spread_ticks):
             return "b_meanrev_book_too_tight"
+        if self.healthy_book_since_ms is None:
+            return "b_meanrev_waiting_for_healthy_book"
+        healthy_age = int(now_ms) - int(self.healthy_book_since_ms)
+        if healthy_age < int(self.config.meanrev_min_healthy_book_age_ms):
+            return "b_meanrev_waiting_for_healthy_book"
         return None
 
-    def _residual_entry_block(self, z: float, residual_payload: dict[str, Any] | None) -> str | None:
+    def _residual_entry_block(self, deviation: float | None, residual_payload: dict[str, Any] | None) -> str | None:
         if residual_payload is None:
             return None
         dispersion = residual_payload.get("synthetic_dispersion")
@@ -283,7 +370,8 @@ class BMeanReversionStrategy:
         basis = residual_payload.get("composite_basis")
         if basis is not None:
             basis_value = float(basis)
-            if abs(basis_value) >= float(self.config.basis_strong_threshold_ticks) and (basis_value > 0) == (z > 0):
+            deviation_sign = 1 if float(deviation or 0.0) > 0 else (-1 if float(deviation or 0.0) < 0 else 0)
+            if deviation_sign != 0 and abs(basis_value) >= float(self.config.basis_strong_threshold_ticks) and (basis_value > 0) == (deviation_sign > 0):
                 return "b_meanrev_synthetic_confirms_deviation"
         return None
 
@@ -332,15 +420,20 @@ class BMeanReversionStrategy:
         self.last_signal = BMeanReversionSignal(
             ema_fast=self.ema_fast,
             ema_slow=self.ema_slow,
+            mean_reference=self.last_mean_reference,
+            mean_reference_ema_component=self.last_mean_reference_ema_component,
+            mean_reference_synth_component=self.last_mean_reference_synth_component,
+            used_synthetic_reference=self.last_used_synthetic_reference,
             sigma=self.last_sigma,
             z_score=self.last_z_score,
+            deviation_ticks=self.last_deviation_ticks,
             target_inventory=0,
             regime_block_reason=reason,
         )
         return QuotePlan("OBSERVE_ONLY", None, None, (), True, reason)
 
-    def _current_z(self) -> float | None:
-        if self.book.mid is None or self.ema_slow is None:
+    def _current_z(self, mean_reference: float | None) -> float | None:
+        if self.book.mid is None or mean_reference is None:
             self.last_z_score = None
             return None
         sigma = max(float(self.config.meanrev_sigma_floor), float(self.last_sigma or 0.0))
@@ -348,8 +441,42 @@ class BMeanReversionStrategy:
             self.last_z_score = None
             return None
         self.last_sigma = sigma
-        self.last_z_score = (float(self.book.mid) - float(self.ema_slow)) / sigma
+        self.last_z_score = (float(self.book.mid) - float(mean_reference)) / sigma
         return self.last_z_score
+
+    def _current_deviation(self, mean_reference: float | None) -> float | None:
+        if self.book.mid is None or mean_reference is None:
+            self.last_deviation_ticks = None
+            return None
+        self.last_deviation_ticks = float(self.book.mid) - float(mean_reference)
+        return self.last_deviation_ticks
+
+    def _compute_mean_reference(self, residual_payload: dict[str, Any] | None) -> float | None:
+        self.last_mean_reference = self.ema_slow
+        self.last_mean_reference_ema_component = self.ema_slow
+        self.last_mean_reference_synth_component = None
+        self.last_used_synthetic_reference = False
+        if self.ema_slow is None:
+            return None
+        if residual_payload is None:
+            return self.ema_slow
+        synthetic = residual_payload.get("composite_synthetic_fair")
+        dispersion = residual_payload.get("synthetic_dispersion")
+        basis = residual_payload.get("composite_basis")
+        if (
+            synthetic is not None
+            and dispersion is not None
+            and float(dispersion) <= float(self.config.max_synthetic_dispersion)
+            and abs(float(basis or 0.0)) <= 6.0
+        ):
+            synth_value = float(synthetic)
+            ema_component = 0.65 * float(self.ema_slow)
+            synth_component = 0.35 * synth_value
+            self.last_mean_reference_ema_component = ema_component
+            self.last_mean_reference_synth_component = synth_component
+            self.last_mean_reference = ema_component + synth_component
+            self.last_used_synthetic_reference = True
+        return self.last_mean_reference
 
     def _update_ema_state(self, mid: float, now_ms: int) -> None:
         if self.last_update_ms is None or self.last_mid is None:
@@ -360,20 +487,41 @@ class BMeanReversionStrategy:
             self.last_mid = mid
             self.last_update_ms = int(now_ms)
             self.last_z_score = 0.0
+            self.last_deviation_ticks = 0.0
+            self.last_abs_deviation = 0.0
+            self.last_deviation_sign = 0
+            self.last_extension_ms = int(now_ms)
             return
 
         elapsed = max(1, int(now_ms) - int(self.last_update_ms))
         fast_alpha = 1.0 - exp(-elapsed / max(1.0, float(self.config.meanrev_ema_fast_ms)))
         slow_alpha = 1.0 - exp(-elapsed / max(1.0, float(self.config.meanrev_ema_slow_ms)))
         vol_alpha = 1.0 - exp(-elapsed / max(1.0, float(self.config.meanrev_vol_ewma_ms)))
+        prior_ema_fast = self.ema_fast
         self.ema_fast = mid if self.ema_fast is None else (fast_alpha * mid) + ((1.0 - fast_alpha) * self.ema_fast)
         self.ema_slow = mid if self.ema_slow is None else (slow_alpha * mid) + ((1.0 - slow_alpha) * self.ema_slow)
+        self.last_fast_slope = None if prior_ema_fast is None else float(self.ema_fast) - float(prior_ema_fast)
         ret = mid - float(self.last_mid)
         prior_var = float(self.ewma_var if self.ewma_var is not None else float(self.config.meanrev_sigma_floor) ** 2)
         self.ewma_var = max(0.0, (vol_alpha * ret * ret) + ((1.0 - vol_alpha) * prior_var))
         self.last_sigma = self.ewma_var ** 0.5
         self.last_mid = mid
         self.last_update_ms = int(now_ms)
+        deviation = None if self.ema_slow is None else float(mid) - float(self.ema_slow)
+        if deviation is not None:
+            sign = 1 if deviation > 0 else (-1 if deviation < 0 else 0)
+            abs_deviation = abs(deviation)
+            extending = (
+                sign != 0
+                and sign == self.last_deviation_sign
+                and self.last_abs_deviation is not None
+                and abs_deviation > float(self.last_abs_deviation) + 0.25
+            )
+            if sign != self.last_deviation_sign or extending or self.last_extension_ms is None:
+                self.last_extension_ms = int(now_ms)
+            self.last_deviation_sign = sign
+            self.last_abs_deviation = abs_deviation
+            self.last_deviation_ticks = deviation
 
     def _allowed_sizes(self) -> tuple[int, int]:
         buy_exposure = self.order_manager.buy_exposure()
@@ -397,6 +545,49 @@ class BMeanReversionStrategy:
             if previous_inventory != 0:
                 self.last_entry_ms = int(now_ms)
             self.position_entry_ms = None
+
+    def _book_is_healthy(self) -> bool:
+        return (
+            self.book.best_bid is not None
+            and self.book.best_ask is not None
+            and self.book.spread is not None
+            and int(self.book.spread) >= int(self.config.meanrev_min_spread_ticks)
+        )
+
+    def _book_is_bad(self) -> bool:
+        return (
+            self.book.best_bid is None
+            or self.book.best_ask is None
+            or self.book.spread is None
+            or int(self.book.spread) <= 1
+        )
+
+    def should_force_bad_book_cancel(self) -> bool:
+        if not self._book_is_bad():
+            return False
+        for side in ("BUY", "SELL"):
+            order = self.order_manager.live_order(side)  # type: ignore[arg-type]
+            if order is not None and not order.cancel_pending:
+                return True
+        return False
+
+    def _recent_bad_fill_blocks_entry(self, now_ms: int) -> bool:
+        return (
+            self.last_bad_book_fill_ms is not None
+            and int(now_ms) - int(self.last_bad_book_fill_ms) < int(self.config.meanrev_bad_fill_cooldown_ms)
+        )
+
+    def _turn_confirmed(self, deviation: float | None, now_ms: int) -> bool:
+        if deviation is None:
+            return False
+        sign = 1 if deviation > 0 else (-1 if deviation < 0 else 0)
+        if sign == 0:
+            return True
+        if self.last_fast_slope is not None and (float(self.last_fast_slope) * sign) <= 0:
+            return True
+        if self.last_extension_ms is None:
+            return False
+        return int(now_ms) - int(self.last_extension_ms) >= int(self.config.meanrev_turn_confirm_ms)
 
     @staticmethod
     def _now_ms() -> int:

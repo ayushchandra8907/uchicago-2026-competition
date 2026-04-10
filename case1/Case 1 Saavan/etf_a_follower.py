@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import time
 from typing import Any
@@ -23,6 +24,14 @@ class ETFASignal:
     source_target_inventory: int | None
     target_from_a_position: int | None
     source_direction: int
+
+
+@dataclass
+class ETFEntryDiagnostics:
+    order_attempt_count: int = 0
+    first_order_attempt_ms: int | None = None
+    first_fill_ms: int | None = None
+    terminal_reason: str | None = None
 
 
 class ETFAFollowerStrategy:
@@ -51,11 +60,17 @@ class ETFAFollowerStrategy:
         self.last_block_reason: str | None = None
         self.unwind_reason: str | None = None
         self.last_fill_ms: int | None = None
+        self.entry_diagnostics: dict[str, ETFEntryDiagnostics] = {}
+        self._top_of_book_change_ms: deque[int] = deque()
+        self._last_top_of_book: tuple[int | None, int | None, int | None, int | None] | None = None
+        self._stable_book_since_ms: int | None = None
+        self._churn_guard_reason: str | None = None
 
     def on_book_update_at(self, symbol: str, book, now_ms: int) -> bool:
         if symbol != self.symbol:
             return False
         self.book = BookSnapshot.from_order_book(book, depth_levels=self.book_depth_levels)
+        self._update_churn_guard(now_ms=int(now_ms))
         return True
 
     def on_market_trade(self, price: int, qty: int, now_ms: int | None = None) -> None:
@@ -99,6 +114,10 @@ class ETFAFollowerStrategy:
         self.last_trade_qty = int(qty)
         self.last_trade_ms = self._now_ms() if now_ms is None else int(now_ms)
         self.last_fill_ms = self.last_trade_ms
+        if self.active_signal is not None:
+            diag = self.entry_diagnostics.setdefault(self.active_signal.signal_id, ETFEntryDiagnostics())
+            if order.action_class == "etf_shock_take" and diag.first_fill_ms is None:
+                diag.first_fill_ms = self.last_fill_ms
         return order
 
     def on_cancel_response(self, order_id: str, success: bool) -> Any | None:
@@ -182,6 +201,7 @@ class ETFAFollowerStrategy:
             source_direction=direction,
         )
         self.active_signal = signal
+        self.entry_diagnostics[signal.signal_id] = ETFEntryDiagnostics()
         self.mode = "ETF_A_SHOCK"
         self.last_block_reason = None
         self.unwind_reason = None
@@ -192,18 +212,29 @@ class ETFAFollowerStrategy:
         if signal is None:
             self.mode = "ETF_OBSERVE_ONLY"
             return QuotePlan(self.mode, None, None, (), True, "waiting_for_a_shock_signal")
+        diag = self.entry_diagnostics.setdefault(signal.signal_id, ETFEntryDiagnostics())
+        elapsed_ms = int(now_ms) - int(signal.started_ms)
+        active_guard_reason = self._active_entry_guard_reason(now_ms)
+        if diag.first_fill_ms is None and self.inventory == 0 and elapsed_ms >= int(self.config.entry_retry_window_ms):
+            diag.terminal_reason = active_guard_reason or "etf_entry_retry_window_expired"
+            self.last_block_reason = diag.terminal_reason
+            self.active_signal = None
+            self.mode = "ETF_OBSERVE_ONLY"
+            return QuotePlan(self.mode, None, None, (), True, diag.terminal_reason)
         if self.book.best_bid is None or self.book.best_ask is None or self.book.mid is None or self.book.spread is None:
+            self.mode = "ETF_CHURN_GUARD"
             self.last_block_reason = "missing_etf_book"
-            return QuotePlan("ETF_OBSERVE_ONLY", None, None, (), True, "missing_etf_book")
-        if int(self.book.spread) <= 0:
-            self.last_block_reason = "etf_book_crossed_or_locked"
-            return QuotePlan("ETF_OBSERVE_ONLY", None, None, (), True, "etf_book_crossed_or_locked")
+            return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, "missing_etf_book")
+        if active_guard_reason is not None:
+            self.mode = "ETF_CHURN_GUARD"
+            self.last_block_reason = active_guard_reason
+            return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
         if int(self.book.spread) < max(1, int(self.config.min_book_spread_ticks)):
             self.last_block_reason = "etf_book_too_tight_or_crossed"
             return self._unwind_plan(now_ms, reason="etf_book_too_tight_or_crossed", allow_only_if_flat=False)
 
-        elapsed_ms = int(now_ms) - int(signal.started_ms)
         if self.mode == "ETF_A_SHOCK" and self._target_reached(signal):
+            diag.terminal_reason = "etf_target_reached"
             self.mode = "ETF_A_HOLD"
 
         if self.mode in {"ETF_A_SHOCK", "ETF_A_HOLD"}:
@@ -225,6 +256,7 @@ class ETFAFollowerStrategy:
 
     def trace_state(self, now_ms: int) -> dict[str, Any]:
         signal = self.active_signal
+        diag = None if signal is None else self.entry_diagnostics.get(signal.signal_id)
         return {
             "symbol": self.symbol,
             "market_key": "ETF",
@@ -268,6 +300,24 @@ class ETFAFollowerStrategy:
             "etf_target_from_a_position": None if signal is None else signal.target_from_a_position,
             "etf_source_direction": None if signal is None else signal.source_direction,
             "etf_unwind_reason": self.unwind_reason,
+            "etf_entry_order_attempt_count": None if diag is None else diag.order_attempt_count,
+            "etf_first_order_attempt_latency_ms": (
+                None
+                if signal is None or diag is None or diag.first_order_attempt_ms is None
+                else int(diag.first_order_attempt_ms) - int(signal.started_ms)
+            ),
+            "etf_first_fill_latency_ms": (
+                None
+                if signal is None or diag is None or diag.first_fill_ms is None
+                else int(diag.first_fill_ms) - int(signal.started_ms)
+            ),
+            "etf_missed_entry_terminal_reason": None if diag is None else diag.terminal_reason,
+            "etf_churn_guard_reason": self._churn_guard_reason,
+            "etf_churn_guard_active": self._active_entry_guard_reason(now_ms) is not None,
+            "etf_book_change_count_250ms": len(self._top_of_book_change_ms),
+            "etf_stable_book_age_ms": (
+                None if self._stable_book_since_ms is None else max(0, int(now_ms) - int(self._stable_book_since_ms))
+            ),
             "block_reason": self.last_block_reason,
         }
 
@@ -297,9 +347,16 @@ class ETFAFollowerStrategy:
         assert self.book.best_bid is not None and self.book.best_ask is not None
         edge = signal.target_fair - float(self.book.best_ask.px) if side == "BUY" else float(self.book.best_bid.px) - signal.target_fair
         if edge < max(0, int(self.config.min_projected_edge_ticks)):
+            self.last_block_reason = "etf_edge_below_entry_threshold"
             return QuotePlan("ETF_A_SHOCK", None, None, (), True, "etf_edge_below_entry_threshold")
         qty = min(abs(desired_delta), max(1, int(self.config.quote_size)))
         px = self.book.best_ask.px if side == "BUY" else self.book.best_bid.px
+        diag = self.entry_diagnostics.setdefault(signal.signal_id, ETFEntryDiagnostics())
+        if diag.first_order_attempt_ms is None:
+            diag.first_order_attempt_ms = int(now_ms)
+        diag.order_attempt_count += 1
+        elapsed_ms = int(now_ms) - int(signal.started_ms)
+        aggressive = diag.first_fill_ms is None or elapsed_ms <= int(self.config.entry_force_aggressive_ms)
         order = self._desired(
             side,
             px,
@@ -307,11 +364,15 @@ class ETFAFollowerStrategy:
             reason=f"following A {signal.source_kind} shock with alpha {signal.alpha:.2f}",
             signal_id=signal.signal_id,
             action_class="etf_shock_take",
+            aggressive=aggressive,
         )
         return QuotePlan("ETF_A_SHOCK", None, None, (order,), False, order.reason)
 
     def _unwind_plan(self, now_ms: int, *, reason: str, allow_only_if_flat: bool = True) -> QuotePlan:
         if self.inventory == 0:
+            if self.active_signal is not None:
+                diag = self.entry_diagnostics.setdefault(self.active_signal.signal_id, ETFEntryDiagnostics())
+                diag.terminal_reason = reason
             self.active_signal = None
             self.mode = "ETF_OBSERVE_ONLY"
             return QuotePlan(self.mode, None, None, (), True, "etf_a_follower_flat")
@@ -371,13 +432,23 @@ class ETFAFollowerStrategy:
         alpha = float(self.config.alpha_from_a if value is None else value)
         return min(float(self.config.alpha_max), max(0.0, alpha))
 
-    def _desired(self, side: str, px: int, qty: int, reason: str, *, signal_id: str, action_class: str) -> DesiredOrder:
+    def _desired(
+        self,
+        side: str,
+        px: int,
+        qty: int,
+        reason: str,
+        *,
+        signal_id: str,
+        action_class: str,
+        aggressive: bool = False,
+    ) -> DesiredOrder:
         return DesiredOrder(
             side=side,  # type: ignore[arg-type]
             px=int(px),
             qty=int(qty),
             overlay="news",
-            aggressive=False,
+            aggressive=bool(aggressive),
             reason=reason,
             intent="etf_a_follower",
             mode_at_submit=self.mode,
@@ -394,3 +465,50 @@ class ETFAFollowerStrategy:
     @staticmethod
     def _now_ms() -> int:
         return int(time.monotonic() * 1000)
+
+    def _update_churn_guard(self, *, now_ms: int) -> None:
+        top_of_book = (
+            None if self.book.best_bid is None else int(self.book.best_bid.px),
+            None if self.book.best_bid is None else int(self.book.best_bid.qty),
+            None if self.book.best_ask is None else int(self.book.best_ask.px),
+            None if self.book.best_ask is None else int(self.book.best_ask.qty),
+        )
+        if self._last_top_of_book != top_of_book:
+            self._top_of_book_change_ms.append(int(now_ms))
+            self._last_top_of_book = top_of_book
+        churn_window_ms = max(1, int(self.config.churn_window_ms))
+        while self._top_of_book_change_ms and int(now_ms) - int(self._top_of_book_change_ms[0]) > churn_window_ms:
+            self._top_of_book_change_ms.popleft()
+
+        valid_book = (
+            self.book.best_bid is not None
+            and self.book.best_ask is not None
+            and self.book.spread is not None
+            and int(self.book.spread) > 0
+        )
+        churn_active = len(self._top_of_book_change_ms) > int(self.config.churn_max_top_of_book_updates)
+        if not valid_book:
+            self._churn_guard_reason = "crossed_or_locked_etf_book"
+            self._stable_book_since_ms = None
+            return
+        if churn_active:
+            self._churn_guard_reason = "etf_quote_churn_guard"
+            self._stable_book_since_ms = None
+            return
+        if self._churn_guard_reason is not None:
+            if self._stable_book_since_ms is None:
+                self._stable_book_since_ms = int(now_ms)
+            elif int(now_ms) - int(self._stable_book_since_ms) >= int(self.config.churn_resume_stable_ms):
+                self._churn_guard_reason = None
+        else:
+            self._stable_book_since_ms = int(now_ms)
+
+    def _active_entry_guard_reason(self, now_ms: int) -> str | None:
+        if self._churn_guard_reason is None:
+            return None
+        if self._stable_book_since_ms is None:
+            return self._churn_guard_reason
+        stable_age = int(now_ms) - int(self._stable_book_since_ms)
+        if stable_age < int(self.config.churn_resume_stable_ms):
+            return self._churn_guard_reason
+        return None

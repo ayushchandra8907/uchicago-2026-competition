@@ -809,8 +809,12 @@ class MarketABot(XChangeClient):
 
         now_ms = self._now_ms()
         self.b_observer.on_book_update(symbol, self.order_books[symbol], now_ms=now_ms)
+        force_b_eval = False
         if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
             self.b_strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
+            force_b_eval = bool(
+                getattr(self.b_strategy, "should_force_bad_book_cancel", lambda: False)()
+            )
         if self.b_option_strategy is not None:
             self.b_option_strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
         if self.tracer is not None:
@@ -828,7 +832,7 @@ class MarketABot(XChangeClient):
             )
             self._record_b_signal(now_ms)
         if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
-            await self._evaluate_and_sync_b(f"book update:{symbol}")
+            await self._evaluate_and_sync_b(f"book update:{symbol}", force=force_b_eval)
         if self.b_option_strategy is not None:
             option_symbols = self.config.market_b.option_symbols if symbol == self.config.market_b.underlying_symbol else (symbol,)
             await self._evaluate_and_sync_b_options(f"book update:{symbol}", symbols=option_symbols)
@@ -1441,11 +1445,30 @@ class MarketABot(XChangeClient):
         ):
             return
         now_ms = self._now_ms()
-        min_interval = max(0, int(self.config.etf.min_eval_interval_ms))
+        pending_etf_entry = (
+            self.etf_strategy.active_signal is not None
+            and self.etf_strategy.inventory == 0
+            and self.etf_strategy.entry_diagnostics.get(self.etf_strategy.active_signal.signal_id) is not None
+            and self.etf_strategy.entry_diagnostics[self.etf_strategy.active_signal.signal_id].first_fill_ms is None
+        )
+        min_interval = max(
+            0,
+            int(self.config.etf.entry_retry_reprice_ms if pending_etf_entry else self.config.etf.min_eval_interval_ms),
+        )
         if not force and self._last_etf_eval_ms is not None and now_ms - self._last_etf_eval_ms < min_interval:
             return
         async with self._quote_lock:
             now_ms = self._now_ms()
+            pending_etf_entry = (
+                self.etf_strategy.active_signal is not None
+                and self.etf_strategy.inventory == 0
+                and self.etf_strategy.entry_diagnostics.get(self.etf_strategy.active_signal.signal_id) is not None
+                and self.etf_strategy.entry_diagnostics[self.etf_strategy.active_signal.signal_id].first_fill_ms is None
+            )
+            min_interval = max(
+                0,
+                int(self.config.etf.entry_retry_reprice_ms if pending_etf_entry else self.config.etf.min_eval_interval_ms),
+            )
             if not force and self._last_etf_eval_ms is not None and now_ms - self._last_etf_eval_ms < min_interval:
                 return
             self._last_etf_eval_ms = now_ms

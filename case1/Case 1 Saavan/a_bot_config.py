@@ -161,8 +161,8 @@ class BConfig:
     mm_min_healthy_book_age_ms: int = 500
     mm_cancel_on_bad_book: bool = True
     mm_bad_fill_cooldown_ms: int = 750
-    meanrev_max_position: int = 8
-    meanrev_quote_size: int = 1
+    meanrev_max_position: int = 16
+    meanrev_quote_size: int = 2
     meanrev_ema_fast_ms: int = 30_000
     meanrev_ema_slow_ms: int = 180_000
     meanrev_vol_ewma_ms: int = 60_000
@@ -176,6 +176,16 @@ class BConfig:
     meanrev_cooldown_ms: int = 1_500
     meanrev_aggressive_entry_z: float = 2.75
     meanrev_aggressive_exit: bool = True
+    meanrev_entry_ticks: int = 10
+    meanrev_full_entry_ticks: int = 15
+    meanrev_exit_ticks: int = 3
+    meanrev_base_target: int = 6
+    meanrev_full_target: int = 16
+    meanrev_extreme_entry_ticks: int = 20
+    meanrev_risk_off_deviation_ticks: int = 35
+    meanrev_turn_confirm_ms: int = 300
+    meanrev_min_healthy_book_age_ms: int = 500
+    meanrev_bad_fill_cooldown_ms: int = 1_000
     basis_entry_threshold_ticks: float = 1.25
     basis_strong_threshold_ticks: float = 2.5
     imbalance_confirmation_threshold: float = 0.15
@@ -195,6 +205,8 @@ class BConfig:
     option_lottery_atm_max_position: int = 40
     option_lottery_total_premium_budget: int = 1_500
     option_lottery_wing_premium_budget: int = 600
+    option_lottery_c1050_premium_budget: int = 450
+    option_lottery_p950_premium_budget: int = 450
     option_lottery_atm_total_premium_budget: int = 300
     option_lottery_near_strike_ticks: int = 80
     option_lottery_min_momentum_ticks: float = 1.0
@@ -246,6 +258,12 @@ class ETFConfig:
     reprice_threshold_ticks: int = 2
     min_eval_interval_ms: int = 100
     unwind_reprice_threshold_ticks: int = 8
+    entry_retry_window_ms: int = 1_500
+    entry_force_aggressive_ms: int = 250
+    entry_retry_reprice_ms: int = 125
+    churn_window_ms: int = 250
+    churn_max_top_of_book_updates: int = 25
+    churn_resume_stable_ms: int = 500
 
 
 @dataclass(frozen=True)
@@ -543,8 +561,8 @@ def load_bot_config(
             mm_min_healthy_book_age_ms=_optional_int("B_MM_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
             mm_cancel_on_bad_book=_optional_bool("B_MM_CANCEL_ON_BAD_BOOK", True),
             mm_bad_fill_cooldown_ms=_optional_int("B_MM_BAD_FILL_COOLDOWN_MS", 750) or 750,
-            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 8) or 8,
-            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 1) or 1,
+            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 16) or 16,
+            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 2) or 2,
             meanrev_ema_fast_ms=_optional_int("B_MEANREV_EMA_FAST_MS", 30_000) or 30_000,
             meanrev_ema_slow_ms=_optional_int("B_MEANREV_EMA_SLOW_MS", 180_000) or 180_000,
             meanrev_vol_ewma_ms=_optional_int("B_MEANREV_VOL_EWMA_MS", 60_000) or 60_000,
@@ -558,6 +576,16 @@ def load_bot_config(
             meanrev_cooldown_ms=_optional_int("B_MEANREV_COOLDOWN_MS", 1_500) or 1_500,
             meanrev_aggressive_entry_z=_optional_float("B_MEANREV_AGGRESSIVE_ENTRY_Z", 2.75) or 2.75,
             meanrev_aggressive_exit=_optional_bool("B_MEANREV_AGGRESSIVE_EXIT", True),
+            meanrev_entry_ticks=_optional_int("B_MEANREV_ENTRY_TICKS", 10) or 10,
+            meanrev_full_entry_ticks=_optional_int("B_MEANREV_FULL_ENTRY_TICKS", 15) or 15,
+            meanrev_exit_ticks=_optional_int("B_MEANREV_EXIT_TICKS", 3) or 3,
+            meanrev_base_target=_optional_int("B_MEANREV_BASE_TARGET", 6) or 6,
+            meanrev_full_target=_optional_int("B_MEANREV_FULL_TARGET", 16) or 16,
+            meanrev_extreme_entry_ticks=_optional_int("B_MEANREV_EXTREME_ENTRY_TICKS", 20) or 20,
+            meanrev_risk_off_deviation_ticks=_optional_int("B_MEANREV_RISK_OFF_DEVIATION_TICKS", 35) or 35,
+            meanrev_turn_confirm_ms=_optional_int("B_MEANREV_TURN_CONFIRM_MS", 300) or 300,
+            meanrev_min_healthy_book_age_ms=_optional_int("B_MEANREV_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
+            meanrev_bad_fill_cooldown_ms=_optional_int("B_MEANREV_BAD_FILL_COOLDOWN_MS", 1_000) or 1_000,
             basis_entry_threshold_ticks=_optional_float("B_BASIS_ENTRY_THRESHOLD_TICKS", 1.25) or 1.25,
             basis_strong_threshold_ticks=_optional_float("B_BASIS_STRONG_THRESHOLD_TICKS", 2.5) or 2.5,
             imbalance_confirmation_threshold=_optional_float("B_IMBALANCE_CONFIRMATION_THRESHOLD", 0.15) or 0.15,
@@ -577,6 +605,8 @@ def load_bot_config(
             option_lottery_atm_max_position=_optional_int("B_OPTION_LOTTERY_ATM_MAX_POSITION", 40) or 40,
             option_lottery_total_premium_budget=_optional_int("B_OPTION_LOTTERY_TOTAL_PREMIUM_BUDGET", 1_500) or 1_500,
             option_lottery_wing_premium_budget=_optional_int("B_OPTION_LOTTERY_WING_PREMIUM_BUDGET", 600) or 600,
+            option_lottery_c1050_premium_budget=_optional_int("B_OPTION_C1050_PREMIUM_BUDGET", 450) or 450,
+            option_lottery_p950_premium_budget=_optional_int("B_OPTION_P950_PREMIUM_BUDGET", 450) or 450,
             option_lottery_atm_total_premium_budget=_optional_int("B_OPTION_LOTTERY_ATM_TOTAL_PREMIUM_BUDGET", 300) or 300,
             option_lottery_near_strike_ticks=_optional_int("B_OPTION_LOTTERY_NEAR_STRIKE_TICKS", 80) or 80,
             option_lottery_min_momentum_ticks=_optional_float("B_OPTION_LOTTERY_MIN_MOMENTUM_TICKS", 1.0) or 1.0,
@@ -622,6 +652,12 @@ def load_bot_config(
             reprice_threshold_ticks=_optional_int("ETF_REPRICE_THRESHOLD_TICKS", 2) or 2,
             min_eval_interval_ms=_optional_int("ETF_MIN_EVAL_INTERVAL_MS", 100) or 100,
             unwind_reprice_threshold_ticks=_optional_int("ETF_UNWIND_REPRICE_THRESHOLD_TICKS", 8) or 8,
+            entry_retry_window_ms=_optional_int("ETF_ENTRY_RETRY_WINDOW_MS", 1_500) or 1_500,
+            entry_force_aggressive_ms=_optional_int("ETF_ENTRY_FORCE_AGGRESSIVE_MS", 250) or 250,
+            entry_retry_reprice_ms=_optional_int("ETF_ENTRY_RETRY_REPRICE_MS", 125) or 125,
+            churn_window_ms=_optional_int("ETF_CHURN_WINDOW_MS", 250) or 250,
+            churn_max_top_of_book_updates=_optional_int("ETF_CHURN_MAX_TOP_OF_BOOK_UPDATES", 25) or 25,
+            churn_resume_stable_ms=_optional_int("ETF_CHURN_RESUME_STABLE_MS", 500) or 500,
         ),
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
