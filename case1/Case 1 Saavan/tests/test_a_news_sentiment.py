@@ -44,3 +44,18 @@ class ANewsSentimentParityTests(unittest.TestCase):
                 self.assertEqual(ours.unknown_candidate_phrases, ayush.unknown_candidate_phrases)
                 self.assertEqual(ours.unknown_candidate_unigrams, ayush.unknown_candidate_unigrams)
                 self.assertEqual(ours.unknown_candidate_bigrams, ayush.unknown_candidate_bigrams)
+
+    def test_restored_scorer_matches_ayush_for_recent_review_headlines(self) -> None:
+        headlines = [
+            "International markets continue to drag down A's financials.",
+            "An innovative virtual reality platform is successfully launched by A.",
+            "Significant expansion is reported by A in its subscription-based revenue streams.",
+        ]
+
+        for headline in headlines:
+            with self.subTest(headline=headline):
+                ours = score_a_unstructured_headline(headline)
+                ayush = ayush_score_a_unstructured_headline(headline)
+                self.assertEqual(ours.score, ayush.score)
+                self.assertEqual(ours.bucket, ayush.bucket)
+                self.assertEqual(ours.direction, ayush.direction)

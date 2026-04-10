@@ -141,10 +141,38 @@ def print_summary(summary: dict) -> None:
     for reason, count in (summary.get("b_strategy_block_reasons") or {}).items():
         print(f"  {reason}: {count}")
     print("")
+    print("B option lottery summary:")
+    option_summary = summary.get("b_option_lottery_summary") or {}
+    print(f"  premium_spent: {option_summary.get('premium_spent')}")
+    print(f"  premium_recovered: {option_summary.get('premium_recovered')}")
+    print(f"  mtm_pnl: {option_summary.get('mtm_pnl')}")
+    for symbol, stats in (option_summary.get("by_symbol") or {}).items():
+        print(f"  {symbol}: {stats}")
+    print("")
+    print("ETF A-shock calibration:")
+    etf_calibration = summary.get("etf_a_shock_calibration") or {}
+    print(f"  signal_count: {etf_calibration.get('signal_count', 0)}")
+    print(f"  by_horizon_ms: {etf_calibration.get('by_horizon_ms')}")
+    print(f"  by_source_kind: {etf_calibration.get('by_source_kind')}")
+    print(f"  candidate_alpha_evaluation: {etf_calibration.get('candidate_alpha_evaluation')}")
+    print("")
+    print("ETF episode summaries:")
+    for row in summary.get("etf_episode_summaries") or []:
+        print(
+            f"  {row.get('signal_id')}: target={row.get('target_inventory')} "
+            f"entry_qty={row.get('entry_qty')} unwind_qty={row.get('unwind_qty')} "
+            f"peak={row.get('peak_inventory')} pnl={row.get('episode_pnl')} "
+            f"unwind={row.get('unwind_reason')}"
+        )
+    print("")
     print("Trace volume summary:")
     volume = summary.get("trace_volume_summary") or {}
     print(f"  event_counts: {volume.get('event_counts')}")
     print(f"  symbol_counts: {volume.get('symbol_counts')}")
+    print("")
+    print("Inventory divergence summary:")
+    for symbol, stats in (summary.get("inventory_divergence_summary") or {}).items():
+        print(f"  {symbol}: {stats}")
 
 
 def main() -> None:

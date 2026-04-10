@@ -26,6 +26,33 @@ class _FakeCall:
         return True
 
 
+class _FakeBObserver:
+    symbols = {"B", "B_C_1000"}
+
+    def __init__(self) -> None:
+        self.book_updates: list[str] = []
+        self.trades: list[str] = []
+
+    def on_book_update(self, symbol, book, *, now_ms=None) -> None:
+        self.book_updates.append(symbol)
+
+    def on_market_trade(self, symbol, price, qty, *, now_ms=None) -> None:
+        self.trades.append(symbol)
+
+
+class _FakeBStrategy:
+    def __init__(self) -> None:
+        self.book_updates: list[str] = []
+        self.trades: list[str] = []
+
+    def on_book_update_at(self, symbol, book, now_ms) -> bool:
+        self.book_updates.append(symbol)
+        return True
+
+    def on_market_trade(self, price, qty, *, now_ms=None) -> None:
+        self.trades.append("B")
+
+
 @unittest.skipIf(MarketABot is None, "runtime exchange dependencies are unavailable in this test environment")
 class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
     def make_bot(
@@ -54,6 +81,8 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         bot._shutdown = asyncio.Event()
         bot.call = _FakeCall()
         bot.tracer = None
+        bot.b_option_strategy = None
+        bot.etf_strategy = None
         return bot
 
     async def test_followup_position_snapshot_requests_clean_auto_stop(self) -> None:
@@ -108,3 +137,34 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bot._shutdown.is_set())
         self.assertEqual(bot._shutdown_note, "round_complete_auto_stop:settlement_payout")
         self.assertEqual(bot.call.cancel_count, 1)
+
+    async def test_b_option_updates_refresh_observer_without_repricing_live_quotes(self) -> None:
+        bot = MarketABot.__new__(MarketABot)
+        bot.config = SimpleNamespace(
+            market_b=SimpleNamespace(enabled=True, underlying_symbol="B"),
+        )
+        bot.b_observer = _FakeBObserver()
+        bot.b_strategy = _FakeBStrategy()
+        bot.b_option_strategy = None
+        bot.etf_strategy = None
+        bot.order_books = {"B": object(), "B_C_1000": object()}
+        bot.tracer = None
+        bot._now_ms = lambda: 1_000
+        eval_reasons: list[str] = []
+
+        async def fake_eval(reason: str, *, force: bool = False) -> None:
+            eval_reasons.append(reason)
+
+        bot._evaluate_and_sync_b = fake_eval
+
+        await bot.bot_handle_book_update("B_C_1000")
+        await bot.bot_handle_trade_msg("B_C_1000", 10, 1)
+        self.assertEqual(eval_reasons, [])
+        self.assertEqual(bot.b_observer.book_updates, ["B_C_1000"])
+        self.assertEqual(bot.b_observer.trades, ["B_C_1000"])
+        self.assertEqual(bot.b_strategy.book_updates, [])
+        self.assertEqual(bot.b_strategy.trades, [])
+
+        await bot.bot_handle_book_update("B")
+        await bot.bot_handle_trade_msg("B", 1000, 1)
+        self.assertEqual(eval_reasons, ["book update:B", "market trade:B"])
