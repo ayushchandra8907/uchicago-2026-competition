@@ -215,6 +215,98 @@ class TraceTests(unittest.TestCase):
             self.assertIn("runtime_reconnect_attempt", event_types)
             self.assertIn("runtime_reconnect_succeeded", event_types)
 
+    def test_compact_trace_suppresses_book_updates_by_default(self) -> None:
+        strategy = self.make_strategy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_write_summary_on_shutdown=False,
+                ),
+                session_prefix="test_trace",
+            )
+            state = strategy.trace_state(1_000)
+            recorder.record_book_update(now_ms=1_000, state=state, cash=10_000, trigger="book_update")
+            recorder.finalize(now_ms=1_100, state=state, cash=10_000, note="done")
+
+            event_types = [event["event_type"] for event in load_trace_events(recorder.run_dir)]
+            self.assertNotIn("book_update", event_types)
+
+    def test_verbose_trace_can_record_book_updates(self) -> None:
+        strategy = self.make_strategy()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_write_summary_on_shutdown=False,
+                    trace_record_book_updates=True,
+                ),
+                session_prefix="test_trace",
+            )
+            state = strategy.trace_state(1_000)
+            recorder.record_book_update(now_ms=1_000, state=state, cash=10_000, trigger="book_update")
+            recorder.finalize(now_ms=1_100, state=state, cash=10_000, note="done")
+
+            event_types = [event["event_type"] for event in load_trace_events(recorder.run_dir)]
+            self.assertIn("book_update", event_types)
+
+    def test_compact_trace_suppresses_low_signal_observe_only_decisions(self) -> None:
+        strategy = self.make_strategy()
+        plan = QuotePlan(
+            mode="POST_EARNINGS_SHOCK",
+            bid=None,
+            ask=None,
+            aggressive_actions=(),
+            observe_only=True,
+            reason="already at the A shock target",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_write_summary_on_shutdown=False,
+                ),
+                session_prefix="test_trace",
+            )
+            state = strategy.trace_state(1_000)
+            recorder.record_decision(now_ms=1_000, state=state, cash=10_000, trigger="timer", plan=plan)
+            recorder.finalize(now_ms=1_100, state=state, cash=10_000, note="done")
+
+            event_types = [event["event_type"] for event in load_trace_events(recorder.run_dir)]
+            self.assertNotIn("decision_evaluated", event_types)
+            with recorder.snapshots_path.open("r", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows, [])
+
+    def test_compact_trace_keeps_news_confirmation_decisions(self) -> None:
+        strategy = self.make_strategy()
+        plan = QuotePlan(
+            mode="NEWS_CONFIRMATION",
+            bid=None,
+            ask=None,
+            aggressive_actions=(),
+            observe_only=True,
+            reason="waiting for medium A-news confirmation",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TraceRecorder(
+                TraceConfig(
+                    trace_enabled=True,
+                    trace_root=Path(temp_dir),
+                    trace_write_summary_on_shutdown=False,
+                ),
+                session_prefix="test_trace",
+            )
+            state = strategy.trace_state(1_000)
+            recorder.record_decision(now_ms=1_000, state=state, cash=10_000, trigger="news", plan=plan)
+            recorder.finalize(now_ms=1_100, state=state, cash=10_000, note="done")
+
+            event_types = [event["event_type"] for event in load_trace_events(recorder.run_dir)]
+            self.assertIn("decision_evaluated", event_types)
+
     def test_trace_recorder_writes_run_files_and_summary(self) -> None:
         strategy = self.make_strategy()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,9 +426,11 @@ class TraceTests(unittest.TestCase):
             self.assertIn("a_mm_loss_by_mode", summary)
             self.assertIn("pnl_by_action_class", summary)
             self.assertIn("a_strategy_breakdown", summary)
+            self.assertIn("a_earnings_calibration_diagnostics", summary)
             self.assertIn("a_news_summary", summary)
             self.assertIn("a_news_episode_summaries", summary)
             self.assertIn("b_cost_adjusted_residual_stats", summary)
+            self.assertIn("b_mean_reversion_summary", summary)
             self.assertIn("b_shadow_underlying_mm", summary)
             self.assertIn("b_strategy_block_reasons", summary)
             self.assertIn("trace_volume_summary", summary)
@@ -351,6 +445,58 @@ class TraceTests(unittest.TestCase):
             optional_keys = {
                 "TRACE_ROOT",
                 "TRACE_ENABLED",
+                "TRACE_SNAPSHOT_INTERVAL_MS",
+                "TRACE_BOOK_DEPTH_LEVELS",
+                "TRACE_RECORD_BOOK_UPDATES",
+                "TRACE_RECORD_OBSERVE_ONLY_DECISIONS",
+                "B_MM_MIN_EVAL_INTERVAL_MS",
+                "B_MM_REPRICE_THRESHOLD_TICKS",
+                "B_MM_V2_MAX_POSITION",
+                "B_MM_V2_QUOTE_SIZE",
+                "B_MM_MIN_VALID_SPREAD_TICKS",
+                "B_MM_MIN_HEALTHY_BOOK_AGE_MS",
+                "B_MM_CANCEL_ON_BAD_BOOK",
+                "B_MM_BAD_FILL_COOLDOWN_MS",
+                "B_MEANREV_ENABLED",
+                "B_MEANREV_MAX_POSITION",
+                "B_MEANREV_QUOTE_SIZE",
+                "B_MEANREV_EMA_FAST_MS",
+                "B_MEANREV_EMA_SLOW_MS",
+                "B_MEANREV_VOL_EWMA_MS",
+                "B_MEANREV_SIGMA_FLOOR",
+                "B_MEANREV_ENTRY_Z",
+                "B_MEANREV_ENTRY_Z2",
+                "B_MEANREV_EXIT_Z",
+                "B_MEANREV_STOP_Z",
+                "B_MEANREV_MIN_SPREAD_TICKS",
+                "B_MEANREV_MAX_HOLD_MS",
+                "B_MEANREV_COOLDOWN_MS",
+                "B_MEANREV_AGGRESSIVE_ENTRY_Z",
+                "B_MEANREV_AGGRESSIVE_EXIT",
+                "B_OPTION_LOTTERY_ENABLED",
+                "B_OPTION_LOTTERY_MAX_ASK",
+                "B_OPTION_LOTTERY_TOTAL_PREMIUM_BUDGET",
+                "B_OPTION_LOTTERY_WING_MAX_POSITION",
+                "B_OPTION_LOTTERY_ATM_MAX_POSITION",
+                "B_OPTION_LOTTERY_WING_PREMIUM_BUDGET",
+                "B_OPTION_LOTTERY_ATM_TOTAL_PREMIUM_BUDGET",
+                "B_OPTION_LOTTERY_PROFIT_TAKE_ENABLED",
+                "B_OPTION_HEDGE_ENABLED",
+                "B_OPTION_HEDGE_MAX_ASK",
+                "B_OPTION_HEDGE_MIN_UNDERLYING_INVENTORY",
+                "B_OPTION_HEDGE_TARGET_RATIO",
+                "B_OPTION_HEDGE_PREMIUM_BUDGET",
+                "ETF_ENABLED",
+                "ETF_TRADING_ENABLED",
+                "ETF_ALPHA_FROM_A",
+                "ETF_ALPHA_FROM_A_EARNINGS",
+                "ETF_ALPHA_FROM_A_NEWS",
+                "ETF_MAX_POSITION",
+                "ETF_QUOTE_SIZE",
+                "ETF_TARGET_POSITION_PER_A_SHOCK_INVENTORY",
+                "ETF_MIN_HOLD_MS",
+                "ETF_MIN_EVAL_INTERVAL_MS",
+                "ETF_UNWIND_REPRICE_THRESHOLD_TICKS",
                 "AUTO_STOP_ON_FOLLOWUP_POSITION_SNAPSHOT",
                 "AUTO_STOP_ON_MARKET_RESOLVED",
             }
@@ -368,7 +514,57 @@ class TraceTests(unittest.TestCase):
                         os.environ[key] = old_value
             self.assertEqual(config.trace.trace_root, Path(temp_dir).resolve() / "analysis_runs")
             self.assertFalse(config.trace.trace_enabled)
+            self.assertEqual(config.trace.trace_snapshot_interval_ms, 2_000)
+            self.assertEqual(config.trace.trace_book_depth_levels, 1)
+            self.assertFalse(config.trace.trace_record_book_updates)
+            self.assertFalse(config.trace.trace_record_observe_only_decisions)
             self.assertFalse(config.market_a.recover_pricing_state)
+            self.assertEqual(config.market_b.mm_min_eval_interval_ms, 150)
+            self.assertEqual(config.market_b.max_position, 4)
+            self.assertEqual(config.market_b.quote_size, 1)
+            self.assertEqual(config.market_b.mm_reprice_threshold_ticks, 3)
+            self.assertEqual(config.market_b.mm_min_valid_spread_ticks, 3)
+            self.assertEqual(config.market_b.mm_min_healthy_book_age_ms, 500)
+            self.assertTrue(config.market_b.mm_cancel_on_bad_book)
+            self.assertEqual(config.market_b.mm_bad_fill_cooldown_ms, 750)
+            self.assertTrue(config.market_b.meanrev_enabled)
+            self.assertEqual(config.market_b.meanrev_max_position, 8)
+            self.assertEqual(config.market_b.meanrev_quote_size, 1)
+            self.assertEqual(config.market_b.meanrev_ema_fast_ms, 30_000)
+            self.assertEqual(config.market_b.meanrev_ema_slow_ms, 180_000)
+            self.assertEqual(config.market_b.meanrev_vol_ewma_ms, 60_000)
+            self.assertEqual(config.market_b.meanrev_sigma_floor, 4.0)
+            self.assertEqual(config.market_b.meanrev_entry_z, 1.25)
+            self.assertEqual(config.market_b.meanrev_entry_z2, 2.25)
+            self.assertEqual(config.market_b.meanrev_exit_z, 0.35)
+            self.assertEqual(config.market_b.meanrev_stop_z, 5.0)
+            self.assertEqual(config.market_b.meanrev_min_spread_ticks, 3)
+            self.assertEqual(config.market_b.meanrev_max_hold_ms, 120_000)
+            self.assertEqual(config.market_b.meanrev_cooldown_ms, 1_500)
+            self.assertEqual(config.market_b.meanrev_aggressive_entry_z, 2.75)
+            self.assertTrue(config.market_b.meanrev_aggressive_exit)
+            self.assertTrue(config.market_b.option_lottery_enabled)
+            self.assertEqual(config.market_b.option_lottery_max_ask, 3)
+            self.assertEqual(config.market_b.option_lottery_total_premium_budget, 1_500)
+            self.assertEqual(config.market_b.option_lottery_wing_max_position, 200)
+            self.assertEqual(config.market_b.option_lottery_atm_max_position, 40)
+            self.assertEqual(config.market_b.option_lottery_wing_premium_budget, 600)
+            self.assertEqual(config.market_b.option_lottery_atm_total_premium_budget, 300)
+            self.assertTrue(config.market_b.option_lottery_profit_take_enabled)
+            self.assertTrue(config.market_b.option_hedge_enabled)
+            self.assertEqual(config.market_b.option_hedge_max_ask, 6)
+            self.assertEqual(config.market_b.option_hedge_min_underlying_inventory, 4)
+            self.assertEqual(config.market_b.option_hedge_target_ratio, 0.5)
+            self.assertEqual(config.market_b.option_hedge_premium_budget, 300)
+            self.assertTrue(config.etf.enabled)
+            self.assertTrue(config.etf.trading_enabled)
+            self.assertEqual(config.etf.alpha_from_a, 0.60)
+            self.assertEqual(config.etf.max_position, 100)
+            self.assertEqual(config.etf.quote_size, 16)
+            self.assertEqual(config.etf.target_position_per_a_shock_inventory, 0.35)
+            self.assertEqual(config.etf.min_hold_ms, 3_000)
+            self.assertEqual(config.etf.min_eval_interval_ms, 100)
+            self.assertEqual(config.etf.unwind_reprice_threshold_ticks, 8)
             self.assertTrue(config.auto_stop_after_round_complete)
             self.assertEqual(config.assumed_round_duration_ms, 900_000)
             self.assertEqual(config.round_completion_grace_ms, 5_000)
@@ -487,6 +683,129 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(summary["activity_split"]["earnings_prejump"], 1)
         self.assertAlmostEqual(summary["fill_markouts_by_intent"]["earnings_prejump"]["250ms"], 7.0, delta=0.001)
 
+    def test_summarize_trace_events_reports_inventory_divergence(self) -> None:
+        events = [
+            {
+                "event_type": "inventory_updated",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "inventory": 12,
+                "strategy_inventory": 12,
+                "exchange_inventory": 12,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_100,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "inventory": 24,
+                "strategy_inventory": 24,
+                "exchange_inventory": 12,
+            },
+        ]
+
+        summary = summarize_trace_events(events)
+
+        self.assertEqual(summary["inventory_divergence_summary"]["ETF"]["divergent_sample_count"], 1)
+        self.assertEqual(summary["inventory_divergence_summary"]["ETF"]["max_abs_difference"], 12)
+
+    def test_summarize_trace_events_reports_b_option_lottery_summary(self) -> None:
+        events = [
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "B_C_1050",
+                "market_key": "B",
+                "side": "BUY",
+                "price": 3,
+                "qty": 10,
+                "fill_price": 3,
+                "fill_qty": 10,
+                "pnl_owner": "b_option_lottery:B_C_1050",
+                "strategy_family": "b_option_lottery",
+                "action_class": "cheap_option_buy",
+                "inventory": 10,
+                "mark_price": 3,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "B_C_1050",
+                "market_key": "B",
+                "inventory": 10,
+                "mark_price": 9,
+            },
+        ]
+
+        summary = summarize_trace_events(events)
+        option_summary = summary["b_option_lottery_summary"]["by_symbol"]["B_C_1050"]
+
+        self.assertEqual(option_summary["buy_qty"], 10)
+        self.assertEqual(option_summary["premium_spent"], 30.0)
+        self.assertEqual(option_summary["final_inventory"], 10)
+        self.assertEqual(option_summary["mtm_pnl"], 60.0)
+        self.assertEqual(option_summary["mtm_pnl_from_fills"], 60.0)
+
+    def test_b_option_lottery_max_mark_ignores_pre_entry_marks(self) -> None:
+        events = [
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 900,
+                "symbol": "B_P_950",
+                "market_key": "B",
+                "inventory": 0,
+                "mark_price": 20,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "B_P_950",
+                "market_key": "B",
+                "side": "BUY",
+                "price": 3,
+                "qty": 4,
+                "fill_price": 3,
+                "fill_qty": 4,
+                "pnl_owner": "b_option_lottery:B_P_950",
+                "strategy_family": "b_option_lottery",
+                "action_class": "cheap_option_buy",
+                "inventory": 4,
+                "mark_price": 3,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "symbol": "B_P_950",
+                "market_key": "B",
+                "inventory": 4,
+                "mark_price": 9,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "B_P_950",
+                "market_key": "B",
+                "inventory": 0,
+                "mark_price": 50,
+            },
+        ]
+
+        summary = summarize_trace_events(events)
+        option_summary = summary["b_option_lottery_summary"]["by_symbol"]["B_P_950"]
+
+        self.assertEqual(option_summary["max_mark_after_first_buy"], 9.0)
+        self.assertEqual(option_summary["open_qty_from_fills"], 4)
+        self.assertEqual(option_summary["open_mark_value_from_fills"], 200.0)
+
     def test_summarize_trace_events_rolls_up_pnl_by_market_and_strategy(self) -> None:
         events = [
             {
@@ -515,6 +834,54 @@ class TraceTests(unittest.TestCase):
         summary = summarize_trace_events(events, markout_windows_ms=(250,))
         self.assertAlmostEqual(summary["pnl_by_market"]["A"], 20.0, delta=0.001)
         self.assertAlmostEqual(summary["pnl_by_strategy_family"]["a_earnings"], 20.0, delta=0.001)
+
+    def test_summarize_trace_events_suppresses_unreliable_fill_side_attribution(self) -> None:
+        events = [
+            {
+                "event_type": "inventory_updated",
+                "run_id": "run-1",
+                "monotonic_ms": 900,
+                "symbol": "A",
+                "market_key": "A",
+                "inventory": 0,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "A",
+                "market_key": "A",
+                "pnl_owner": "a_earnings",
+                "action_class": "shock_take",
+                "intent": "post_earnings_shock_take",
+                "side": "BUY",
+                "fill_price": 1000,
+                "fill_qty": 10,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "symbol": "A",
+                "market_key": "A",
+                "mid": 1100.0,
+            },
+            {
+                "event_type": "session_end",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "A",
+                "market_key": "A",
+                "inventory": 0,
+                "mid": 1100.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+
+        self.assertFalse(summary["attribution_reliability"]["A"]["reliable"])
+        self.assertNotIn("A", summary["pnl_by_market"])
+        self.assertNotIn("a_earnings", summary["pnl_by_strategy_family"])
 
     def test_b_observer_computes_parity_residuals_and_synthetic_fair(self) -> None:
         observer = MarketBObserver(depth_levels=5)
@@ -549,6 +916,131 @@ class TraceTests(unittest.TestCase):
 
         observer.on_book_update("B_C_1000", FakeOrderBook(bids={104: 10}, asks={108: 10}))
         self.assertIsNotNone(observer.derived_signal_bundle(now_ms=1_150))
+
+    def test_summarize_trace_events_reports_b_adverse_selection_stats(self) -> None:
+        events = [
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "B",
+                "market_key": "B",
+                "pnl_owner": "b_underlying_mm_v2",
+                "action_class": "reduce_only",
+                "intent": "b_underlying_mm_v2_passive",
+                "side": "SELL",
+                "fill_price": 1000,
+                "fill_qty": 1,
+                "spread": 0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "symbol": "B",
+                "market_key": "B",
+                "mid": 999.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+
+        self.assertEqual(summary["b_adverse_selection_stats"]["fill_count"], 1)
+        self.assertEqual(summary["b_adverse_selection_stats"]["crossed_or_locked_fill_count"], 1)
+        self.assertEqual(summary["b_adverse_selection_stats"]["reduce_only_fill_count"], 1)
+
+    def test_summarize_trace_events_reports_b_mean_reversion_summary(self) -> None:
+        events = [
+            {
+                "event_type": "decision_evaluated",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "B",
+                "market_key": "B",
+                "mode": "B_MEANREV_ENTRY",
+                "inventory": 0,
+                "b_meanrev_z": 1.5,
+                "desired_bid": None,
+                "desired_ask": {"strategy_family": "b_mean_reversion", "px": 1004, "qty": 1},
+                "aggressive_action_count": 0,
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_010,
+                "symbol": "B",
+                "market_key": "B",
+                "mode": "B_MEANREV_ENTRY",
+                "strategy_family": "b_mean_reversion",
+                "pnl_owner": "b_mean_reversion",
+                "action_class": "mean_reversion_entry",
+                "b_meanrev_z": 1.5,
+                "side": "SELL",
+                "price": 1004,
+                "qty": 1,
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_015,
+                "symbol": "B",
+                "market_key": "B",
+                "mode": "B_MEANREV_RISK_OFF",
+                "strategy_family": "b_mean_reversion",
+                "pnl_owner": "b_mean_reversion",
+                "action_class": "mean_reversion_risk_off",
+                "b_meanrev_risk_off_forced": False,
+                "side": "BUY",
+                "price": 1001,
+                "qty": 1,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_020,
+                "symbol": "B",
+                "market_key": "B",
+                "strategy_family": "b_mean_reversion",
+                "pnl_owner": "b_mean_reversion",
+                "action_class": "mean_reversion_entry",
+                "intent": "b_mean_reversion",
+                "side": "SELL",
+                "fill_price": 1004,
+                "fill_qty": 1,
+                "spread": 6,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_270,
+                "symbol": "B",
+                "market_key": "B",
+                "mid": 1000.0,
+            },
+            {
+                "event_type": "session_end",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "B",
+                "market_key": "B",
+                "inventory": -1,
+                "mid": 1000.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+
+        meanrev = summary["b_mean_reversion_summary"]
+        self.assertEqual(meanrev["decision_count"], 1)
+        self.assertEqual(meanrev["quote_count"], 1)
+        self.assertEqual(meanrev["entry_count"], 1)
+        self.assertEqual(meanrev["risk_off_count"], 1)
+        self.assertEqual(meanrev["risk_off_hold_or_passive_reduce_count"], 1)
+        self.assertEqual(meanrev["risk_off_forced_exit_count"], 0)
+        self.assertEqual(meanrev["fill_count"], 1)
+        self.assertEqual(meanrev["fill_qty"], 1)
+        self.assertEqual(meanrev["avg_entry_abs_z"], 1.5)
+        self.assertGreater(meanrev["entry_markouts"]["250ms"], 0)
 
     def test_summarize_trace_events_reports_a_episode_mm_loss_and_b_cost_stats(self) -> None:
         events = [
@@ -915,6 +1407,69 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(shadow["candidate_quote_count"], 1)
         self.assertEqual(shadow["hypothetical_fill_count"], 1)
         self.assertIn("BUY", shadow["hypothetical_quote_counts"])
+
+    def test_etf_a_shock_calibration_reports_realized_response_ratios(self) -> None:
+        events = [
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mid": 1000.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 500.0,
+            },
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "a_shock_projection",
+                "signal_id": "etf_a_1",
+                "payload": {
+                    "source_kind": "structured_earnings",
+                    "alpha": 0.25,
+                    "a_fair_shift": 100.0,
+                    "projected_etf_shift": 25.0,
+                    "base_mid": 500.0,
+                    "target_inventory": 25,
+                },
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mid": 1080.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 520.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        calibration = summary["etf_a_shock_calibration"]
+
+        self.assertEqual(calibration["signal_count"], 1)
+        self.assertEqual(calibration["by_horizon_ms"]["1000"]["sample_count"], 1)
+        self.assertEqual(calibration["by_horizon_ms"]["1000"]["mean_etf_over_a_fair_shift"], 0.2)
+        self.assertEqual(calibration["by_horizon_ms"]["1000"]["mean_configured_alpha"], 0.25)
+        self.assertEqual(calibration["by_source_kind"]["structured_earnings"]["1000"]["directional_hit_rate"], 1.0)
 
 
 if __name__ == "__main__":

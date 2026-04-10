@@ -20,14 +20,37 @@ class FakeOrderBook:
 
 
 class AyushPortStrategyTests(unittest.TestCase):
-    def make_strategy(self) -> AyushPortStrategy:
+    def make_strategy(self, *, initial_fair_value: int | None = None) -> AyushPortStrategy:
         return AyushPortStrategy(
             risk=RiskConfig(
                 reprice_cooldown_ms=0,
                 passive_reprice_threshold_ticks=2,
                 passive_quote_ttl_ms=3_000,
             ),
+            initial_fair_value=initial_fair_value,
             book_depth_levels=5,
+        )
+
+    def seed_baseline(self, strategy: AyushPortStrategy, *, mid: int, start_ms: int = 0, samples: int = 10) -> None:
+        for index in range(samples):
+            strategy.on_book_update_at(
+                "A",
+                FakeOrderBook(bids={mid - 2: 10}, asks={mid + 2: 10}),
+                now_ms=start_ms + (index * 1_000),
+            )
+
+    def send_unknown_a_news(self, strategy: AyushPortStrategy, *, now_ms: int = 10_000) -> None:
+        strategy.on_news(
+            {
+                "tick": 50,
+                "kind": "unstructured",
+                "symbol": "A",
+                "new_data": {
+                    "content": "A mentions a completely novel undecidable update.",
+                    "type": "News",
+                },
+            },
+            now_ms=now_ms,
         )
 
     def test_strong_a_news_immediately_enters_news_shock(self) -> None:
@@ -85,6 +108,16 @@ class AyushPortStrategyTests(unittest.TestCase):
         self.assertEqual(order.action_class, "shock_take")
         self.assertEqual(order.side, "BUY")
         self.assertGreater(order.qty, 0)
+
+    def test_a_news_uses_faithful_ayush_permanent_pe_freeze(self) -> None:
+        strategy = self.make_strategy(initial_fair_value=1000)
+        strategy.on_book_update_at("A", FakeOrderBook(bids={998: 10}, asks={1002: 10}), now_ms=1_000)
+
+        self.send_unknown_a_news(strategy, now_ms=1_100)
+        self.assertTrue(strategy._strategy.pe_frozen)
+
+        strategy.evaluate_runtime(now_ms=1_250)
+        self.assertTrue(strategy._strategy.pe_frozen)
 
     def test_medium_news_confirms_then_enters_news_shock(self) -> None:
         strategy = self.make_strategy()

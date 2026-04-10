@@ -43,6 +43,8 @@ SNAPSHOT_FIELDNAMES = [
     "trusted_multiplier",
     "multiplier_confidence",
     "inventory",
+    "strategy_inventory",
+    "exchange_inventory",
     "earnings_position",
     "news_position",
     "mm_position",
@@ -88,12 +90,64 @@ SNAPSHOT_FIELDNAMES = [
     "news_confirmation_deadline_ms",
     "news_takeover_started_ms",
     "pe_frozen",
+    "last_a_unstructured_news_ms",
+    "pe_freeze_until_ms",
+    "a_news_seen_before_first_structured_earnings",
+    "first_structured_earnings_seen",
+    "permanent_post_eps_news_freeze",
+    "clean_multiplier_sample_count",
+    "multiplier_freeze_event_count",
+    "multiplier_unfreeze_event_count",
+    "permanent_post_eps_news_freeze_count",
+    "temporary_pre_eps_news_freeze_count",
+    "earnings_conflict_skip_count",
+    "earnings_conflict_override_count",
     "news_matched_phrases_json",
     "news_matched_unigrams_json",
     "news_matched_bigrams_json",
     "unknown_candidate_phrases_json",
     "unknown_candidate_unigrams_json",
     "unknown_candidate_bigrams_json",
+    "composite_synthetic_fair",
+    "synthetic_dispersion",
+    "composite_basis",
+    "block_reason",
+    "b_mm_v2_base_center",
+    "b_mm_v2_used_synthetic_anchor",
+    "b_mm_v2_dynamic_half_spread",
+    "b_mm_v2_bid_px",
+    "b_mm_v2_ask_px",
+    "b_meanrev_ema_fast",
+    "b_meanrev_ema_slow",
+    "b_meanrev_sigma",
+    "b_meanrev_z",
+    "b_meanrev_target_inventory",
+    "b_meanrev_hold_ms",
+    "b_meanrev_regime_block_reason",
+    "b_meanrev_risk_off_forced",
+    "etf_signal_id",
+    "etf_alpha_from_a",
+    "etf_source_signal_id",
+    "etf_source_signal_kind",
+    "etf_a_fair_shift",
+    "etf_projected_shift",
+    "etf_base_mid",
+    "etf_target_fair",
+    "etf_target_inventory",
+    "etf_source_target_inventory",
+    "etf_target_from_a_position",
+    "etf_unwind_reason",
+    "b_option_lottery_premium_spent",
+    "b_option_lottery_premium_recovered",
+    "b_option_lottery_symbol_premium_remaining",
+    "b_option_lottery_avg_entry",
+    "b_option_lottery_realized_profit",
+    "b_option_underlying_inventory",
+    "b_option_hedge_needed",
+    "b_option_hedge_target_qty",
+    "b_option_hedge_budget_remaining",
+    "b_option_profit_take_trigger",
+    "b_option_hedge_premium_spent",
 ]
 
 
@@ -291,6 +345,25 @@ def _quoted_spread(desired_bid: dict[str, Any] | None, desired_ask: dict[str, An
     if live_bid is None or live_ask is None:
         return None
     return int(live_ask["px"]) - int(live_bid["px"])
+
+
+def _trim_depth_levels(levels: Iterable[Any], max_levels: int) -> list[Any]:
+    if max_levels <= 0:
+        return []
+    return list(levels)[:max_levels]
+
+
+def _decision_has_orders(plan: Any) -> bool:
+    return plan.bid is not None or plan.ask is not None or bool(plan.aggressive_actions)
+
+
+def _is_high_signal_observe_only_decision(plan: Any) -> bool:
+    """Keep sparse non-order decisions that explain a pending tradable signal."""
+    mode = str(plan.mode or "")
+    if mode == "NEWS_CONFIRMATION":
+        return True
+    reason = str(plan.reason or "").lower()
+    return "confirmation" in reason or "pending news" in reason
 
 
 def _resolve_run_dir(path_or_run_dir: str | Path) -> Path:
@@ -561,6 +634,412 @@ def build_b_shadow_underlying_mm_summary(events: list[dict[str, Any]]) -> dict[s
     }
 
 
+def build_etf_a_shock_calibration_summary(
+    events: list[dict[str, Any]],
+    *,
+    horizons_ms: tuple[int, ...] = (250, 1_000, 3_000, 5_000),
+) -> dict[str, Any]:
+    a_series = _series_for_symbol(events, "A")
+    etf_series = _series_for_symbol(events, "ETF")
+    signal_events = [
+        event
+        for event in events
+        if str(event.get("event_type") or "") == "derived_signal"
+        and str(event.get("strategy_family") or "") == "etf_a_follower"
+        and str(event.get("action_class") or "") == "a_shock_projection"
+    ]
+    if not signal_events:
+        return {"signal_count": 0, "by_horizon_ms": {}, "by_source_kind": {}, "signals": []}
+
+    rows: list[dict[str, Any]] = []
+    aggregate: dict[tuple[str, int], dict[str, Any]] = defaultdict(
+        lambda: {
+            "count": 0,
+            "directional_hits": 0,
+            "etf_move_sum": 0.0,
+            "a_realized_move_sum": 0.0,
+            "ratio_vs_a_fair_shift_sum": 0.0,
+            "ratio_vs_a_realized_move_sum": 0.0,
+            "ratio_vs_a_realized_move_count": 0,
+            "alpha_sum": 0.0,
+        }
+    )
+
+    for event in signal_events:
+        payload = event.get("payload") or {}
+        start_ms = int(event.get("monotonic_ms", 0))
+        source_kind = str(payload.get("source_kind") or "unknown")
+        a_fair_shift = float(payload.get("a_fair_shift", 0.0) or 0.0)
+        alpha = float(payload.get("alpha", 0.0) or 0.0)
+        a_start = _mark_near(a_series, start_ms)
+        etf_start = payload.get("base_mid")
+        if etf_start is None:
+            etf_start = _mark_near(etf_series, start_ms)
+        if a_fair_shift == 0 or etf_start is None:
+            continue
+        signal_row = {
+            "signal_id": event.get("signal_id"),
+            "source_kind": source_kind,
+            "started_ms": start_ms,
+            "configured_alpha": round(alpha, 4),
+            "a_fair_shift": round(a_fair_shift, 4),
+            "projected_etf_shift": round(float(payload.get("projected_etf_shift", 0.0) or 0.0), 4),
+            "target_inventory": payload.get("target_inventory"),
+            "horizons": {},
+        }
+        for horizon_ms in horizons_ms:
+            a_mark = _mark_at_or_after(a_series, start_ms + horizon_ms)
+            etf_mark = _mark_at_or_after(etf_series, start_ms + horizon_ms)
+            if etf_mark is None:
+                continue
+            etf_move = float(etf_mark) - float(etf_start)
+            a_realized_move = None if a_start is None or a_mark is None else float(a_mark) - float(a_start)
+            ratio_vs_fair = etf_move / a_fair_shift
+            directional_hit = etf_move * a_fair_shift > 0
+            horizon_row = {
+                "etf_move": round(etf_move, 4),
+                "a_realized_move": None if a_realized_move is None else round(a_realized_move, 4),
+                "etf_over_a_fair_shift": round(ratio_vs_fair, 4),
+                "etf_over_a_realized_move": None,
+                "directional_hit": bool(directional_hit),
+                "configured_alpha": round(alpha, 4),
+                "alpha_error_vs_fair_shift": round(ratio_vs_fair - alpha, 4),
+            }
+            if a_realized_move not in {None, 0.0}:
+                horizon_row["etf_over_a_realized_move"] = round(etf_move / float(a_realized_move), 4)
+            signal_row["horizons"][str(horizon_ms)] = horizon_row
+            for group in ("all", source_kind):
+                bucket = aggregate[(group, horizon_ms)]
+                bucket["count"] += 1
+                bucket["directional_hits"] += 1 if directional_hit else 0
+                bucket["etf_move_sum"] += etf_move
+                bucket["a_realized_move_sum"] += 0.0 if a_realized_move is None else a_realized_move
+                bucket["ratio_vs_a_fair_shift_sum"] += ratio_vs_fair
+                bucket["alpha_sum"] += alpha
+                if a_realized_move not in {None, 0.0}:
+                    bucket["ratio_vs_a_realized_move_sum"] += etf_move / float(a_realized_move)
+                    bucket["ratio_vs_a_realized_move_count"] += 1
+        rows.append(signal_row)
+
+    def _aggregate_for(group: str) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for horizon_ms in horizons_ms:
+            bucket = aggregate.get((group, horizon_ms))
+            if not bucket or not bucket["count"]:
+                continue
+            count = int(bucket["count"])
+            output[str(horizon_ms)] = {
+                "sample_count": count,
+                "directional_hit_rate": round(bucket["directional_hits"] / count, 4),
+                "mean_etf_move": round(bucket["etf_move_sum"] / count, 4),
+                "mean_a_realized_move": round(bucket["a_realized_move_sum"] / count, 4),
+                "mean_etf_over_a_fair_shift": round(bucket["ratio_vs_a_fair_shift_sum"] / count, 4),
+                "mean_etf_over_a_realized_move": round(
+                    bucket["ratio_vs_a_realized_move_sum"] / bucket["ratio_vs_a_realized_move_count"],
+                    4,
+                ) if bucket["ratio_vs_a_realized_move_count"] else None,
+                "mean_configured_alpha": round(bucket["alpha_sum"] / count, 4),
+                "mean_alpha_error_vs_fair_shift": round(
+                    (bucket["ratio_vs_a_fair_shift_sum"] / count) - (bucket["alpha_sum"] / count),
+                    4,
+                ),
+            }
+        return output
+
+    source_kinds = sorted({str((event.get("payload") or {}).get("source_kind") or "unknown") for event in signal_events})
+    by_horizon = _aggregate_for("all")
+    candidate_alpha_evaluation: dict[str, Any] = {}
+    for candidate in (0.33, 0.50, 0.75, 1.00):
+        errors = []
+        for horizon in ("3000", "5000"):
+            realized = (by_horizon.get(horizon) or {}).get("mean_etf_over_a_fair_shift")
+            if realized is not None:
+                errors.append(abs(float(realized) - candidate))
+        candidate_alpha_evaluation[f"{candidate:.2f}"] = {
+            "mean_abs_error_vs_3s_5s_realized_ratio": round(sum(errors) / len(errors), 4) if errors else None
+        }
+    return {
+        "signal_count": len(rows),
+        "by_horizon_ms": by_horizon,
+        "by_source_kind": {source_kind: _aggregate_for(source_kind) for source_kind in source_kinds},
+        "candidate_alpha_evaluation": candidate_alpha_evaluation,
+        "signals": rows[:50],
+    }
+
+
+def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    etf_series = _series_for_symbol(events, "ETF")
+    signal_events = [
+        event
+        for event in events
+        if str(event.get("event_type") or "") == "derived_signal"
+        and str(event.get("strategy_family") or "") == "etf_a_follower"
+        and str(event.get("action_class") or "") == "a_shock_projection"
+    ]
+    if not signal_events:
+        return []
+    session_end_ms = max((int(event.get("monotonic_ms", 0)) for event in events), default=0)
+    fill_events = [
+        event
+        for event in events
+        if str(event.get("event_type") or "") == "order_filled"
+        and str(event.get("strategy_family") or "") == "etf_a_follower"
+    ]
+    submit_events = [
+        event
+        for event in events
+        if str(event.get("event_type") or "") == "order_submitted"
+        and str(event.get("strategy_family") or "") == "etf_a_follower"
+    ]
+    decision_events = [
+        event
+        for event in events
+        if str(event.get("event_type") or "") == "decision_evaluated"
+        and str(event.get("symbol") or "") == "ETF"
+        and str(event.get("mode") or "").startswith("ETF_")
+    ]
+    inventory_events = [
+        event
+        for event in events
+        if str(event.get("symbol") or "") == "ETF"
+        and event.get("inventory") is not None
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for index, signal_event in enumerate(signal_events):
+        payload = signal_event.get("payload") or {}
+        signal_id = str(signal_event.get("signal_id") or payload.get("signal_id") or "")
+        if not signal_id:
+            continue
+        start_ms = int(signal_event.get("monotonic_ms", 0))
+        end_ms = int(signal_events[index + 1].get("monotonic_ms", session_end_ms)) if index + 1 < len(signal_events) else session_end_ms
+        episode_fills = [
+            event
+            for event in fill_events
+            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
+            and str(event.get("signal_id") or "") == signal_id
+        ]
+        episode_submits = [
+            event
+            for event in submit_events
+            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
+            and str(event.get("signal_id") or "") == signal_id
+        ]
+        episode_decisions = [
+            event
+            for event in decision_events
+            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
+            and (not event.get("etf_signal_id") or str(event.get("etf_signal_id") or "") == signal_id)
+        ]
+        signed_qty = 0
+        cash_pnl = 0.0
+        entry_qty = 0
+        unwind_qty = 0
+        entry_notional = 0.0
+        unwind_notional = 0.0
+        first_entry_ms = None
+        first_unwind_ms = None
+        fill_side_alternations = 0
+        previous_fill_side: str | None = None
+        for fill in episode_fills:
+            order = fill.get("order") or {}
+            side = str(fill.get("side") or order.get("side") or "")
+            qty = int(fill.get("qty", 0) or 0)
+            price = float(fill.get("price", 0.0) or 0.0)
+            action_class = str(fill.get("action_class") or order.get("action_class") or "")
+            fill_ms = int(fill.get("monotonic_ms", 0))
+            if side == "BUY":
+                signed_qty += qty
+                cash_pnl -= qty * price
+            elif side == "SELL":
+                signed_qty -= qty
+                cash_pnl += qty * price
+            if previous_fill_side is not None and side and side != previous_fill_side:
+                fill_side_alternations += 1
+            if side:
+                previous_fill_side = side
+            if action_class == "etf_shock_take":
+                entry_qty += qty
+                entry_notional += qty * price
+                first_entry_ms = fill_ms if first_entry_ms is None else min(first_entry_ms, fill_ms)
+            elif action_class == "etf_shock_unwind":
+                unwind_qty += qty
+                unwind_notional += qty * price
+                first_unwind_ms = fill_ms if first_unwind_ms is None else min(first_unwind_ms, fill_ms)
+        final_mark = _mark_at_or_after(etf_series, end_ms) or _mark_near(etf_series, end_ms)
+        episode_pnl = cash_pnl + (signed_qty * float(final_mark or 0.0))
+        peak_inventory = 0
+        for event in inventory_events:
+            event_ms = int(event.get("monotonic_ms", 0))
+            if start_ms <= event_ms <= end_ms:
+                inventory = int(event.get("inventory") or 0)
+                if abs(inventory) > abs(peak_inventory):
+                    peak_inventory = inventory
+        unwind_reason = None
+        for submit in episode_submits:
+            if str(submit.get("action_class") or "") == "etf_shock_unwind":
+                unwind_reason = submit.get("reason") or submit.get("evaluation_reason")
+                break
+        first_block_reason = None
+        for decision in episode_decisions:
+            block_reason = decision.get("block_reason") or decision.get("reason")
+            if block_reason:
+                first_block_reason = str(block_reason)
+                break
+        base_mid = payload.get("base_mid")
+        direction_matches: dict[str, bool | None] = {}
+        for horizon_ms in (1_000, 3_000, 5_000):
+            mark = _mark_at_or_after(etf_series, start_ms + horizon_ms)
+            if mark is None or base_mid is None:
+                direction_matches[str(horizon_ms)] = None
+            else:
+                move = float(mark) - float(base_mid)
+                fair_shift = float(payload.get("a_fair_shift", 0.0) or 0.0)
+                direction_matches[str(horizon_ms)] = None if fair_shift == 0 else bool(move * fair_shift > 0)
+        rows.append(
+            {
+                "signal_id": signal_id,
+                "source_kind": payload.get("source_kind"),
+                "started_ms": start_ms,
+                "a_fair_shift": payload.get("a_fair_shift"),
+                "configured_alpha": payload.get("alpha"),
+                "target_inventory": payload.get("target_inventory"),
+                "entry_qty": entry_qty,
+                "entry_qty_vs_abs_target": None if payload.get("target_inventory") is None else entry_qty - abs(int(payload.get("target_inventory") or 0)),
+                "entry_attempt_count": len(episode_submits),
+                "first_block_reason": first_block_reason,
+                "unwind_qty": unwind_qty,
+                "churn_fill_count": max(0, len(episode_fills) - 2),
+                "fill_side_alternations": fill_side_alternations,
+                "peak_inventory": peak_inventory,
+                "avg_entry": round(entry_notional / entry_qty, 4) if entry_qty else None,
+                "avg_exit": round(unwind_notional / unwind_qty, 4) if unwind_qty else None,
+                "net_slippage": None
+                if not entry_qty
+                else round(
+                    (entry_notional / entry_qty) - float(payload.get("target_fair", payload.get("base_mid", 0.0)) or 0.0),
+                    4,
+                ),
+                "hold_time_ms": None if first_entry_ms is None else ((first_unwind_ms or end_ms) - first_entry_ms),
+                "unwind_reason": unwind_reason,
+                "episode_pnl": round(episode_pnl, 4),
+                "direction_match_by_horizon_ms": direction_matches,
+            }
+        )
+    return rows
+
+
+def build_b_option_lottery_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    option_symbols = ("B_C_950", "B_P_950", "B_C_1000", "B_P_1000", "B_C_1050", "B_P_1050")
+    rows: dict[str, dict[str, Any]] = {
+        symbol: {
+            "symbol": symbol,
+            "buy_qty": 0,
+            "sell_qty": 0,
+            "premium_spent": 0.0,
+            "premium_recovered": 0.0,
+            "realized_profit_taking": 0.0,
+            "hedge_buy_qty": 0,
+            "hedge_premium_spent": 0.0,
+            "final_inventory": 0,
+            "avg_entry": None,
+            "final_mark": None,
+            "max_mark_after_first_buy": None,
+            "max_mark_while_long": None,
+            "mtm_pnl": 0.0,
+            "open_qty_from_fills": 0,
+            "open_mark_value_from_fills": 0.0,
+            "mtm_pnl_from_fills": 0.0,
+            "first_buy_ms": None,
+        }
+        for symbol in option_symbols
+    }
+    latest_mark: dict[str, float] = {}
+    mark_series: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    mark_series_while_long: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    latest_position_by_symbol: dict[str, int] = defaultdict(int)
+    for event in events:
+        symbol = str(event.get("symbol") or "")
+        if symbol not in rows:
+            continue
+        if event.get("inventory") is not None:
+            latest_position_by_symbol[symbol] = int(event.get("inventory") or 0)
+            rows[symbol]["final_inventory"] = int(event.get("inventory") or 0)
+        mark = _trace_mark_from_event(event)
+        if mark is not None:
+            latest_mark[symbol] = float(mark)
+            mark_series[symbol].append((int(event.get("monotonic_ms", 0)), float(mark)))
+            if latest_position_by_symbol[symbol] > 0:
+                mark_series_while_long[symbol].append((int(event.get("monotonic_ms", 0)), float(mark)))
+    open_cost: dict[str, float] = defaultdict(float)
+    open_qty: Counter[str] = Counter()
+    for event in events:
+        if str(event.get("event_type") or "") != "order_filled":
+            continue
+        symbol = str(event.get("symbol") or "")
+        pnl_owner = str(event.get("pnl_owner") or "")
+        if symbol not in rows or not (
+            pnl_owner.startswith("b_option_lottery") or pnl_owner.startswith("b_option_hedge")
+        ):
+            continue
+        side = str(event.get("side") or "")
+        qty = int(event.get("fill_qty") or event.get("qty") or 0)
+        price = float(event.get("fill_price") or event.get("price") or 0.0)
+        now_ms = int(event.get("monotonic_ms", 0))
+        row = rows[symbol]
+        if side == "BUY":
+            row["buy_qty"] += qty
+            row["premium_spent"] += qty * price
+            if pnl_owner.startswith("b_option_hedge"):
+                row["hedge_buy_qty"] += qty
+                row["hedge_premium_spent"] += qty * price
+            open_cost[symbol] += qty * price
+            open_qty[symbol] += qty
+            row["first_buy_ms"] = now_ms if row["first_buy_ms"] is None else min(int(row["first_buy_ms"]), now_ms)
+        elif side == "SELL":
+            row["sell_qty"] += qty
+            row["premium_recovered"] += qty * price
+            avg_cost = 0.0 if open_qty[symbol] <= 0 else open_cost[symbol] / open_qty[symbol]
+            closing_qty = min(qty, open_qty[symbol])
+            row["realized_profit_taking"] += closing_qty * (price - avg_cost)
+            open_qty[symbol] -= closing_qty
+            open_cost[symbol] = max(0.0, open_cost[symbol] - (closing_qty * avg_cost))
+    for symbol, row in rows.items():
+        final_mark = latest_mark.get(symbol)
+        row["final_mark"] = None if final_mark is None else round(final_mark, 4)
+        if row["buy_qty"]:
+            row["avg_entry"] = round(float(row["premium_spent"]) / int(row["buy_qty"]), 4)
+        first_buy_ms = row.get("first_buy_ms")
+        if first_buy_ms is not None:
+            later_marks = [mark for ms, mark in mark_series_while_long.get(symbol, []) if ms >= int(first_buy_ms)]
+            row["max_mark_after_first_buy"] = round(max(later_marks), 4) if later_marks else None
+            row["max_mark_while_long"] = row["max_mark_after_first_buy"]
+        mark_value = float(row.get("final_inventory") or 0) * float(final_mark or 0.0)
+        open_qty_from_fills = max(0, int(open_qty[symbol]))
+        open_mark_value_from_fills = open_qty_from_fills * float(final_mark or 0.0)
+        row["mtm_pnl"] = round(float(row["premium_recovered"]) - float(row["premium_spent"]) + mark_value, 4)
+        row["open_qty_from_fills"] = open_qty_from_fills
+        row["open_mark_value_from_fills"] = round(open_mark_value_from_fills, 4)
+        row["mtm_pnl_from_fills"] = round(
+            float(row["premium_recovered"]) - float(row["premium_spent"]) + open_mark_value_from_fills,
+            4,
+        )
+        row["premium_spent"] = round(float(row["premium_spent"]), 4)
+        row["premium_recovered"] = round(float(row["premium_recovered"]), 4)
+        row["realized_profit_taking"] = round(float(row["realized_profit_taking"]), 4)
+        row["hedge_premium_spent"] = round(float(row["hedge_premium_spent"]), 4)
+    active_rows = {symbol: row for symbol, row in rows.items() if row["buy_qty"] or row["sell_qty"] or row["final_inventory"]}
+    return {
+        "premium_spent": round(sum(float(row["premium_spent"]) for row in active_rows.values()), 4),
+        "premium_recovered": round(sum(float(row["premium_recovered"]) for row in active_rows.values()), 4),
+        "hedge_premium_spent": round(sum(float(row["hedge_premium_spent"]) for row in active_rows.values()), 4),
+        "mtm_pnl": round(sum(float(row["mtm_pnl"]) for row in active_rows.values()), 4),
+        "mtm_pnl_from_fills": round(sum(float(row["mtm_pnl_from_fills"]) for row in active_rows.values()), 4),
+        "open_mark_value_from_fills": round(sum(float(row["open_mark_value_from_fills"]) for row in active_rows.values()), 4),
+        "by_symbol": active_rows,
+    }
+
+
 def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_ms: tuple[int, ...] = (250, 1_000, 5_000)) -> dict[str, Any]:
     event_list = sorted(list(events), key=lambda event: (int(event.get("monotonic_ms", 0)), str(event.get("event_type", ""))))
     mode_durations_by_market: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -594,6 +1073,18 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     a_relevant_structured_earnings_count = 0
     a_irrelevant_structured_count = 0
     a_relevant_unstructured_count = 0
+    a_earnings_calibration_diagnostics: dict[str, Any] = {
+        "multiplier_freeze_event_count": 0,
+        "multiplier_unfreeze_event_count": 0,
+        "earnings_conflict_skip_count": 0,
+        "earnings_conflict_override_count": 0,
+        "clean_multiplier_sample_count": 0,
+        "a_news_seen_before_first_structured_earnings": False,
+        "permanent_post_eps_news_freeze": False,
+        "permanent_post_eps_news_freeze_count": 0,
+        "temporary_pre_eps_news_freeze_count": 0,
+        "earnings_conflict_guard_events": [],
+    }
 
     mark_series: dict[str, list[tuple[int, float]]] = defaultdict(list)
     latest_mark_by_symbol: dict[str, float] = {}
@@ -609,8 +1100,41 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     mm_mode_markouts: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     mm_fills_inside_earnings_cycle = 0
     b_strategy_block_reasons: Counter[str] = Counter()
+    b_mm_v2_decision_count = 0
+    b_mm_v2_quote_count = 0
+    b_mm_v2_desired_spread_sum = 0.0
+    b_mm_v2_desired_spread_count = 0
+    b_mm_v2_abs_inventory_sum = 0
+    b_mm_v2_inventory_sample_count = 0
+    b_mm_v2_max_long = 0
+    b_mm_v2_max_short = 0
+    b_meanrev_decision_count = 0
+    b_meanrev_quote_count = 0
+    b_meanrev_entry_count = 0
+    b_meanrev_exit_count = 0
+    b_meanrev_risk_off_count = 0
+    b_meanrev_risk_off_forced_exit_count = 0
+    b_meanrev_risk_off_passive_count = 0
+    b_meanrev_entry_z_sum = 0.0
+    b_meanrev_entry_z_count = 0
+    b_meanrev_abs_inventory_sum = 0
+    b_meanrev_inventory_sample_count = 0
+    b_meanrev_max_long = 0
+    b_meanrev_max_short = 0
+    b_fill_count = 0
+    b_fill_qty = 0
+    b_fill_spread_sum = 0.0
+    b_fill_spread_count = 0
+    b_crossed_or_locked_fill_count = 0
+    b_reduce_only_fill_count = 0
     trace_event_counts: Counter[str] = Counter()
     trace_symbol_counts: Counter[str] = Counter()
+    first_inventory_by_symbol: dict[str, int] = {}
+    latest_inventory_by_symbol: dict[str, int] = {}
+    reconstructed_fill_delta_by_symbol: Counter[str] = Counter()
+    inventory_divergence_by_symbol: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"sample_count": 0, "divergent_sample_count": 0, "max_abs_difference": 0, "latest_difference": 0}
+    )
 
     def _mark_from_event(event: dict[str, Any]) -> float | None:
         for key in ("mark_price", "mid", "mid_price", "fair_value", "last_trade_px", "price"):
@@ -698,6 +1222,39 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         trace_event_counts[event_type] += 1
         trace_symbol_counts[symbol or "_ALL"] += 1
 
+        if symbol and event_type in {"inventory_updated", "session_end"} and event.get("inventory") is not None:
+            if event_type == "inventory_updated" and symbol not in first_inventory_by_symbol:
+                first_inventory_by_symbol[symbol] = int(event.get("inventory") or 0)
+            latest_inventory_by_symbol[symbol] = int(event.get("inventory") or 0)
+        if symbol and event.get("strategy_inventory") is not None and event.get("exchange_inventory") is not None:
+            strategy_inventory = int(event.get("strategy_inventory") or 0)
+            exchange_inventory = int(event.get("exchange_inventory") or 0)
+            diff = strategy_inventory - exchange_inventory
+            row = inventory_divergence_by_symbol[symbol]
+            row["sample_count"] += 1
+            row["latest_difference"] = int(diff)
+            row["max_abs_difference"] = max(int(row["max_abs_difference"]), abs(diff))
+            if diff != 0:
+                row["divergent_sample_count"] += 1
+
+        if market_key == "B" and symbol == "B":
+            inventory = event.get("inventory")
+            if inventory is not None:
+                inv = int(inventory)
+                b_mm_v2_abs_inventory_sum += abs(inv)
+                b_mm_v2_inventory_sample_count += 1
+                b_mm_v2_max_long = max(b_mm_v2_max_long, inv)
+                b_mm_v2_max_short = min(b_mm_v2_max_short, inv)
+                if (
+                    event.get("b_meanrev_z") is not None
+                    or str(event.get("mode") or "").startswith("B_MEANREV")
+                    or str(event.get("strategy_family") or "") == "b_mean_reversion"
+                ):
+                    b_meanrev_abs_inventory_sum += abs(inv)
+                    b_meanrev_inventory_sample_count += 1
+                    b_meanrev_max_long = max(b_meanrev_max_long, inv)
+                    b_meanrev_max_short = min(b_meanrev_max_short, inv)
+
         if mode:
             last_mode = last_mode_by_market.get(market_key)
             last_mode_started_ms = last_mode_started_ms_by_market.get(market_key)
@@ -711,6 +1268,28 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 last_mode_started_ms_by_market[market_key] = now_ms
 
         if market_key == "A":
+            for key in (
+                "multiplier_freeze_event_count",
+                "multiplier_unfreeze_event_count",
+                "earnings_conflict_skip_count",
+                "earnings_conflict_override_count",
+                "clean_multiplier_sample_count",
+                "permanent_post_eps_news_freeze_count",
+                "temporary_pre_eps_news_freeze_count",
+            ):
+                value = event.get(key)
+                if value is not None:
+                    a_earnings_calibration_diagnostics[key] = max(
+                        int(a_earnings_calibration_diagnostics.get(key) or 0),
+                        int(value),
+                    )
+            if bool(event.get("a_news_seen_before_first_structured_earnings")):
+                a_earnings_calibration_diagnostics["a_news_seen_before_first_structured_earnings"] = True
+            if bool(event.get("permanent_post_eps_news_freeze")):
+                a_earnings_calibration_diagnostics["permanent_post_eps_news_freeze"] = True
+            guard_events = event.get("earnings_conflict_guard_events")
+            if isinstance(guard_events, list):
+                a_earnings_calibration_diagnostics["earnings_conflict_guard_events"] = guard_events
             budget_shift_active = bool(event.get("budget_shift_active"))
             if last_budget_shift_state is None:
                 last_budget_shift_state = budget_shift_active
@@ -743,6 +1322,43 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 latest_mtm_basis = str(event.get("mtm_basis") or "unknown")
 
         if event_type == "decision_evaluated":
+            desired_bid = event.get("desired_bid") or {}
+            desired_ask = event.get("desired_ask") or {}
+            aggressive_actions = list(event.get("aggressive_actions") or [])
+            has_meanrev_aggressive_action = any(
+                str(action.get("strategy_family") or "") == "b_mean_reversion"
+                for action in aggressive_actions
+                if isinstance(action, dict)
+            )
+            is_meanrev_decision = (
+                market_key == "B"
+                and symbol == "B"
+                and (
+                    event.get("b_meanrev_z") is not None
+                    or str(event.get("mode") or "").startswith("B_MEANREV")
+                    or str(desired_bid.get("strategy_family") or "") == "b_mean_reversion"
+                    or str(desired_ask.get("strategy_family") or "") == "b_mean_reversion"
+                    or has_meanrev_aggressive_action
+                )
+            )
+            if is_meanrev_decision:
+                b_meanrev_decision_count += 1
+            if (
+                str(desired_bid.get("strategy_family") or "") == "b_underlying_mm_v2"
+                or str(desired_ask.get("strategy_family") or "") == "b_underlying_mm_v2"
+            ):
+                b_mm_v2_decision_count += 1
+                if desired_bid or desired_ask:
+                    b_mm_v2_quote_count += 1
+                if desired_bid and desired_ask and desired_bid.get("px") is not None and desired_ask.get("px") is not None:
+                    b_mm_v2_desired_spread_sum += float(desired_ask["px"]) - float(desired_bid["px"])
+                    b_mm_v2_desired_spread_count += 1
+            if (
+                str(desired_bid.get("strategy_family") or "") == "b_mean_reversion"
+                or str(desired_ask.get("strategy_family") or "") == "b_mean_reversion"
+                or has_meanrev_aggressive_action
+            ):
+                b_meanrev_quote_count += 1
             if bool(event.get("observe_only")):
                 observe_only_count += 1
             if int(event.get("aggressive_action_count") or 0) == 0 and event.get("desired_bid") is None and event.get("desired_ask") is None:
@@ -797,6 +1413,20 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             submits_by_action_class[action_class] += 1
             if bool(event.get("aggressive")):
                 spread_cross_count += 1
+            if str(event.get("strategy_family") or "") == "b_mean_reversion":
+                if action_class == "mean_reversion_entry":
+                    b_meanrev_entry_count += 1
+                    if event.get("b_meanrev_z") is not None:
+                        b_meanrev_entry_z_sum += abs(float(event.get("b_meanrev_z") or 0.0))
+                        b_meanrev_entry_z_count += 1
+                elif action_class == "mean_reversion_exit":
+                    b_meanrev_exit_count += 1
+                elif action_class == "mean_reversion_risk_off":
+                    b_meanrev_risk_off_count += 1
+                    if bool(event.get("b_meanrev_risk_off_forced")) or bool(event.get("aggressive")):
+                        b_meanrev_risk_off_forced_exit_count += 1
+                    else:
+                        b_meanrev_risk_off_passive_count += 1
 
         elif event_type == "order_cancel_requested":
             cancel_reason_counts[str(event.get("cancel_reason") or "unknown")] += 1
@@ -822,6 +1452,20 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             fill_qty = int(event.get("fill_qty") or event.get("qty") or 0)
             fill_qty_by_action_class[action_class] += fill_qty
             signed_qty = fill_qty if str(event.get("side")) == "BUY" else -fill_qty
+            if symbol:
+                reconstructed_fill_delta_by_symbol[symbol] += signed_qty
+            if market_key == "B":
+                b_fill_count += 1
+                b_fill_qty += fill_qty
+                spread_at_fill = event.get("spread")
+                if spread_at_fill is not None:
+                    spread_value = float(spread_at_fill)
+                    b_fill_spread_sum += spread_value
+                    b_fill_spread_count += 1
+                    if spread_value <= 1.0:
+                        b_crossed_or_locked_fill_count += 1
+                if action_class == "reduce_only":
+                    b_reduce_only_fill_count += 1
             owner_key = (market_key, pnl_owner, symbol)
             action_key = (market_key, action_class, symbol)
             signal_key = (market_key, pnl_owner, symbol, signal_id)
@@ -857,6 +1501,23 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
 
     mode_durations_ms = dict(sorted(mode_durations_by_market.get("A", {}).items()))
 
+    attribution_reliability: dict[str, dict[str, Any]] = {}
+    unreliable_symbols: set[str] = set()
+    for symbol, latest_inventory in sorted(latest_inventory_by_symbol.items()):
+        initial_inventory = int(first_inventory_by_symbol.get(symbol, 0))
+        reconstructed_inventory = initial_inventory + int(reconstructed_fill_delta_by_symbol.get(symbol, 0))
+        difference = reconstructed_inventory - int(latest_inventory)
+        reliable = abs(difference) <= 2
+        attribution_reliability[symbol] = {
+            "initial_inventory": initial_inventory,
+            "reconstructed_inventory": reconstructed_inventory,
+            "latest_traced_inventory": int(latest_inventory),
+            "difference": int(difference),
+            "reliable": bool(reliable),
+        }
+        if not reliable:
+            unreliable_symbols.add(symbol)
+
     for bucket in list(owner_buckets.values()) + list(signal_buckets.values()):
         if bucket["open_started_ms"] is not None:
             bucket["time_in_position_ms"] += max(0, final_ms - int(bucket["open_started_ms"]))
@@ -869,6 +1530,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     strategy_rows: dict[str, dict[str, Any]] = {}
 
     for (market_key, pnl_owner, symbol), bucket in owner_buckets.items():
+        if symbol in unreliable_symbols:
+            continue
         position = int(bucket["position"])
         avg_cost = float(bucket["avg_cost"])
         latest_mark = latest_mark_by_symbol.get(symbol)
@@ -903,6 +1566,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         row["time_in_position_ms"] += int(bucket["time_in_position_ms"])
 
     for (market_key, action_class, symbol), bucket in action_buckets.items():
+        if symbol in unreliable_symbols:
+            continue
         position = int(bucket["position"])
         avg_cost = float(bucket["avg_cost"])
         latest_mark = latest_mark_by_symbol.get(symbol)
@@ -916,6 +1581,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         pnl_by_action_class[f"{market_key}.{action_class}"] += total_pnl
 
     for (market_key, pnl_owner, symbol, signal_id), bucket in signal_buckets.items():
+        if symbol in unreliable_symbols:
+            continue
         position = int(bucket["position"])
         avg_cost = float(bucket["avg_cost"])
         latest_mark = latest_mark_by_symbol.get(symbol)
@@ -963,6 +1630,22 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         for name, row in sorted(strategy_rows.items(), key=lambda item: item[1]["total_pnl"])[:5]
     ]
     top_losing_signal_episodes = sorted(signal_episode_rows, key=lambda row: row["total_pnl"])[:10]
+    guarded_signal_ids = {
+        str(event.get("signal_id"))
+        for event in a_earnings_calibration_diagnostics.get("earnings_conflict_guard_events", [])
+        if event.get("signal_id")
+    }
+    guarded_earnings_pnl = 0.0
+    unguarded_earnings_pnl = 0.0
+    for row in signal_episode_rows:
+        if str(row.get("market_key")) != "A" or str(row.get("strategy_family")) != "a_earnings":
+            continue
+        if str(row.get("signal_id")) in guarded_signal_ids:
+            guarded_earnings_pnl += float(row.get("total_pnl") or 0.0)
+        else:
+            unguarded_earnings_pnl += float(row.get("total_pnl") or 0.0)
+    a_earnings_calibration_diagnostics["guarded_earnings_pnl"] = round(guarded_earnings_pnl, 4)
+    a_earnings_calibration_diagnostics["unguarded_earnings_pnl"] = round(unguarded_earnings_pnl, 4)
 
     a_episode_summaries: list[dict[str, Any]] = []
     if a_cycle_events:
@@ -1068,6 +1751,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     a_news_episode_summaries = build_a_news_episode_summaries(event_list, signal_episode_rows)
 
     b_cost_adjusted_residual_stats: dict[str, Any] = {}
+    b_tradeable_parity_stats: dict[str, Any] = {}
     b_residual_events = [
         event
         for event in event_list
@@ -1090,10 +1774,20 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         composite_basis_abs_sum = 0.0
         composite_basis_count = 0
         composite_basis_max_abs = 0.0
+        tradeable_per_strike: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "max_conversion_edge": float("-inf"),
+                "max_reversal_edge": float("-inf"),
+                "positive_conversion_count": 0,
+                "positive_reversal_count": 0,
+                "sample_count": 0,
+            }
+        )
         for idx, event in enumerate(b_residual_events):
             payload = event.get("payload") or {}
             residuals = payload.get("parity_residual_by_strike") or {}
             edges = payload.get("parity_edge_after_cost_by_strike") or {}
+            tradeable = payload.get("tradeable_parity_by_strike") or {}
             current_ms = int(event.get("monotonic_ms", 0))
             next_ms = current_ms
             if idx + 1 < len(b_residual_events):
@@ -1112,6 +1806,17 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 if edge_after_cost > 0:
                     bucket["positive_edge_count"] += 1
                     bucket["positive_edge_persistence_ms"] += delta_ms
+            for strike, metrics in tradeable.items():
+                bucket = tradeable_per_strike[str(strike)]
+                conversion_edge = float(metrics.get("conversion_edge", 0.0) or 0.0)
+                reversal_edge = float(metrics.get("reversal_edge", 0.0) or 0.0)
+                bucket["sample_count"] += 1
+                bucket["max_conversion_edge"] = max(float(bucket["max_conversion_edge"]), conversion_edge)
+                bucket["max_reversal_edge"] = max(float(bucket["max_reversal_edge"]), reversal_edge)
+                if conversion_edge > 0:
+                    bucket["positive_conversion_count"] += 1
+                if reversal_edge > 0:
+                    bucket["positive_reversal_count"] += 1
             composite_basis = payload.get("composite_basis")
             if composite_basis is not None:
                 composite_abs = abs(float(composite_basis))
@@ -1142,12 +1847,129 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 "max_abs_basis": round(composite_basis_max_abs, 4),
             },
         }
+        b_tradeable_parity_stats = {
+            strike: {
+                "sample_count": int(bucket["sample_count"]),
+                "max_conversion_edge": round(0.0 if bucket["max_conversion_edge"] == float("-inf") else bucket["max_conversion_edge"], 4),
+                "max_reversal_edge": round(0.0 if bucket["max_reversal_edge"] == float("-inf") else bucket["max_reversal_edge"], 4),
+                "positive_conversion_count": int(bucket["positive_conversion_count"]),
+                "positive_reversal_count": int(bucket["positive_reversal_count"]),
+            }
+            for strike, bucket in sorted(tradeable_per_strike.items())
+        }
+
+    b_parity_shadow_events = [
+        event
+        for event in event_list
+        if str(event.get("event_type") or "") == "derived_signal"
+        and str(event.get("strategy_family") or "") == "b_parity_opportunist"
+    ]
+    b_parity_shadow_stats: dict[str, Any] = {
+        "opportunity_count": len(b_parity_shadow_events),
+        "best_edge": 0.0,
+        "by_kind": {},
+        "by_strike": {},
+    }
+    for event in b_parity_shadow_events:
+        opportunity = ((event.get("payload") or {}).get("opportunity") or {})
+        kind = str(opportunity.get("kind") or "unknown")
+        strike = str(opportunity.get("strike") or "unknown")
+        edge = float(opportunity.get("edge", 0.0) or 0.0)
+        b_parity_shadow_stats["best_edge"] = max(float(b_parity_shadow_stats["best_edge"]), edge)
+        by_kind = b_parity_shadow_stats["by_kind"].setdefault(kind, {"count": 0, "best_edge": 0.0})
+        by_kind["count"] += 1
+        by_kind["best_edge"] = max(float(by_kind["best_edge"]), edge)
+        by_strike = b_parity_shadow_stats["by_strike"].setdefault(strike, {"count": 0, "best_edge": 0.0})
+        by_strike["count"] += 1
+        by_strike["best_edge"] = max(float(by_strike["best_edge"]), edge)
+    b_parity_shadow_stats["best_edge"] = round(float(b_parity_shadow_stats["best_edge"]), 4)
+    for group_name in ("by_kind", "by_strike"):
+        for row in b_parity_shadow_stats[group_name].values():
+            row["best_edge"] = round(float(row["best_edge"]), 4)
 
     b_shadow_underlying_mm = build_b_shadow_underlying_mm_summary(event_list)
+    b_option_lottery_summary = build_b_option_lottery_summary(event_list)
+    etf_a_shock_calibration = build_etf_a_shock_calibration_summary(event_list)
+    etf_episode_summaries = build_etf_episode_summaries(event_list)
+    etf_missed_entry_reasons = Counter(
+        str(row.get("first_block_reason") or "no_order_attempt_recorded")
+        for row in etf_episode_summaries
+        if int(row.get("entry_qty") or 0) == 0
+    )
+    action_markout_summary = _average_markouts(fill_markouts_by_action_class)
+    b_mean_reversion_summary = {
+        "decision_count": int(b_meanrev_decision_count),
+        "quote_count": int(b_meanrev_quote_count),
+        "entry_count": int(b_meanrev_entry_count),
+        "exit_count": int(b_meanrev_exit_count),
+        "risk_off_count": int(b_meanrev_risk_off_count),
+        "risk_off_forced_exit_count": int(b_meanrev_risk_off_forced_exit_count),
+        "risk_off_hold_or_passive_reduce_count": int(b_meanrev_risk_off_passive_count),
+        "fill_count": int(
+            fills_by_action_class.get("mean_reversion_entry", 0)
+            + fills_by_action_class.get("mean_reversion_exit", 0)
+            + fills_by_action_class.get("mean_reversion_risk_off", 0)
+        ),
+        "fill_qty": int(
+            fill_qty_by_action_class.get("mean_reversion_entry", 0)
+            + fill_qty_by_action_class.get("mean_reversion_exit", 0)
+            + fill_qty_by_action_class.get("mean_reversion_risk_off", 0)
+        ),
+        "avg_entry_abs_z": round(b_meanrev_entry_z_sum / b_meanrev_entry_z_count, 4)
+        if b_meanrev_entry_z_count
+        else None,
+        "mean_abs_inventory": round(
+            b_meanrev_abs_inventory_sum / b_meanrev_inventory_sample_count,
+            4,
+        ) if b_meanrev_inventory_sample_count else 0.0,
+        "max_long_inventory": int(b_meanrev_max_long),
+        "max_short_inventory": int(b_meanrev_max_short),
+        "entry_markouts": action_markout_summary.get("mean_reversion_entry", {}),
+        "exit_markouts": action_markout_summary.get("mean_reversion_exit", {}),
+        "risk_off_markouts": action_markout_summary.get("mean_reversion_risk_off", {}),
+    }
+    b_underlying_mm_v2_summary = {
+        "decision_count": int(b_mm_v2_decision_count),
+        "quote_count": int(b_mm_v2_quote_count),
+        "fill_count": int(b_fill_count),
+        "fill_qty": int(b_fill_qty),
+        "quote_to_fill_ratio": round(
+            b_mm_v2_quote_count / b_fill_count,
+            4,
+        ) if b_fill_count else None,
+        "average_desired_spread": round(
+            b_mm_v2_desired_spread_sum / b_mm_v2_desired_spread_count,
+            4,
+        ) if b_mm_v2_desired_spread_count else None,
+        "mean_abs_inventory": round(
+            b_mm_v2_abs_inventory_sum / b_mm_v2_inventory_sample_count,
+            4,
+        ) if b_mm_v2_inventory_sample_count else 0.0,
+        "max_long_inventory": int(b_mm_v2_max_long),
+        "max_short_inventory": int(b_mm_v2_max_short),
+    }
+    b_adverse_selection_stats = {
+        "fill_count": int(b_fill_count),
+        "fill_qty": int(b_fill_qty),
+        "average_spread_at_fill": round(b_fill_spread_sum / b_fill_spread_count, 4) if b_fill_spread_count else None,
+        "crossed_or_locked_fill_count": int(b_crossed_or_locked_fill_count),
+        "crossed_or_locked_fill_rate": round(b_crossed_or_locked_fill_count / b_fill_count, 4) if b_fill_count else 0.0,
+        "reduce_only_fill_count": int(b_reduce_only_fill_count),
+        "reduce_only_pnl": round(pnl_by_action_class.get("B.reduce_only", 0.0), 4),
+        "market_making_pnl": round(pnl_by_action_class.get("B.market_making", 0.0), 4),
+        "mean_reversion_entry_pnl": round(pnl_by_action_class.get("B.mean_reversion_entry", 0.0), 4),
+        "mean_reversion_exit_pnl": round(pnl_by_action_class.get("B.mean_reversion_exit", 0.0), 4),
+        "mean_reversion_risk_off_pnl": round(pnl_by_action_class.get("B.mean_reversion_risk_off", 0.0), 4),
+    }
 
     trace_volume_summary = {
         "event_counts": dict(sorted(trace_event_counts.items())),
         "symbol_counts": dict(sorted(trace_symbol_counts.items())),
+    }
+    inventory_divergence_summary = {
+        symbol: dict(row)
+        for symbol, row in sorted(inventory_divergence_by_symbol.items())
+        if int(row.get("sample_count") or 0) > 0
     }
 
     return {
@@ -1184,10 +2006,19 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "estimated_final_mtm_pnl": latest_mtm,
         "estimated_final_mtm_basis": latest_mtm_basis,
         "fill_markouts_by_intent": _average_markouts(fill_markouts_by_intent),
-        "markouts_by_action_class": _average_markouts(fill_markouts_by_action_class),
+        "markouts_by_action_class": action_markout_summary,
         "pnl_by_market": {key: round(value, 4) for key, value in sorted(pnl_by_market.items())},
         "pnl_by_strategy_family": {key: round(value, 4) for key, value in sorted(pnl_by_strategy_family.items())},
         "pnl_by_action_class": {key: round(value, 4) for key, value in sorted(pnl_by_action_class.items())},
+        "attribution_reliability": attribution_reliability,
+        "inventory_divergence_summary": inventory_divergence_summary,
+        "pnl_attribution_note": (
+            "Per-strategy P&L excludes symbols whose fill-side reconstruction diverged from traced inventory."
+            if unreliable_symbols
+            else "Strategy/exchange inventory divergence was observed; review inventory_divergence_summary."
+            if any(int(row.get("divergent_sample_count") or 0) > 0 for row in inventory_divergence_summary.values())
+            else "Per-strategy P&L reconstruction matched traced inventory within tolerance."
+        ),
         "top_losing_strategy_families": top_losing_strategy_families,
         "top_losing_signal_episodes": top_losing_signal_episodes,
         "strategy_family_stats": strategy_rows,
@@ -1198,10 +2029,23 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "a_news_episode_summaries": a_news_episode_summaries,
         "a_mm_loss_by_mode": a_mm_loss_by_mode,
         "a_strategy_breakdown": a_strategy_breakdown,
+        "a_earnings_calibration_diagnostics": a_earnings_calibration_diagnostics,
         "derived_signal_counts": dict(sorted(derived_signal_counts.items())),
         "latest_derived_signals": latest_derived_signals,
         "b_cost_adjusted_residual_stats": b_cost_adjusted_residual_stats,
+        "b_tradeable_parity_stats": b_tradeable_parity_stats,
+        "b_parity_shadow_stats": b_parity_shadow_stats,
+        "b_mean_reversion_summary": b_mean_reversion_summary,
+        "b_underlying_mm_v2_summary": b_underlying_mm_v2_summary,
+        "b_adverse_selection_stats": b_adverse_selection_stats,
+        "b_option_lottery_summary": b_option_lottery_summary,
         "b_shadow_underlying_mm": b_shadow_underlying_mm,
+        "etf_a_shock_calibration": etf_a_shock_calibration,
+        "etf_episode_summaries": etf_episode_summaries,
+        "etf_missed_entry_summary": {
+            "missed_entry_signal_count": int(sum(etf_missed_entry_reasons.values())),
+            "by_reason": dict(etf_missed_entry_reasons.most_common()),
+        },
         "b_strategy_block_reasons": dict(b_strategy_block_reasons.most_common()),
         "trace_volume_summary": trace_volume_summary,
         "activity_split": {
@@ -1228,11 +2072,22 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     a_news_episode_summaries = summary.get("a_news_episode_summaries") or []
     a_mm_loss_by_mode = summary.get("a_mm_loss_by_mode") or {}
     a_strategy_breakdown = summary.get("a_strategy_breakdown") or {}
+    a_earnings_calibration_diagnostics = summary.get("a_earnings_calibration_diagnostics") or {}
     a_news_summary = summary.get("a_news_summary") or {}
     b_cost_stats = summary.get("b_cost_adjusted_residual_stats") or {}
+    b_tradeable_parity_stats = summary.get("b_tradeable_parity_stats") or {}
+    b_parity_shadow_stats = summary.get("b_parity_shadow_stats") or {}
+    b_mean_reversion_summary = summary.get("b_mean_reversion_summary") or {}
+    b_underlying_mm_v2_summary = summary.get("b_underlying_mm_v2_summary") or {}
+    b_adverse_selection_stats = summary.get("b_adverse_selection_stats") or {}
+    b_option_lottery_summary = summary.get("b_option_lottery_summary") or {}
     b_shadow_underlying_mm = summary.get("b_shadow_underlying_mm") or {}
+    etf_a_shock_calibration = summary.get("etf_a_shock_calibration") or {}
+    etf_episode_summaries = summary.get("etf_episode_summaries") or []
+    etf_missed_entry_summary = summary.get("etf_missed_entry_summary") or {}
     b_strategy_block_reasons = summary.get("b_strategy_block_reasons") or {}
     trace_volume_summary = summary.get("trace_volume_summary") or {}
+    inventory_divergence_summary = summary.get("inventory_divergence_summary") or {}
     return "\n".join(
         [
             f"# A Bot Run Summary",
@@ -1241,6 +2096,7 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             f"- Run folder: `{run_dir}`",
             f"- Total events: `{summary.get('total_events', 0)}`",
             f"- Estimated final MTM PnL: `{summary.get('estimated_final_mtm_pnl')}` (`{summary.get('estimated_final_mtm_basis')}`)",
+            f"- Attribution note: `{summary.get('pnl_attribution_note')}`",
             f"- Passive fills: `{summary.get('passive_fills', 0)}`",
             f"- Aggressive fills: `{summary.get('aggressive_fills', 0)}`",
             f"- Largest long inventory: `{summary.get('largest_inventory_long', 0)}`",
@@ -1305,6 +2161,9 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "## A Strategy Breakdown",
             *(f"- `{key}`: `{value}`" for key, value in a_strategy_breakdown.items()),
             "",
+            "## A Earnings Calibration Diagnostics",
+            *(f"- `{key}`: `{value}`" for key, value in a_earnings_calibration_diagnostics.items()),
+            "",
             "## A News Summary",
             *(f"- `{key}`: `{value}`" for key, value in a_news_summary.items()),
             "",
@@ -1325,8 +2184,56 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
                 for strike, stats in (b_cost_stats.get("by_strike") or {}).items()
             ),
             "",
+            "## B Tradeable Parity Stats",
+            *(f"- Strike `{strike}`: `{stats}`" for strike, stats in b_tradeable_parity_stats.items()),
+            "",
+            "## B Parity Shadow Stats",
+            f"- Opportunity count: `{b_parity_shadow_stats.get('opportunity_count')}`",
+            f"- Best edge: `{b_parity_shadow_stats.get('best_edge')}`",
+            f"- By kind: `{b_parity_shadow_stats.get('by_kind')}`",
+            f"- By strike: `{b_parity_shadow_stats.get('by_strike')}`",
+            "",
+            "## B Mean Reversion Summary",
+            *(f"- `{key}`: `{value}`" for key, value in b_mean_reversion_summary.items()),
+            "",
+            "## B Underlying MM v2 Summary",
+            *(f"- `{key}`: `{value}`" for key, value in b_underlying_mm_v2_summary.items()),
+            "",
+            "## B Adverse Selection",
+            *(f"- `{key}`: `{value}`" for key, value in b_adverse_selection_stats.items()),
+            "",
+            "## B Option Lottery Summary",
+            f"- Premium spent: `{b_option_lottery_summary.get('premium_spent')}`",
+            f"- Premium recovered: `{b_option_lottery_summary.get('premium_recovered')}`",
+            f"- Hedge premium spent: `{b_option_lottery_summary.get('hedge_premium_spent')}`",
+            f"- MTM PnL: `{b_option_lottery_summary.get('mtm_pnl')}`",
+            f"- MTM PnL from fill-open qty: `{b_option_lottery_summary.get('mtm_pnl_from_fills')}`",
+            f"- Open mark value from fill-open qty: `{b_option_lottery_summary.get('open_mark_value_from_fills')}`",
+            *(
+                f"- `{symbol}`: `{stats}`"
+                for symbol, stats in (b_option_lottery_summary.get("by_symbol") or {}).items()
+            ),
+            "",
             "## B Shadow Underlying MM",
             *(f"- `{key}`: `{value}`" for key, value in b_shadow_underlying_mm.items()),
+            "",
+            "## ETF A-Shock Calibration",
+            f"- Signal count: `{etf_a_shock_calibration.get('signal_count', 0)}`",
+            f"- By horizon: `{etf_a_shock_calibration.get('by_horizon_ms')}`",
+            f"- By source kind: `{etf_a_shock_calibration.get('by_source_kind')}`",
+            f"- Candidate alpha evaluation: `{etf_a_shock_calibration.get('candidate_alpha_evaluation')}`",
+            f"- Missed entry signals: `{etf_missed_entry_summary.get('missed_entry_signal_count', 0)}`",
+            f"- Missed entry reasons: `{etf_missed_entry_summary.get('by_reason')}`",
+            "",
+            "## ETF Episode Summaries",
+            *(
+                f"- `{row.get('signal_id')}` source=`{row.get('source_kind')}` target=`{row.get('target_inventory')}` "
+                f"entry_qty=`{row.get('entry_qty')}` unwind_qty=`{row.get('unwind_qty')}` peak=`{row.get('peak_inventory')}` "
+                f"hold_ms=`{row.get('hold_time_ms')}` pnl=`{row.get('episode_pnl')}` "
+                f"unwind_reason=`{row.get('unwind_reason')}` first_block=`{row.get('first_block_reason')}` "
+                f"direction_match=`{row.get('direction_match_by_horizon_ms')}`"
+                for row in etf_episode_summaries
+            ),
             "",
             "## B Strategy Block Reasons",
             *(f"- `{reason}`: `{count}`" for reason, count in b_strategy_block_reasons.items()),
@@ -1334,6 +2241,9 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "## Trace Volume Summary",
             f"- Event counts: `{trace_volume_summary.get('event_counts')}`",
             f"- Symbol counts: `{trace_volume_summary.get('symbol_counts')}`",
+            "",
+            "## Inventory Divergence Summary",
+            *(f"- `{symbol}`: `{stats}`" for symbol, stats in inventory_divergence_summary.items()),
         ]
     )
 
@@ -1400,6 +2310,7 @@ class TraceRecorder:
     def _state_fields(self, state: dict[str, Any], cash: int | None) -> dict[str, Any]:
         book = state.get("book") or {}
         live_orders = list(state.get("live_orders") or [])
+        max_depth_levels = max(0, int(self.trace_config.trace_book_depth_levels or 0))
         mtm_pnl, mtm_basis, mark_price = estimate_mtm(state, cash)
         self._latest_cash = cash if cash is not None else self._latest_cash
         return {
@@ -1417,6 +2328,8 @@ class TraceRecorder:
             "news_caution_until_ms": state.get("news_caution_until_ms"),
             "news_caution_remaining_ms": state.get("news_caution_remaining_ms"),
             "inventory": state.get("inventory"),
+            "strategy_inventory": state.get("strategy_inventory"),
+            "exchange_inventory": state.get("exchange_inventory"),
             "earnings_position": state.get("earnings_position"),
             "news_position": state.get("news_position"),
             "mm_position": state.get("mm_position"),
@@ -1435,6 +2348,19 @@ class TraceRecorder:
             "news_confirmation_deadline_ms": state.get("news_confirmation_deadline_ms"),
             "news_takeover_started_ms": state.get("news_takeover_started_ms"),
             "pe_frozen": state.get("pe_frozen"),
+            "last_a_unstructured_news_ms": state.get("last_a_unstructured_news_ms"),
+            "pe_freeze_until_ms": state.get("pe_freeze_until_ms"),
+            "a_news_seen_before_first_structured_earnings": state.get("a_news_seen_before_first_structured_earnings"),
+            "first_structured_earnings_seen": state.get("first_structured_earnings_seen"),
+            "permanent_post_eps_news_freeze": state.get("permanent_post_eps_news_freeze"),
+            "clean_multiplier_sample_count": state.get("clean_multiplier_sample_count"),
+            "multiplier_freeze_event_count": state.get("multiplier_freeze_event_count"),
+            "multiplier_unfreeze_event_count": state.get("multiplier_unfreeze_event_count"),
+            "permanent_post_eps_news_freeze_count": state.get("permanent_post_eps_news_freeze_count"),
+            "temporary_pre_eps_news_freeze_count": state.get("temporary_pre_eps_news_freeze_count"),
+            "earnings_conflict_skip_count": state.get("earnings_conflict_skip_count"),
+            "earnings_conflict_override_count": state.get("earnings_conflict_override_count"),
+            "earnings_conflict_guard_events": state.get("earnings_conflict_guard_events"),
             "news_matched_phrases": state.get("news_matched_phrases"),
             "news_matched_unigrams": state.get("news_matched_unigrams"),
             "news_matched_bigrams": state.get("news_matched_bigrams"),
@@ -1459,8 +2385,8 @@ class TraceRecorder:
             "microprice": book.get("microprice"),
             "top_of_book_imbalance": book.get("top_of_book_imbalance"),
             "book_depth": {
-                "bid_levels": list(book.get("bid_levels") or []),
-                "ask_levels": list(book.get("ask_levels") or []),
+                "bid_levels": _trim_depth_levels(book.get("bid_levels") or [], max_depth_levels),
+                "ask_levels": _trim_depth_levels(book.get("ask_levels") or [], max_depth_levels),
             },
             "live_orders": live_orders,
             "cash": cash if cash is not None else self._latest_cash,
@@ -1475,6 +2401,46 @@ class TraceRecorder:
             "current_news_signal_id": state.get("current_news_signal_id"),
             "last_relevant_a_earnings_ms": state.get("last_relevant_a_earnings_ms"),
             "active_earnings_cycle_id": state.get("active_earnings_cycle_id"),
+            "composite_synthetic_fair": state.get("composite_synthetic_fair"),
+            "synthetic_dispersion": state.get("synthetic_dispersion"),
+            "composite_basis": state.get("composite_basis"),
+            "block_reason": state.get("block_reason"),
+            "b_mm_v2_base_center": state.get("b_mm_v2_base_center"),
+            "b_mm_v2_used_synthetic_anchor": state.get("b_mm_v2_used_synthetic_anchor"),
+            "b_mm_v2_dynamic_half_spread": state.get("b_mm_v2_dynamic_half_spread"),
+            "b_mm_v2_bid_px": state.get("b_mm_v2_bid_px"),
+            "b_mm_v2_ask_px": state.get("b_mm_v2_ask_px"),
+            "b_meanrev_ema_fast": state.get("b_meanrev_ema_fast"),
+            "b_meanrev_ema_slow": state.get("b_meanrev_ema_slow"),
+            "b_meanrev_sigma": state.get("b_meanrev_sigma"),
+            "b_meanrev_z": state.get("b_meanrev_z"),
+            "b_meanrev_target_inventory": state.get("b_meanrev_target_inventory"),
+            "b_meanrev_hold_ms": state.get("b_meanrev_hold_ms"),
+            "b_meanrev_regime_block_reason": state.get("b_meanrev_regime_block_reason"),
+            "b_meanrev_risk_off_forced": state.get("b_meanrev_risk_off_forced"),
+            "etf_signal_id": state.get("etf_signal_id"),
+            "etf_alpha_from_a": state.get("etf_alpha_from_a"),
+            "etf_source_signal_id": state.get("etf_source_signal_id"),
+            "etf_source_signal_kind": state.get("etf_source_signal_kind"),
+            "etf_a_fair_shift": state.get("etf_a_fair_shift"),
+            "etf_projected_shift": state.get("etf_projected_shift"),
+            "etf_base_mid": state.get("etf_base_mid"),
+            "etf_target_fair": state.get("etf_target_fair"),
+            "etf_target_inventory": state.get("etf_target_inventory"),
+            "etf_source_target_inventory": state.get("etf_source_target_inventory"),
+            "etf_target_from_a_position": state.get("etf_target_from_a_position"),
+            "etf_unwind_reason": state.get("etf_unwind_reason"),
+            "b_option_lottery_premium_spent": state.get("b_option_lottery_premium_spent"),
+            "b_option_lottery_premium_recovered": state.get("b_option_lottery_premium_recovered"),
+            "b_option_lottery_symbol_premium_remaining": state.get("b_option_lottery_symbol_premium_remaining"),
+            "b_option_lottery_avg_entry": state.get("b_option_lottery_avg_entry"),
+            "b_option_lottery_realized_profit": state.get("b_option_lottery_realized_profit"),
+            "b_option_underlying_inventory": state.get("b_option_underlying_inventory"),
+            "b_option_hedge_needed": state.get("b_option_hedge_needed"),
+            "b_option_hedge_target_qty": state.get("b_option_hedge_target_qty"),
+            "b_option_hedge_budget_remaining": state.get("b_option_hedge_budget_remaining"),
+            "b_option_profit_take_trigger": state.get("b_option_profit_take_trigger"),
+            "b_option_hedge_premium_spent": state.get("b_option_hedge_premium_spent"),
         }
 
     @staticmethod
@@ -1558,6 +2524,8 @@ class TraceRecorder:
         self._write_event(event)
 
     def record_book_update(self, *, now_ms: int, state: dict[str, Any], cash: int | None, trigger: str) -> None:
+        if not self.trace_config.trace_record_book_updates:
+            return
         event = self._base_event(
             "book_update",
             now_ms=now_ms,
@@ -1693,6 +2661,13 @@ class TraceRecorder:
         self._write_event(event)
 
     def record_decision(self, *, now_ms: int, state: dict[str, Any], cash: int | None, trigger: str, plan) -> None:
+        if (
+            not self.trace_config.trace_record_observe_only_decisions
+            and plan.observe_only
+            and not _decision_has_orders(plan)
+            and not _is_high_signal_observe_only_decision(plan)
+        ):
+            return
         desired_bid = None if plan.bid is None else self._serialize_order(plan.bid.__dict__)
         desired_ask = None if plan.ask is None else self._serialize_order(plan.ask.__dict__)
         aggressive_actions = [self._serialize_order(action.__dict__) for action in plan.aggressive_actions]
@@ -1985,6 +2960,8 @@ class TraceRecorder:
             "trusted_multiplier": event.get("trusted_multiplier"),
             "multiplier_confidence": event.get("multiplier_confidence"),
             "inventory": event.get("inventory"),
+            "strategy_inventory": event.get("strategy_inventory"),
+            "exchange_inventory": event.get("exchange_inventory"),
             "earnings_position": event.get("earnings_position"),
             "news_position": event.get("news_position"),
             "mm_position": event.get("mm_position"),
@@ -2030,12 +3007,64 @@ class TraceRecorder:
             "news_confirmation_deadline_ms": event.get("news_confirmation_deadline_ms"),
             "news_takeover_started_ms": event.get("news_takeover_started_ms"),
             "pe_frozen": event.get("pe_frozen"),
+            "last_a_unstructured_news_ms": event.get("last_a_unstructured_news_ms"),
+            "pe_freeze_until_ms": event.get("pe_freeze_until_ms"),
+            "a_news_seen_before_first_structured_earnings": event.get("a_news_seen_before_first_structured_earnings"),
+            "first_structured_earnings_seen": event.get("first_structured_earnings_seen"),
+            "permanent_post_eps_news_freeze": event.get("permanent_post_eps_news_freeze"),
+            "clean_multiplier_sample_count": event.get("clean_multiplier_sample_count"),
+            "multiplier_freeze_event_count": event.get("multiplier_freeze_event_count"),
+            "multiplier_unfreeze_event_count": event.get("multiplier_unfreeze_event_count"),
+            "permanent_post_eps_news_freeze_count": event.get("permanent_post_eps_news_freeze_count"),
+            "temporary_pre_eps_news_freeze_count": event.get("temporary_pre_eps_news_freeze_count"),
+            "earnings_conflict_skip_count": event.get("earnings_conflict_skip_count"),
+            "earnings_conflict_override_count": event.get("earnings_conflict_override_count"),
             "news_matched_phrases_json": json.dumps(event.get("news_matched_phrases") or [], sort_keys=True, default=_json_default),
             "news_matched_unigrams_json": json.dumps(event.get("news_matched_unigrams") or [], sort_keys=True, default=_json_default),
             "news_matched_bigrams_json": json.dumps(event.get("news_matched_bigrams") or [], sort_keys=True, default=_json_default),
             "unknown_candidate_phrases_json": json.dumps(event.get("unknown_candidate_phrases") or [], sort_keys=True, default=_json_default),
             "unknown_candidate_unigrams_json": json.dumps(event.get("unknown_candidate_unigrams") or [], sort_keys=True, default=_json_default),
             "unknown_candidate_bigrams_json": json.dumps(event.get("unknown_candidate_bigrams") or [], sort_keys=True, default=_json_default),
+            "composite_synthetic_fair": event.get("composite_synthetic_fair"),
+            "synthetic_dispersion": event.get("synthetic_dispersion"),
+            "composite_basis": event.get("composite_basis"),
+            "block_reason": event.get("block_reason"),
+            "b_mm_v2_base_center": event.get("b_mm_v2_base_center"),
+            "b_mm_v2_used_synthetic_anchor": event.get("b_mm_v2_used_synthetic_anchor"),
+            "b_mm_v2_dynamic_half_spread": event.get("b_mm_v2_dynamic_half_spread"),
+            "b_mm_v2_bid_px": event.get("b_mm_v2_bid_px"),
+            "b_mm_v2_ask_px": event.get("b_mm_v2_ask_px"),
+            "b_meanrev_ema_fast": event.get("b_meanrev_ema_fast"),
+            "b_meanrev_ema_slow": event.get("b_meanrev_ema_slow"),
+            "b_meanrev_sigma": event.get("b_meanrev_sigma"),
+            "b_meanrev_z": event.get("b_meanrev_z"),
+            "b_meanrev_target_inventory": event.get("b_meanrev_target_inventory"),
+            "b_meanrev_hold_ms": event.get("b_meanrev_hold_ms"),
+            "b_meanrev_regime_block_reason": event.get("b_meanrev_regime_block_reason"),
+            "b_meanrev_risk_off_forced": event.get("b_meanrev_risk_off_forced"),
+            "etf_signal_id": event.get("etf_signal_id"),
+            "etf_alpha_from_a": event.get("etf_alpha_from_a"),
+            "etf_source_signal_id": event.get("etf_source_signal_id"),
+            "etf_source_signal_kind": event.get("etf_source_signal_kind"),
+            "etf_a_fair_shift": event.get("etf_a_fair_shift"),
+            "etf_projected_shift": event.get("etf_projected_shift"),
+            "etf_base_mid": event.get("etf_base_mid"),
+            "etf_target_fair": event.get("etf_target_fair"),
+            "etf_target_inventory": event.get("etf_target_inventory"),
+            "etf_source_target_inventory": event.get("etf_source_target_inventory"),
+            "etf_target_from_a_position": event.get("etf_target_from_a_position"),
+            "etf_unwind_reason": event.get("etf_unwind_reason"),
+            "b_option_lottery_premium_spent": event.get("b_option_lottery_premium_spent"),
+            "b_option_lottery_premium_recovered": event.get("b_option_lottery_premium_recovered"),
+            "b_option_lottery_symbol_premium_remaining": event.get("b_option_lottery_symbol_premium_remaining"),
+            "b_option_lottery_avg_entry": event.get("b_option_lottery_avg_entry"),
+            "b_option_lottery_realized_profit": event.get("b_option_lottery_realized_profit"),
+            "b_option_underlying_inventory": event.get("b_option_underlying_inventory"),
+            "b_option_hedge_needed": event.get("b_option_hedge_needed"),
+            "b_option_hedge_target_qty": event.get("b_option_hedge_target_qty"),
+            "b_option_hedge_budget_remaining": event.get("b_option_hedge_budget_remaining"),
+            "b_option_profit_take_trigger": event.get("b_option_profit_take_trigger"),
+            "b_option_hedge_premium_spent": event.get("b_option_hedge_premium_spent"),
         }
 
     def finalize(self, *, now_ms: int, state: dict[str, Any], cash: int | None, note: str | None = None) -> None:
