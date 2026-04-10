@@ -117,6 +117,15 @@ SNAPSHOT_FIELDNAMES = [
     "b_mm_v2_dynamic_half_spread",
     "b_mm_v2_bid_px",
     "b_mm_v2_ask_px",
+    "b_meanrev_ema_fast",
+    "b_meanrev_ema_slow",
+    "b_meanrev_sigma",
+    "b_meanrev_z",
+    "b_meanrev_target_inventory",
+    "b_meanrev_hold_ms",
+    "b_meanrev_regime_block_reason",
+    "b_meanrev_risk_off_forced",
+    "etf_signal_id",
     "etf_alpha_from_a",
     "etf_source_signal_id",
     "etf_source_signal_kind",
@@ -133,6 +142,12 @@ SNAPSHOT_FIELDNAMES = [
     "b_option_lottery_symbol_premium_remaining",
     "b_option_lottery_avg_entry",
     "b_option_lottery_realized_profit",
+    "b_option_underlying_inventory",
+    "b_option_hedge_needed",
+    "b_option_hedge_target_qty",
+    "b_option_hedge_budget_remaining",
+    "b_option_profit_take_trigger",
+    "b_option_hedge_premium_spent",
 ]
 
 
@@ -776,6 +791,13 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
         if str(event.get("event_type") or "") == "order_submitted"
         and str(event.get("strategy_family") or "") == "etf_a_follower"
     ]
+    decision_events = [
+        event
+        for event in events
+        if str(event.get("event_type") or "") == "decision_evaluated"
+        and str(event.get("symbol") or "") == "ETF"
+        and str(event.get("mode") or "").startswith("ETF_")
+    ]
     inventory_events = [
         event
         for event in events
@@ -802,6 +824,12 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
             for event in submit_events
             if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
             and str(event.get("signal_id") or "") == signal_id
+        ]
+        episode_decisions = [
+            event
+            for event in decision_events
+            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
+            and (not event.get("etf_signal_id") or str(event.get("etf_signal_id") or "") == signal_id)
         ]
         signed_qty = 0
         cash_pnl = 0.0
@@ -852,6 +880,12 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
             if str(submit.get("action_class") or "") == "etf_shock_unwind":
                 unwind_reason = submit.get("reason") or submit.get("evaluation_reason")
                 break
+        first_block_reason = None
+        for decision in episode_decisions:
+            block_reason = decision.get("block_reason") or decision.get("reason")
+            if block_reason:
+                first_block_reason = str(block_reason)
+                break
         base_mid = payload.get("base_mid")
         direction_matches: dict[str, bool | None] = {}
         for horizon_ms in (1_000, 3_000, 5_000):
@@ -872,6 +906,8 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
                 "target_inventory": payload.get("target_inventory"),
                 "entry_qty": entry_qty,
                 "entry_qty_vs_abs_target": None if payload.get("target_inventory") is None else entry_qty - abs(int(payload.get("target_inventory") or 0)),
+                "entry_attempt_count": len(episode_submits),
+                "first_block_reason": first_block_reason,
                 "unwind_qty": unwind_qty,
                 "churn_fill_count": max(0, len(episode_fills) - 2),
                 "fill_side_alternations": fill_side_alternations,
@@ -903,34 +939,48 @@ def build_b_option_lottery_summary(events: list[dict[str, Any]]) -> dict[str, An
             "premium_spent": 0.0,
             "premium_recovered": 0.0,
             "realized_profit_taking": 0.0,
+            "hedge_buy_qty": 0,
+            "hedge_premium_spent": 0.0,
             "final_inventory": 0,
             "avg_entry": None,
             "final_mark": None,
             "max_mark_after_first_buy": None,
+            "max_mark_while_long": None,
             "mtm_pnl": 0.0,
+            "open_qty_from_fills": 0,
+            "open_mark_value_from_fills": 0.0,
+            "mtm_pnl_from_fills": 0.0,
             "first_buy_ms": None,
         }
         for symbol in option_symbols
     }
     latest_mark: dict[str, float] = {}
     mark_series: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    mark_series_while_long: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    latest_position_by_symbol: dict[str, int] = defaultdict(int)
     for event in events:
         symbol = str(event.get("symbol") or "")
         if symbol not in rows:
             continue
+        if event.get("inventory") is not None:
+            latest_position_by_symbol[symbol] = int(event.get("inventory") or 0)
+            rows[symbol]["final_inventory"] = int(event.get("inventory") or 0)
         mark = _trace_mark_from_event(event)
         if mark is not None:
             latest_mark[symbol] = float(mark)
             mark_series[symbol].append((int(event.get("monotonic_ms", 0)), float(mark)))
-        if event.get("inventory") is not None:
-            rows[symbol]["final_inventory"] = int(event.get("inventory") or 0)
+            if latest_position_by_symbol[symbol] > 0:
+                mark_series_while_long[symbol].append((int(event.get("monotonic_ms", 0)), float(mark)))
     open_cost: dict[str, float] = defaultdict(float)
     open_qty: Counter[str] = Counter()
     for event in events:
         if str(event.get("event_type") or "") != "order_filled":
             continue
         symbol = str(event.get("symbol") or "")
-        if symbol not in rows or not str(event.get("pnl_owner") or "").startswith("b_option_lottery"):
+        pnl_owner = str(event.get("pnl_owner") or "")
+        if symbol not in rows or not (
+            pnl_owner.startswith("b_option_lottery") or pnl_owner.startswith("b_option_hedge")
+        ):
             continue
         side = str(event.get("side") or "")
         qty = int(event.get("fill_qty") or event.get("qty") or 0)
@@ -940,6 +990,9 @@ def build_b_option_lottery_summary(events: list[dict[str, Any]]) -> dict[str, An
         if side == "BUY":
             row["buy_qty"] += qty
             row["premium_spent"] += qty * price
+            if pnl_owner.startswith("b_option_hedge"):
+                row["hedge_buy_qty"] += qty
+                row["hedge_premium_spent"] += qty * price
             open_cost[symbol] += qty * price
             open_qty[symbol] += qty
             row["first_buy_ms"] = now_ms if row["first_buy_ms"] is None else min(int(row["first_buy_ms"]), now_ms)
@@ -958,18 +1011,31 @@ def build_b_option_lottery_summary(events: list[dict[str, Any]]) -> dict[str, An
             row["avg_entry"] = round(float(row["premium_spent"]) / int(row["buy_qty"]), 4)
         first_buy_ms = row.get("first_buy_ms")
         if first_buy_ms is not None:
-            later_marks = [mark for ms, mark in mark_series.get(symbol, []) if ms >= int(first_buy_ms)]
+            later_marks = [mark for ms, mark in mark_series_while_long.get(symbol, []) if ms >= int(first_buy_ms)]
             row["max_mark_after_first_buy"] = round(max(later_marks), 4) if later_marks else None
+            row["max_mark_while_long"] = row["max_mark_after_first_buy"]
         mark_value = float(row.get("final_inventory") or 0) * float(final_mark or 0.0)
+        open_qty_from_fills = max(0, int(open_qty[symbol]))
+        open_mark_value_from_fills = open_qty_from_fills * float(final_mark or 0.0)
         row["mtm_pnl"] = round(float(row["premium_recovered"]) - float(row["premium_spent"]) + mark_value, 4)
+        row["open_qty_from_fills"] = open_qty_from_fills
+        row["open_mark_value_from_fills"] = round(open_mark_value_from_fills, 4)
+        row["mtm_pnl_from_fills"] = round(
+            float(row["premium_recovered"]) - float(row["premium_spent"]) + open_mark_value_from_fills,
+            4,
+        )
         row["premium_spent"] = round(float(row["premium_spent"]), 4)
         row["premium_recovered"] = round(float(row["premium_recovered"]), 4)
         row["realized_profit_taking"] = round(float(row["realized_profit_taking"]), 4)
+        row["hedge_premium_spent"] = round(float(row["hedge_premium_spent"]), 4)
     active_rows = {symbol: row for symbol, row in rows.items() if row["buy_qty"] or row["sell_qty"] or row["final_inventory"]}
     return {
         "premium_spent": round(sum(float(row["premium_spent"]) for row in active_rows.values()), 4),
         "premium_recovered": round(sum(float(row["premium_recovered"]) for row in active_rows.values()), 4),
+        "hedge_premium_spent": round(sum(float(row["hedge_premium_spent"]) for row in active_rows.values()), 4),
         "mtm_pnl": round(sum(float(row["mtm_pnl"]) for row in active_rows.values()), 4),
+        "mtm_pnl_from_fills": round(sum(float(row["mtm_pnl_from_fills"]) for row in active_rows.values()), 4),
+        "open_mark_value_from_fills": round(sum(float(row["open_mark_value_from_fills"]) for row in active_rows.values()), 4),
         "by_symbol": active_rows,
     }
 
@@ -1042,6 +1108,19 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     b_mm_v2_inventory_sample_count = 0
     b_mm_v2_max_long = 0
     b_mm_v2_max_short = 0
+    b_meanrev_decision_count = 0
+    b_meanrev_quote_count = 0
+    b_meanrev_entry_count = 0
+    b_meanrev_exit_count = 0
+    b_meanrev_risk_off_count = 0
+    b_meanrev_risk_off_forced_exit_count = 0
+    b_meanrev_risk_off_passive_count = 0
+    b_meanrev_entry_z_sum = 0.0
+    b_meanrev_entry_z_count = 0
+    b_meanrev_abs_inventory_sum = 0
+    b_meanrev_inventory_sample_count = 0
+    b_meanrev_max_long = 0
+    b_meanrev_max_short = 0
     b_fill_count = 0
     b_fill_qty = 0
     b_fill_spread_sum = 0.0
@@ -1166,6 +1245,15 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 b_mm_v2_inventory_sample_count += 1
                 b_mm_v2_max_long = max(b_mm_v2_max_long, inv)
                 b_mm_v2_max_short = min(b_mm_v2_max_short, inv)
+                if (
+                    event.get("b_meanrev_z") is not None
+                    or str(event.get("mode") or "").startswith("B_MEANREV")
+                    or str(event.get("strategy_family") or "") == "b_mean_reversion"
+                ):
+                    b_meanrev_abs_inventory_sum += abs(inv)
+                    b_meanrev_inventory_sample_count += 1
+                    b_meanrev_max_long = max(b_meanrev_max_long, inv)
+                    b_meanrev_max_short = min(b_meanrev_max_short, inv)
 
         if mode:
             last_mode = last_mode_by_market.get(market_key)
@@ -1236,6 +1324,25 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         if event_type == "decision_evaluated":
             desired_bid = event.get("desired_bid") or {}
             desired_ask = event.get("desired_ask") or {}
+            aggressive_actions = list(event.get("aggressive_actions") or [])
+            has_meanrev_aggressive_action = any(
+                str(action.get("strategy_family") or "") == "b_mean_reversion"
+                for action in aggressive_actions
+                if isinstance(action, dict)
+            )
+            is_meanrev_decision = (
+                market_key == "B"
+                and symbol == "B"
+                and (
+                    event.get("b_meanrev_z") is not None
+                    or str(event.get("mode") or "").startswith("B_MEANREV")
+                    or str(desired_bid.get("strategy_family") or "") == "b_mean_reversion"
+                    or str(desired_ask.get("strategy_family") or "") == "b_mean_reversion"
+                    or has_meanrev_aggressive_action
+                )
+            )
+            if is_meanrev_decision:
+                b_meanrev_decision_count += 1
             if (
                 str(desired_bid.get("strategy_family") or "") == "b_underlying_mm_v2"
                 or str(desired_ask.get("strategy_family") or "") == "b_underlying_mm_v2"
@@ -1246,6 +1353,12 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 if desired_bid and desired_ask and desired_bid.get("px") is not None and desired_ask.get("px") is not None:
                     b_mm_v2_desired_spread_sum += float(desired_ask["px"]) - float(desired_bid["px"])
                     b_mm_v2_desired_spread_count += 1
+            if (
+                str(desired_bid.get("strategy_family") or "") == "b_mean_reversion"
+                or str(desired_ask.get("strategy_family") or "") == "b_mean_reversion"
+                or has_meanrev_aggressive_action
+            ):
+                b_meanrev_quote_count += 1
             if bool(event.get("observe_only")):
                 observe_only_count += 1
             if int(event.get("aggressive_action_count") or 0) == 0 and event.get("desired_bid") is None and event.get("desired_ask") is None:
@@ -1300,6 +1413,20 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             submits_by_action_class[action_class] += 1
             if bool(event.get("aggressive")):
                 spread_cross_count += 1
+            if str(event.get("strategy_family") or "") == "b_mean_reversion":
+                if action_class == "mean_reversion_entry":
+                    b_meanrev_entry_count += 1
+                    if event.get("b_meanrev_z") is not None:
+                        b_meanrev_entry_z_sum += abs(float(event.get("b_meanrev_z") or 0.0))
+                        b_meanrev_entry_z_count += 1
+                elif action_class == "mean_reversion_exit":
+                    b_meanrev_exit_count += 1
+                elif action_class == "mean_reversion_risk_off":
+                    b_meanrev_risk_off_count += 1
+                    if bool(event.get("b_meanrev_risk_off_forced")) or bool(event.get("aggressive")):
+                        b_meanrev_risk_off_forced_exit_count += 1
+                    else:
+                        b_meanrev_risk_off_passive_count += 1
 
         elif event_type == "order_cancel_requested":
             cancel_reason_counts[str(event.get("cancel_reason") or "unknown")] += 1
@@ -1764,6 +1891,43 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     b_option_lottery_summary = build_b_option_lottery_summary(event_list)
     etf_a_shock_calibration = build_etf_a_shock_calibration_summary(event_list)
     etf_episode_summaries = build_etf_episode_summaries(event_list)
+    etf_missed_entry_reasons = Counter(
+        str(row.get("first_block_reason") or "no_order_attempt_recorded")
+        for row in etf_episode_summaries
+        if int(row.get("entry_qty") or 0) == 0
+    )
+    action_markout_summary = _average_markouts(fill_markouts_by_action_class)
+    b_mean_reversion_summary = {
+        "decision_count": int(b_meanrev_decision_count),
+        "quote_count": int(b_meanrev_quote_count),
+        "entry_count": int(b_meanrev_entry_count),
+        "exit_count": int(b_meanrev_exit_count),
+        "risk_off_count": int(b_meanrev_risk_off_count),
+        "risk_off_forced_exit_count": int(b_meanrev_risk_off_forced_exit_count),
+        "risk_off_hold_or_passive_reduce_count": int(b_meanrev_risk_off_passive_count),
+        "fill_count": int(
+            fills_by_action_class.get("mean_reversion_entry", 0)
+            + fills_by_action_class.get("mean_reversion_exit", 0)
+            + fills_by_action_class.get("mean_reversion_risk_off", 0)
+        ),
+        "fill_qty": int(
+            fill_qty_by_action_class.get("mean_reversion_entry", 0)
+            + fill_qty_by_action_class.get("mean_reversion_exit", 0)
+            + fill_qty_by_action_class.get("mean_reversion_risk_off", 0)
+        ),
+        "avg_entry_abs_z": round(b_meanrev_entry_z_sum / b_meanrev_entry_z_count, 4)
+        if b_meanrev_entry_z_count
+        else None,
+        "mean_abs_inventory": round(
+            b_meanrev_abs_inventory_sum / b_meanrev_inventory_sample_count,
+            4,
+        ) if b_meanrev_inventory_sample_count else 0.0,
+        "max_long_inventory": int(b_meanrev_max_long),
+        "max_short_inventory": int(b_meanrev_max_short),
+        "entry_markouts": action_markout_summary.get("mean_reversion_entry", {}),
+        "exit_markouts": action_markout_summary.get("mean_reversion_exit", {}),
+        "risk_off_markouts": action_markout_summary.get("mean_reversion_risk_off", {}),
+    }
     b_underlying_mm_v2_summary = {
         "decision_count": int(b_mm_v2_decision_count),
         "quote_count": int(b_mm_v2_quote_count),
@@ -1793,6 +1957,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "reduce_only_fill_count": int(b_reduce_only_fill_count),
         "reduce_only_pnl": round(pnl_by_action_class.get("B.reduce_only", 0.0), 4),
         "market_making_pnl": round(pnl_by_action_class.get("B.market_making", 0.0), 4),
+        "mean_reversion_entry_pnl": round(pnl_by_action_class.get("B.mean_reversion_entry", 0.0), 4),
+        "mean_reversion_exit_pnl": round(pnl_by_action_class.get("B.mean_reversion_exit", 0.0), 4),
+        "mean_reversion_risk_off_pnl": round(pnl_by_action_class.get("B.mean_reversion_risk_off", 0.0), 4),
     }
 
     trace_volume_summary = {
@@ -1839,7 +2006,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "estimated_final_mtm_pnl": latest_mtm,
         "estimated_final_mtm_basis": latest_mtm_basis,
         "fill_markouts_by_intent": _average_markouts(fill_markouts_by_intent),
-        "markouts_by_action_class": _average_markouts(fill_markouts_by_action_class),
+        "markouts_by_action_class": action_markout_summary,
         "pnl_by_market": {key: round(value, 4) for key, value in sorted(pnl_by_market.items())},
         "pnl_by_strategy_family": {key: round(value, 4) for key, value in sorted(pnl_by_strategy_family.items())},
         "pnl_by_action_class": {key: round(value, 4) for key, value in sorted(pnl_by_action_class.items())},
@@ -1868,12 +2035,17 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "b_cost_adjusted_residual_stats": b_cost_adjusted_residual_stats,
         "b_tradeable_parity_stats": b_tradeable_parity_stats,
         "b_parity_shadow_stats": b_parity_shadow_stats,
+        "b_mean_reversion_summary": b_mean_reversion_summary,
         "b_underlying_mm_v2_summary": b_underlying_mm_v2_summary,
         "b_adverse_selection_stats": b_adverse_selection_stats,
         "b_option_lottery_summary": b_option_lottery_summary,
         "b_shadow_underlying_mm": b_shadow_underlying_mm,
         "etf_a_shock_calibration": etf_a_shock_calibration,
         "etf_episode_summaries": etf_episode_summaries,
+        "etf_missed_entry_summary": {
+            "missed_entry_signal_count": int(sum(etf_missed_entry_reasons.values())),
+            "by_reason": dict(etf_missed_entry_reasons.most_common()),
+        },
         "b_strategy_block_reasons": dict(b_strategy_block_reasons.most_common()),
         "trace_volume_summary": trace_volume_summary,
         "activity_split": {
@@ -1905,12 +2077,14 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     b_cost_stats = summary.get("b_cost_adjusted_residual_stats") or {}
     b_tradeable_parity_stats = summary.get("b_tradeable_parity_stats") or {}
     b_parity_shadow_stats = summary.get("b_parity_shadow_stats") or {}
+    b_mean_reversion_summary = summary.get("b_mean_reversion_summary") or {}
     b_underlying_mm_v2_summary = summary.get("b_underlying_mm_v2_summary") or {}
     b_adverse_selection_stats = summary.get("b_adverse_selection_stats") or {}
     b_option_lottery_summary = summary.get("b_option_lottery_summary") or {}
     b_shadow_underlying_mm = summary.get("b_shadow_underlying_mm") or {}
     etf_a_shock_calibration = summary.get("etf_a_shock_calibration") or {}
     etf_episode_summaries = summary.get("etf_episode_summaries") or []
+    etf_missed_entry_summary = summary.get("etf_missed_entry_summary") or {}
     b_strategy_block_reasons = summary.get("b_strategy_block_reasons") or {}
     trace_volume_summary = summary.get("trace_volume_summary") or {}
     inventory_divergence_summary = summary.get("inventory_divergence_summary") or {}
@@ -2019,6 +2193,9 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             f"- By kind: `{b_parity_shadow_stats.get('by_kind')}`",
             f"- By strike: `{b_parity_shadow_stats.get('by_strike')}`",
             "",
+            "## B Mean Reversion Summary",
+            *(f"- `{key}`: `{value}`" for key, value in b_mean_reversion_summary.items()),
+            "",
             "## B Underlying MM v2 Summary",
             *(f"- `{key}`: `{value}`" for key, value in b_underlying_mm_v2_summary.items()),
             "",
@@ -2028,7 +2205,10 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "## B Option Lottery Summary",
             f"- Premium spent: `{b_option_lottery_summary.get('premium_spent')}`",
             f"- Premium recovered: `{b_option_lottery_summary.get('premium_recovered')}`",
+            f"- Hedge premium spent: `{b_option_lottery_summary.get('hedge_premium_spent')}`",
             f"- MTM PnL: `{b_option_lottery_summary.get('mtm_pnl')}`",
+            f"- MTM PnL from fill-open qty: `{b_option_lottery_summary.get('mtm_pnl_from_fills')}`",
+            f"- Open mark value from fill-open qty: `{b_option_lottery_summary.get('open_mark_value_from_fills')}`",
             *(
                 f"- `{symbol}`: `{stats}`"
                 for symbol, stats in (b_option_lottery_summary.get("by_symbol") or {}).items()
@@ -2042,13 +2222,16 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             f"- By horizon: `{etf_a_shock_calibration.get('by_horizon_ms')}`",
             f"- By source kind: `{etf_a_shock_calibration.get('by_source_kind')}`",
             f"- Candidate alpha evaluation: `{etf_a_shock_calibration.get('candidate_alpha_evaluation')}`",
+            f"- Missed entry signals: `{etf_missed_entry_summary.get('missed_entry_signal_count', 0)}`",
+            f"- Missed entry reasons: `{etf_missed_entry_summary.get('by_reason')}`",
             "",
             "## ETF Episode Summaries",
             *(
                 f"- `{row.get('signal_id')}` source=`{row.get('source_kind')}` target=`{row.get('target_inventory')}` "
                 f"entry_qty=`{row.get('entry_qty')}` unwind_qty=`{row.get('unwind_qty')}` peak=`{row.get('peak_inventory')}` "
                 f"hold_ms=`{row.get('hold_time_ms')}` pnl=`{row.get('episode_pnl')}` "
-                f"unwind_reason=`{row.get('unwind_reason')}` direction_match=`{row.get('direction_match_by_horizon_ms')}`"
+                f"unwind_reason=`{row.get('unwind_reason')}` first_block=`{row.get('first_block_reason')}` "
+                f"direction_match=`{row.get('direction_match_by_horizon_ms')}`"
                 for row in etf_episode_summaries
             ),
             "",
@@ -2227,6 +2410,15 @@ class TraceRecorder:
             "b_mm_v2_dynamic_half_spread": state.get("b_mm_v2_dynamic_half_spread"),
             "b_mm_v2_bid_px": state.get("b_mm_v2_bid_px"),
             "b_mm_v2_ask_px": state.get("b_mm_v2_ask_px"),
+            "b_meanrev_ema_fast": state.get("b_meanrev_ema_fast"),
+            "b_meanrev_ema_slow": state.get("b_meanrev_ema_slow"),
+            "b_meanrev_sigma": state.get("b_meanrev_sigma"),
+            "b_meanrev_z": state.get("b_meanrev_z"),
+            "b_meanrev_target_inventory": state.get("b_meanrev_target_inventory"),
+            "b_meanrev_hold_ms": state.get("b_meanrev_hold_ms"),
+            "b_meanrev_regime_block_reason": state.get("b_meanrev_regime_block_reason"),
+            "b_meanrev_risk_off_forced": state.get("b_meanrev_risk_off_forced"),
+            "etf_signal_id": state.get("etf_signal_id"),
             "etf_alpha_from_a": state.get("etf_alpha_from_a"),
             "etf_source_signal_id": state.get("etf_source_signal_id"),
             "etf_source_signal_kind": state.get("etf_source_signal_kind"),
@@ -2243,6 +2435,12 @@ class TraceRecorder:
             "b_option_lottery_symbol_premium_remaining": state.get("b_option_lottery_symbol_premium_remaining"),
             "b_option_lottery_avg_entry": state.get("b_option_lottery_avg_entry"),
             "b_option_lottery_realized_profit": state.get("b_option_lottery_realized_profit"),
+            "b_option_underlying_inventory": state.get("b_option_underlying_inventory"),
+            "b_option_hedge_needed": state.get("b_option_hedge_needed"),
+            "b_option_hedge_target_qty": state.get("b_option_hedge_target_qty"),
+            "b_option_hedge_budget_remaining": state.get("b_option_hedge_budget_remaining"),
+            "b_option_profit_take_trigger": state.get("b_option_profit_take_trigger"),
+            "b_option_hedge_premium_spent": state.get("b_option_hedge_premium_spent"),
         }
 
     @staticmethod
@@ -2762,6 +2960,8 @@ class TraceRecorder:
             "trusted_multiplier": event.get("trusted_multiplier"),
             "multiplier_confidence": event.get("multiplier_confidence"),
             "inventory": event.get("inventory"),
+            "strategy_inventory": event.get("strategy_inventory"),
+            "exchange_inventory": event.get("exchange_inventory"),
             "earnings_position": event.get("earnings_position"),
             "news_position": event.get("news_position"),
             "mm_position": event.get("mm_position"),
@@ -2834,6 +3034,15 @@ class TraceRecorder:
             "b_mm_v2_dynamic_half_spread": event.get("b_mm_v2_dynamic_half_spread"),
             "b_mm_v2_bid_px": event.get("b_mm_v2_bid_px"),
             "b_mm_v2_ask_px": event.get("b_mm_v2_ask_px"),
+            "b_meanrev_ema_fast": event.get("b_meanrev_ema_fast"),
+            "b_meanrev_ema_slow": event.get("b_meanrev_ema_slow"),
+            "b_meanrev_sigma": event.get("b_meanrev_sigma"),
+            "b_meanrev_z": event.get("b_meanrev_z"),
+            "b_meanrev_target_inventory": event.get("b_meanrev_target_inventory"),
+            "b_meanrev_hold_ms": event.get("b_meanrev_hold_ms"),
+            "b_meanrev_regime_block_reason": event.get("b_meanrev_regime_block_reason"),
+            "b_meanrev_risk_off_forced": event.get("b_meanrev_risk_off_forced"),
+            "etf_signal_id": event.get("etf_signal_id"),
             "etf_alpha_from_a": event.get("etf_alpha_from_a"),
             "etf_source_signal_id": event.get("etf_source_signal_id"),
             "etf_source_signal_kind": event.get("etf_source_signal_kind"),
@@ -2844,6 +3053,18 @@ class TraceRecorder:
             "etf_target_inventory": event.get("etf_target_inventory"),
             "etf_source_target_inventory": event.get("etf_source_target_inventory"),
             "etf_target_from_a_position": event.get("etf_target_from_a_position"),
+            "etf_unwind_reason": event.get("etf_unwind_reason"),
+            "b_option_lottery_premium_spent": event.get("b_option_lottery_premium_spent"),
+            "b_option_lottery_premium_recovered": event.get("b_option_lottery_premium_recovered"),
+            "b_option_lottery_symbol_premium_remaining": event.get("b_option_lottery_symbol_premium_remaining"),
+            "b_option_lottery_avg_entry": event.get("b_option_lottery_avg_entry"),
+            "b_option_lottery_realized_profit": event.get("b_option_lottery_realized_profit"),
+            "b_option_underlying_inventory": event.get("b_option_underlying_inventory"),
+            "b_option_hedge_needed": event.get("b_option_hedge_needed"),
+            "b_option_hedge_target_qty": event.get("b_option_hedge_target_qty"),
+            "b_option_hedge_budget_remaining": event.get("b_option_hedge_budget_remaining"),
+            "b_option_profit_take_trigger": event.get("b_option_profit_take_trigger"),
+            "b_option_hedge_premium_spent": event.get("b_option_hedge_premium_spent"),
         }
 
     def finalize(self, *, now_ms: int, state: dict[str, Any], cash: int | None, note: str | None = None) -> None:

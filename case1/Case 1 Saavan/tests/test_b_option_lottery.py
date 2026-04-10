@@ -40,6 +40,11 @@ class BOptionLotteryTests(unittest.TestCase):
                 option_lottery_profit_take_min_edge=6,
                 option_lottery_profit_take_multiple=2.0,
                 option_lottery_profit_take_quote_size=20,
+                option_hedge_enabled=True,
+                option_hedge_max_ask=6,
+                option_hedge_min_underlying_inventory=4,
+                option_hedge_target_ratio=0.5,
+                option_hedge_premium_budget=12,
             ),
             RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=1, passive_quote_ttl_ms=3_000),
             book_depth_levels=5,
@@ -58,6 +63,17 @@ class BOptionLotteryTests(unittest.TestCase):
         self.assertIsNotNone(plan.bid)
         self.assertEqual(plan.bid.side, "BUY")
         self.assertEqual(plan.bid.px, 0)
+        self.assertEqual(plan.bid.strategy_family, "b_option_lottery")
+        self.assertEqual(plan.bid.action_class, "cheap_option_buy")
+
+    def test_tail_wing_buy_does_not_require_directional_filter(self) -> None:
+        strategy = self.make_strategy()
+        strategy.on_book_update_at("B_P_950", FakeOrderBook(bids={1: 10}, asks={3: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_P_950", now_ms=1_200, residual_payload={"composite_basis": 0.0, "underlying_mid": 1000.0})
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.bid)
         self.assertEqual(plan.bid.strategy_family, "b_option_lottery")
         self.assertEqual(plan.bid.action_class, "cheap_option_buy")
 
@@ -154,6 +170,43 @@ class BOptionLotteryTests(unittest.TestCase):
 
         self.assertEqual(strategy.inventory("B_C_1050"), 2)
         self.assertEqual(strategy.premium_spent, 6)
+        self.assertEqual(strategy._average_entry("B_C_1050"), 3)
+
+    def test_atm_hedge_buys_put_when_long_underlying(self) -> None:
+        strategy = self.make_strategy()
+        strategy.sync_inventory("B", 8)
+        strategy.on_book_update_at("B_P_1000", FakeOrderBook(bids={5: 10}, asks={6: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_P_1000", now_ms=1_200, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.bid)
+        self.assertEqual(plan.bid.side, "BUY")
+        self.assertEqual(plan.bid.strategy_family, "b_option_hedge")
+        self.assertEqual(plan.bid.action_class, "atm_option_hedge")
+        self.assertEqual(strategy.trace_state("B_P_1000", 1_200)["b_option_hedge_needed"], True)
+
+    def test_atm_hedge_buys_call_when_short_underlying(self) -> None:
+        strategy = self.make_strategy()
+        strategy.sync_inventory("B", -8)
+        strategy.on_book_update_at("B_C_1000", FakeOrderBook(bids={5: 10}, asks={6: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_C_1000", now_ms=1_200, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.bid)
+        self.assertEqual(plan.bid.strategy_family, "b_option_hedge")
+        self.assertEqual(plan.bid.leg_role, "c")
+
+    def test_atm_hedge_blocked_below_inventory_threshold(self) -> None:
+        strategy = self.make_strategy()
+        strategy.sync_inventory("B", 3)
+        strategy.on_book_update_at("B_P_1000", FakeOrderBook(bids={5: 10}, asks={6: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_P_1000", now_ms=1_200, residual_payload=None)
+
+        self.assertTrue(plan.observe_only)
+        self.assertNotEqual(plan.mode, "B_OPTION_HEDGE")
 
     def test_profit_take_sells_existing_long_only(self) -> None:
         strategy = self.make_strategy()
@@ -168,6 +221,38 @@ class BOptionLotteryTests(unittest.TestCase):
         self.assertEqual(plan.ask.side, "SELL")
         self.assertLessEqual(plan.ask.qty, 5)
         self.assertEqual(plan.ask.action_class, "cheap_option_profit_take")
+
+    def test_two_x_profit_take_for_three_tick_entry(self) -> None:
+        strategy = self.make_strategy()
+        strategy.positions["B_P_950"] = 4
+        strategy.open_cost_basis["B_P_950"] = 12.0
+        strategy.on_book_update_at("B_P_950", FakeOrderBook(bids={6: 10}, asks={7: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_P_950", now_ms=1_200, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.ask)
+        self.assertEqual(plan.ask.side, "SELL")
+        self.assertLessEqual(plan.ask.qty, 4)
+
+    def test_profit_take_keeps_existing_sell_and_blocks_rebuy_churn(self) -> None:
+        strategy = self.make_strategy()
+        strategy.positions["B_P_950"] = 4
+        strategy.costed_qty["B_P_950"] = 4
+        strategy.open_cost_basis["B_P_950"] = 12.0
+        strategy.on_book_update_at("B_P_950", FakeOrderBook(bids={6: 10}, asks={3: 10}), now_ms=1_200)
+        first_plan = strategy.compute_quote_plan("B_P_950", now_ms=1_200, residual_payload=None)
+        self.assertIsNotNone(first_plan.ask)
+        strategy.note_submitted("B_P_950", order_id="profit-sell-1", desired=first_plan.ask, now_ms=1_200)
+
+        second_plan = strategy.compute_quote_plan("B_P_950", now_ms=1_250, residual_payload=None)
+
+        self.assertIsNone(second_plan.bid)
+        self.assertIsNotNone(second_plan.ask)
+        self.assertEqual(second_plan.reason, "keeping_existing_option_profit_take_order")
+        actions = strategy.order_managers["B_P_950"].build_actions(second_plan, 1_250)
+        self.assertEqual(actions.cancels, ())
+        self.assertEqual(actions.placements, ())
 
 
 if __name__ == "__main__":

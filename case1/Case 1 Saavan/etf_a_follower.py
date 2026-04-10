@@ -255,6 +255,7 @@ class ETFAFollowerStrategy:
             "last_trade_px": self.last_trade_px,
             "last_trade_qty": self.last_trade_qty,
             "last_trade_ms": self.last_trade_ms,
+            "etf_signal_id": None if signal is None else signal.signal_id,
             "etf_alpha_from_a": None if signal is None else signal.alpha,
             "etf_source_signal_id": None if signal is None else signal.source_signal_id,
             "etf_source_signal_kind": None if signal is None else signal.source_kind,

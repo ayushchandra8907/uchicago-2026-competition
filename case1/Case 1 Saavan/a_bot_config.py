@@ -138,6 +138,7 @@ class BConfig:
     observe_only: bool = False
     allow_trading_with_ayush_port: bool = True
     mm_v2_enabled: bool = True
+    meanrev_enabled: bool = True
     signal_snapshot_interval_ms: int = 250
     signal_change_threshold_ticks: int = 1
     quote_size: int = 1
@@ -160,6 +161,21 @@ class BConfig:
     mm_min_healthy_book_age_ms: int = 500
     mm_cancel_on_bad_book: bool = True
     mm_bad_fill_cooldown_ms: int = 750
+    meanrev_max_position: int = 8
+    meanrev_quote_size: int = 1
+    meanrev_ema_fast_ms: int = 30_000
+    meanrev_ema_slow_ms: int = 180_000
+    meanrev_vol_ewma_ms: int = 60_000
+    meanrev_sigma_floor: float = 4.0
+    meanrev_entry_z: float = 1.25
+    meanrev_entry_z2: float = 2.25
+    meanrev_exit_z: float = 0.35
+    meanrev_stop_z: float = 5.0
+    meanrev_min_spread_ticks: int = 3
+    meanrev_max_hold_ms: int = 120_000
+    meanrev_cooldown_ms: int = 1_500
+    meanrev_aggressive_entry_z: float = 2.75
+    meanrev_aggressive_exit: bool = True
     basis_entry_threshold_ticks: float = 1.25
     basis_strong_threshold_ticks: float = 2.5
     imbalance_confirmation_threshold: float = 0.15
@@ -187,6 +203,11 @@ class BConfig:
     option_lottery_profit_take_min_edge: int = 6
     option_lottery_profit_take_multiple: float = 2.0
     option_lottery_profit_take_quote_size: int = 20
+    option_hedge_enabled: bool = True
+    option_hedge_max_ask: int = 6
+    option_hedge_min_underlying_inventory: int = 4
+    option_hedge_target_ratio: float = 0.5
+    option_hedge_premium_budget: int = 300
     underlying_symbol: str = "B"
     option_symbols: tuple[str, ...] = (
         "B_C_950",
@@ -203,7 +224,7 @@ class ETFConfig:
     enabled: bool = True
     trading_enabled: bool = True
     symbol: str = "ETF"
-    alpha_from_a: float = 0.50
+    alpha_from_a: float = 0.60
     alpha_from_a_earnings: float | None = None
     alpha_from_a_news: float | None = None
     alpha_max: float = 1.0
@@ -493,6 +514,7 @@ def load_bot_config(
             observe_only=_optional_bool("B_OBSERVE_ONLY", False),
             allow_trading_with_ayush_port=_optional_bool("B_ALLOW_TRADING_WITH_AYUSH_PORT", True),
             mm_v2_enabled=_optional_bool("B_MM_V2_ENABLED", True),
+            meanrev_enabled=_optional_bool("B_MEANREV_ENABLED", True),
             signal_snapshot_interval_ms=_optional_int("B_SIGNAL_SNAPSHOT_INTERVAL_MS", 250) or 250,
             signal_change_threshold_ticks=_optional_int("B_SIGNAL_CHANGE_THRESHOLD_TICKS", 1) or 1,
             quote_size=_optional_int(
@@ -521,6 +543,21 @@ def load_bot_config(
             mm_min_healthy_book_age_ms=_optional_int("B_MM_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
             mm_cancel_on_bad_book=_optional_bool("B_MM_CANCEL_ON_BAD_BOOK", True),
             mm_bad_fill_cooldown_ms=_optional_int("B_MM_BAD_FILL_COOLDOWN_MS", 750) or 750,
+            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 8) or 8,
+            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 1) or 1,
+            meanrev_ema_fast_ms=_optional_int("B_MEANREV_EMA_FAST_MS", 30_000) or 30_000,
+            meanrev_ema_slow_ms=_optional_int("B_MEANREV_EMA_SLOW_MS", 180_000) or 180_000,
+            meanrev_vol_ewma_ms=_optional_int("B_MEANREV_VOL_EWMA_MS", 60_000) or 60_000,
+            meanrev_sigma_floor=_optional_float("B_MEANREV_SIGMA_FLOOR", 4.0) or 4.0,
+            meanrev_entry_z=_optional_float("B_MEANREV_ENTRY_Z", 1.25) or 1.25,
+            meanrev_entry_z2=_optional_float("B_MEANREV_ENTRY_Z2", 2.25) or 2.25,
+            meanrev_exit_z=_optional_float("B_MEANREV_EXIT_Z", 0.35) or 0.35,
+            meanrev_stop_z=_optional_float("B_MEANREV_STOP_Z", 5.0) or 5.0,
+            meanrev_min_spread_ticks=_optional_int("B_MEANREV_MIN_SPREAD_TICKS", 3) or 3,
+            meanrev_max_hold_ms=_optional_int("B_MEANREV_MAX_HOLD_MS", 120_000) or 120_000,
+            meanrev_cooldown_ms=_optional_int("B_MEANREV_COOLDOWN_MS", 1_500) or 1_500,
+            meanrev_aggressive_entry_z=_optional_float("B_MEANREV_AGGRESSIVE_ENTRY_Z", 2.75) or 2.75,
+            meanrev_aggressive_exit=_optional_bool("B_MEANREV_AGGRESSIVE_EXIT", True),
             basis_entry_threshold_ticks=_optional_float("B_BASIS_ENTRY_THRESHOLD_TICKS", 1.25) or 1.25,
             basis_strong_threshold_ticks=_optional_float("B_BASIS_STRONG_THRESHOLD_TICKS", 2.5) or 2.5,
             imbalance_confirmation_threshold=_optional_float("B_IMBALANCE_CONFIRMATION_THRESHOLD", 0.15) or 0.15,
@@ -548,6 +585,11 @@ def load_bot_config(
             option_lottery_profit_take_min_edge=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_MIN_EDGE", 6) or 6,
             option_lottery_profit_take_multiple=_optional_float("B_OPTION_LOTTERY_PROFIT_TAKE_MULTIPLE", 2.0) or 2.0,
             option_lottery_profit_take_quote_size=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_QUOTE_SIZE", 20) or 20,
+            option_hedge_enabled=_optional_bool("B_OPTION_HEDGE_ENABLED", True),
+            option_hedge_max_ask=_optional_int("B_OPTION_HEDGE_MAX_ASK", 6) or 6,
+            option_hedge_min_underlying_inventory=_optional_int("B_OPTION_HEDGE_MIN_UNDERLYING_INVENTORY", 4) or 4,
+            option_hedge_target_ratio=_optional_float("B_OPTION_HEDGE_TARGET_RATIO", 0.5) or 0.5,
+            option_hedge_premium_budget=_optional_int("B_OPTION_HEDGE_PREMIUM_BUDGET", 300) or 300,
         ),
         etf=ETFConfig(
             enabled=_optional_bool("ETF_ENABLED", True),
@@ -555,7 +597,7 @@ def load_bot_config(
             symbol=str(os.getenv("ETF_SYMBOL", "ETF") or "ETF").strip(),
             alpha_from_a=min(
                 _optional_float("ETF_ALPHA_MAX", 1.0) or 1.0,
-                max(0.0, _optional_float("ETF_ALPHA_FROM_A", 0.50) or 0.50),
+                max(0.0, _optional_float("ETF_ALPHA_FROM_A", 0.60) or 0.60),
             ),
             alpha_from_a_earnings=_optional_float("ETF_ALPHA_FROM_A_EARNINGS", None),
             alpha_from_a_news=_optional_float("ETF_ALPHA_FROM_A_NEWS", None),

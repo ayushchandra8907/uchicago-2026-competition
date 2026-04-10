@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 
 
@@ -12,6 +14,9 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 try:
+    from a_bot_config import load_bot_config
+    from b_mean_reversion import BMeanReversionStrategy
+    from b_underlying_mm_v2 import BUnderlyingMMv2
     from testing1 import MarketABot
 except (ModuleNotFoundError, SystemExit):
     MarketABot = None
@@ -168,3 +173,83 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         await bot.bot_handle_book_update("B")
         await bot.bot_handle_trade_msg("B", 1000, 1)
         self.assertEqual(eval_reasons, ["book update:B", "market trade:B"])
+
+    async def test_etf_signal_forces_immediate_etf_evaluation_before_news_return(self) -> None:
+        bot = MarketABot.__new__(MarketABot)
+        reaction = SimpleNamespace(
+            note=None,
+            relevant=False,
+            tick=123,
+            fair_value_updated=False,
+        )
+        bot.strategy = SimpleNamespace(
+            mode="IDLE",
+            on_news=lambda news_release, now_ms: reaction,
+        )
+        bot.etf_strategy = SimpleNamespace(
+            on_a_news_reaction=lambda reaction, now_ms: SimpleNamespace(signal_id="etf_a_1"),
+        )
+        bot.tracer = None
+        bot._now_ms = lambda: 1_000
+        calls: list[str] = []
+
+        async def fake_a_eval(reason: str, *, force: bool = False) -> None:
+            calls.append(f"a:{reason}:{force}")
+
+        async def fake_etf_eval(reason: str, *, force: bool = False) -> None:
+            calls.append(f"etf:{reason}:{force}")
+
+        bot._evaluate_and_sync = fake_a_eval
+        bot._evaluate_and_sync_etf = fake_etf_eval
+
+        await bot.bot_handle_news({"kind": "unstructured"})
+
+        self.assertEqual(calls, ["etf:A shock signal:True", "a:news tick:False"])
+
+    async def test_meanrev_enabled_selects_mean_reversion_underlying_strategy(self) -> None:
+        env_keys = {
+            "UTC_HOST": "practice.uchicago.exchange:3333",
+            "UTC_USERNAME": "user",
+            "UTC_PASSWORD": "pass",
+            "TRACE_ENABLED": "0",
+            "B_MEANREV_ENABLED": "1",
+            "B_MM_V2_ENABLED": "1",
+        }
+        old_values = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ.update(env_keys)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config = load_bot_config(Path(temp_dir))
+                bot = MarketABot(config)
+        finally:
+            for key, old_value in old_values.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+        self.assertIsInstance(bot.b_strategy, BMeanReversionStrategy)
+
+    async def test_meanrev_disabled_falls_back_to_mm_v2(self) -> None:
+        env_keys = {
+            "UTC_HOST": "practice.uchicago.exchange:3333",
+            "UTC_USERNAME": "user",
+            "UTC_PASSWORD": "pass",
+            "TRACE_ENABLED": "0",
+            "B_MEANREV_ENABLED": "0",
+            "B_MM_V2_ENABLED": "1",
+        }
+        old_values = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ.update(env_keys)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config = load_bot_config(Path(temp_dir))
+                bot = MarketABot(config)
+        finally:
+            for key, old_value in old_values.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+        self.assertIsInstance(bot.b_strategy, BUnderlyingMMv2)

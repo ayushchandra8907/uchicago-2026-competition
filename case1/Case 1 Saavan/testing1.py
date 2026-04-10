@@ -14,6 +14,7 @@ from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import MarketAStrategy
 from a_bot_trace import TraceRecorder
 from ayush_a_port import AyushPortStrategy
+from b_mean_reversion import BMeanReversionStrategy
 from b_observer import MarketBObserver
 from b_option_lottery import BOptionLotteryStrategy
 from b_parity_opportunist import BParityOpportunist
@@ -73,7 +74,10 @@ class MarketABot(XChangeClient):
             or (self._ayush_port_mode and not config.market_b.allow_trading_with_ayush_port)
         )
         self._b_trading_enabled = bool(config.market_b.enabled and config.market_b.trading_enabled and not self._b_observe_only)
-        b_strategy_cls = BUnderlyingMMv2 if config.market_b.mm_v2_enabled else BUnderlyingMMStrategy
+        if config.market_b.meanrev_enabled:
+            b_strategy_cls = BMeanReversionStrategy
+        else:
+            b_strategy_cls = BUnderlyingMMv2 if config.market_b.mm_v2_enabled else BUnderlyingMMStrategy
         b_risk = replace(
             config.risk,
             passive_reprice_threshold_ticks=int(config.market_b.mm_reprice_threshold_ticks),
@@ -231,11 +235,19 @@ class MarketABot(XChangeClient):
                     "market_b_mm_min_valid_spread_ticks": config.market_b.mm_min_valid_spread_ticks,
                     "market_b_mm_min_healthy_book_age_ms": config.market_b.mm_min_healthy_book_age_ms,
                     "market_b_mm_bad_fill_cooldown_ms": config.market_b.mm_bad_fill_cooldown_ms,
+                    "market_b_meanrev_enabled": config.market_b.meanrev_enabled,
+                    "market_b_meanrev_max_position": config.market_b.meanrev_max_position,
+                    "market_b_meanrev_entry_z": config.market_b.meanrev_entry_z,
+                    "market_b_meanrev_entry_z2": config.market_b.meanrev_entry_z2,
+                    "market_b_meanrev_stop_z": config.market_b.meanrev_stop_z,
                     "market_b_option_lottery_enabled": bool(self.b_option_strategy is not None),
                     "market_b_option_lottery_max_ask": config.market_b.option_lottery_max_ask,
                     "market_b_option_lottery_total_premium_budget": config.market_b.option_lottery_total_premium_budget,
                     "market_b_option_lottery_wing_max_position": config.market_b.option_lottery_wing_max_position,
                     "market_b_option_lottery_atm_max_position": config.market_b.option_lottery_atm_max_position,
+                    "market_b_option_hedge_enabled": config.market_b.option_hedge_enabled,
+                    "market_b_option_hedge_max_ask": config.market_b.option_hedge_max_ask,
+                    "market_b_option_hedge_premium_budget": config.market_b.option_hedge_premium_budget,
                     "etf_min_eval_interval_ms": config.etf.min_eval_interval_ms,
                     "etf_unwind_reprice_threshold_ticks": config.etf.unwind_reprice_threshold_ticks,
                     "auto_stop_on_market_resolved": config.auto_stop_on_market_resolved,
@@ -260,6 +272,10 @@ class MarketABot(XChangeClient):
         if self.b_strategy is not None:
             self.b_strategy.sync_inventory_from_exchange(int(self.positions.get(self.config.market_b.underlying_symbol, 0)))
         if self.b_option_strategy is not None:
+            self.b_option_strategy.sync_inventory(
+                self.config.market_b.underlying_symbol,
+                int(self.positions.get(self.config.market_b.underlying_symbol, 0)),
+            )
             for symbol in self.config.market_b.option_symbols:
                 self.b_option_strategy.sync_inventory(symbol, int(self.positions.get(symbol, 0)))
         if self.etf_strategy is not None:
@@ -382,6 +398,8 @@ class MarketABot(XChangeClient):
             self.b_observer.sync_inventory(symbol, inventory)
             if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
                 self.b_strategy.sync_inventory_from_exchange(inventory)
+            if self.b_option_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                self.b_option_strategy.sync_inventory(symbol, inventory)
             if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
                 self.b_option_strategy.sync_inventory(symbol, inventory)
             if self.tracer is not None:
@@ -393,6 +411,8 @@ class MarketABot(XChangeClient):
                 )
             if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
                 await self._evaluate_and_sync_b("position update", force=True)
+            if self.b_option_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                await self._evaluate_and_sync_b_options(f"position update:{symbol}", force=True)
             if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
                 await self._evaluate_and_sync_b_options(f"position update:{symbol}", symbols=(symbol,), force=True)
         elif msg_type == "position_update" and msg.position_update.symbol == self.config.etf.symbol:
@@ -560,6 +580,11 @@ class MarketABot(XChangeClient):
             )
             if symbol is not None:
                 self.b_observer.sync_inventory(symbol, authoritative_inventory)
+                if self.b_option_strategy is not None:
+                    self.b_option_strategy.sync_inventory(
+                        self.config.market_b.underlying_symbol,
+                        int(self.positions.get(self.config.market_b.underlying_symbol, 0)),
+                    )
             if self.tracer is not None and symbol is not None:
                 self.tracer.record_fill(
                     now_ms=now_ms,
@@ -587,6 +612,8 @@ class MarketABot(XChangeClient):
             )
             order = self.b_strategy.on_fill(order_id, qty, price, authoritative_inventory=authoritative_inventory)
             self.b_observer.sync_inventory(self.config.market_b.underlying_symbol, authoritative_inventory)
+            if self.b_option_strategy is not None:
+                self.b_option_strategy.sync_inventory(self.config.market_b.underlying_symbol, authoritative_inventory)
             if self.tracer is not None:
                 self.tracer.record_fill(
                     now_ms=now_ms,
@@ -598,6 +625,8 @@ class MarketABot(XChangeClient):
                     price=price,
                 )
             await self._evaluate_and_sync_b("fill", force=True)
+            if self.b_option_strategy is not None:
+                await self._evaluate_and_sync_b_options("underlying fill", force=True)
             return
 
         was_recovery_active = self.strategy.recovery_active
@@ -842,6 +871,8 @@ class MarketABot(XChangeClient):
                     leg_role="single",
                     payload=self.etf_strategy.signal_payload(etf_signal),
                 )
+            if etf_signal is not None:
+                await self._evaluate_and_sync_etf("A shock signal", force=True)
         if not reaction.relevant:
             if reaction.tick is not None:
                 await self._evaluate_and_sync("news tick")
@@ -861,8 +892,6 @@ class MarketABot(XChangeClient):
                     details=self._reaction_to_dict(reaction),
                 )
         await self._evaluate_and_sync("news")
-        if etf_signal is not None:
-            await self._evaluate_and_sync_etf("A shock signal", force=True)
 
     async def bot_handle_market_resolved(self, market_id: str, winning_symbol: str, tick: int):
         LOGGER.info("Received market resolution %s winner=%s tick=%s", market_id, winning_symbol, tick)
@@ -1564,7 +1593,8 @@ class MarketABot(XChangeClient):
                         order=self._order_to_dict(managed_order),
                     )
                 LOGGER.info(
-                    "Placed passive %s order %s for B: qty=%s px=%s reason=%s",
+                    "Placed %s %s order %s for B: qty=%s px=%s reason=%s",
+                    "aggressive" if placement.aggressive else "passive",
                     placement.side,
                     order_id,
                     placement.qty,

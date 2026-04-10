@@ -137,6 +137,10 @@ def print_summary(summary: dict) -> None:
     for strike, stats in (b_stats.get("by_strike") or {}).items():
         print(f"  strike {strike}: {stats}")
     print("")
+    print("B mean reversion summary:")
+    for key, value in (summary.get("b_mean_reversion_summary") or {}).items():
+        print(f"  {key}: {value}")
+    print("")
     print("B strategy block reasons:")
     for reason, count in (summary.get("b_strategy_block_reasons") or {}).items():
         print(f"  {reason}: {count}")
@@ -145,6 +149,7 @@ def print_summary(summary: dict) -> None:
     option_summary = summary.get("b_option_lottery_summary") or {}
     print(f"  premium_spent: {option_summary.get('premium_spent')}")
     print(f"  premium_recovered: {option_summary.get('premium_recovered')}")
+    print(f"  hedge_premium_spent: {option_summary.get('hedge_premium_spent')}")
     print(f"  mtm_pnl: {option_summary.get('mtm_pnl')}")
     for symbol, stats in (option_summary.get("by_symbol") or {}).items():
         print(f"  {symbol}: {stats}")
