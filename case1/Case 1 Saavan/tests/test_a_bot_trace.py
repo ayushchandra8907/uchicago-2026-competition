@@ -16,6 +16,7 @@ from a_bot_config import AConfig, RiskConfig, TraceConfig, load_bot_config
 from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import DesiredOrder, ManagedOrder, MarketAStrategy, QuotePlan
 from a_bot_trace import TraceRecorder, load_trace_events, summarize_trace_events
+from b_observer import MarketBObserver
 
 
 class FakeOrderBook:
@@ -35,14 +36,9 @@ class TraceTests(unittest.TestCase):
                 calibration_sample_period_ms=1_000,
                 calibration_stability_band_ticks=8,
                 recover_pricing_state=False,
+                discovery_quote_size=2,
                 steady_quote_size=2,
                 steady_max_position=24,
-                steady_take_min_edge=3,
-                steady_take_large_inventory_edge=5,
-                discovery_max_position=2,
-                discovery_half_spread_ticks=10,
-                news_caution_max_position=2,
-                news_caution_half_spread_ticks=10,
                 steady_take_inventory_guard=8,
                 unwind_entry_position=24,
                 unwind_exit_position=12,
@@ -85,10 +81,7 @@ class TraceTests(unittest.TestCase):
         state = strategy.trace_state(45_000)
 
         self.assertEqual(state["mode"], "STEADY_MM")
-        self.assertEqual(state["earnings_phase"], "IDLE")
-        self.assertEqual(state["mm_phase"], "STEADY_MM")
-        self.assertFalse(state["discovery_contaminated"])
-        self.assertEqual(state["allowed_buy_size"], 198)
+        self.assertEqual(state["allowed_buy_size"], 178)
         self.assertEqual(state["buy_exposure"], 2)
         self.assertEqual(state["mm_position"], 0)
         self.assertEqual(state["earnings_budget"], 120)
@@ -106,7 +99,6 @@ class TraceTests(unittest.TestCase):
                 TraceConfig(
                     trace_enabled=True,
                     trace_root=Path(temp_dir),
-                    trace_detail_level="lite",
                     trace_snapshot_interval_ms=500,
                     trace_book_depth_levels=10,
                     trace_markout_windows_ms=(250, 1_000, 5_000),
@@ -149,8 +141,6 @@ class TraceTests(unittest.TestCase):
                 observe_only=False,
                 reason="steady mm",
             )
-            recorder.record_book_update(now_ms=now_ms, state=state, cash=10_000, trigger="book update")
-            recorder.record_market_trade(now_ms=now_ms, state=state, cash=10_000, price=1100, qty=1)
             recorder.record_decision(now_ms=now_ms, state=state, cash=10_000, trigger="book update", plan=plan)
             recorder.record_order_submitted(
                 now_ms=now_ms,
@@ -203,8 +193,6 @@ class TraceTests(unittest.TestCase):
             self.assertIn("order_submitted", event_types)
             self.assertIn("order_filled", event_types)
             self.assertIn("session_end", event_types)
-            self.assertNotIn("book_update", event_types)
-            self.assertNotIn("market_trade_observed", event_types)
             fill_event = next(event for event in events if event["event_type"] == "order_filled")
             self.assertEqual(fill_event["fill_qty"], 2)
             self.assertEqual(fill_event["fill_price"], 1099)
@@ -215,12 +203,15 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(summary["passive_fills"], 1)
             self.assertEqual(summary["aggressive_fills"], 0)
             self.assertEqual(summary["fills_by_overlay"]["mm"], 1)
-            self.assertIn("local_processing_durations_ms", summary)
+            self.assertIn("a_episode_summaries", summary)
+            self.assertIn("a_mm_loss_by_mode", summary)
+            self.assertIn("b_cost_adjusted_residual_stats", summary)
+            self.assertIn("trace_volume_summary", summary)
 
     def test_load_bot_config_trace_defaults_to_saavan_analysis_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_keys = {
-                "UTC_HOST": "34.197.188.76:3333",
+                "UTC_HOST": "practice.uchicago.exchange:3333",
                 "UTC_USERNAME": "user",
                 "UTC_PASSWORD": "pass",
             }
@@ -238,34 +229,11 @@ class TraceTests(unittest.TestCase):
                         os.environ[key] = old_value
             self.assertEqual(config.trace.trace_root, Path(temp_dir).resolve() / "analysis_runs")
             self.assertFalse(config.trace.trace_enabled)
-            self.assertEqual(config.trace.trace_detail_level, "lite")
             self.assertFalse(config.market_a.recover_pricing_state)
-
-    def test_trace_recorder_full_mode_keeps_book_and_trade_events(self) -> None:
-        strategy = self.make_strategy()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            recorder = TraceRecorder(
-                TraceConfig(
-                    trace_enabled=True,
-                    trace_root=Path(temp_dir),
-                    trace_detail_level="full",
-                    trace_write_summary_on_shutdown=False,
-                ),
-                session_prefix="test_trace",
-            )
-            state = strategy.trace_state(45_000)
-            recorder.record_book_update(now_ms=45_000, state=state, cash=10_000, trigger="book update")
-            recorder.record_market_trade(now_ms=45_000, state=state, cash=10_000, price=1100, qty=1)
-            recorder.finalize(now_ms=45_100, state=state, cash=10_000, note="done")
-
-            event_types = {event["event_type"] for event in load_trace_events(recorder.run_dir)}
-            self.assertIn("book_update", event_types)
-            self.assertIn("market_trade_observed", event_types)
 
     def test_recovered_pricing_state_is_ignored_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             journal = TradingJournal(Path(temp_dir) / "journal.jsonl")
-            journal.record_session_started(startup_mode="clean_start", recovered_orders=0)
             submitted = ManagedOrder(
                 order_id="order-1",
                 side="SELL",
@@ -282,7 +250,6 @@ class TraceTests(unittest.TestCase):
             ignored = select_recovered_pricing_state(replay, recover_pricing_state=False)
             restored = select_recovered_pricing_state(replay, recover_pricing_state=True)
 
-            self.assertEqual(replay.startup_mode, "crash_recovery")
             self.assertEqual(ignored, (None, 0, None, None))
             self.assertEqual(restored, (1050.0, 2, 945, 0.9))
 
@@ -375,6 +342,200 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(summary["submits_by_intent"]["earnings_prejump"], 1)
         self.assertEqual(summary["activity_split"]["earnings_prejump"], 1)
         self.assertAlmostEqual(summary["fill_markouts_by_intent"]["earnings_prejump"]["250ms"], 7.0, delta=0.001)
+
+    def test_summarize_trace_events_rolls_up_pnl_by_market_and_strategy(self) -> None:
+        events = [
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "A",
+                "market_key": "A",
+                "pnl_owner": "a_earnings",
+                "action_class": "shock_take",
+                "intent": "post_earnings_shock_take",
+                "side": "BUY",
+                "fill_price": 1000,
+                "fill_qty": 2,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "symbol": "A",
+                "market_key": "A",
+                "mid": 1010.0,
+                "inventory": 2,
+            },
+        ]
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        self.assertAlmostEqual(summary["pnl_by_market"]["A"], 20.0, delta=0.001)
+        self.assertAlmostEqual(summary["pnl_by_strategy_family"]["a_earnings"], 20.0, delta=0.001)
+
+    def test_b_observer_computes_parity_residuals_and_synthetic_fair(self) -> None:
+        observer = MarketBObserver(depth_levels=5)
+        observer.on_book_update("B", FakeOrderBook(bids={1098: 10}, asks={1102: 10}))
+        observer.on_book_update("B_C_950", FakeOrderBook(bids={150: 10}, asks={154: 10}))
+        observer.on_book_update("B_P_950", FakeOrderBook(bids={0: 10}, asks={4: 10}))
+        observer.on_book_update("B_C_1000", FakeOrderBook(bids={100: 10}, asks={104: 10}))
+        observer.on_book_update("B_P_1000", FakeOrderBook(bids={0: 10}, asks={4: 10}))
+        observer.on_book_update("B_C_1050", FakeOrderBook(bids={50: 10}, asks={54: 10}))
+        observer.on_book_update("B_P_1050", FakeOrderBook(bids={0: 10}, asks={4: 10}))
+
+        bundle = observer.derived_signal_bundle()
+        self.assertIsNotNone(bundle)
+        payload = bundle.payload
+        self.assertAlmostEqual(payload["synthetic_forward_by_strike"]["1000"], 1100.0, delta=0.001)
+        self.assertAlmostEqual(payload["parity_residual_by_strike"]["1000"], 0.0, delta=0.001)
+        self.assertAlmostEqual(payload["estimated_aggressive_crossing_cost_by_strike"]["1000"], 6.0, delta=0.001)
+        self.assertAlmostEqual(payload["parity_edge_after_cost_by_strike"]["1000"], -6.0, delta=0.001)
+
+    def test_b_observer_downsamples_until_threshold_or_interval(self) -> None:
+        observer = MarketBObserver(depth_levels=5, signal_snapshot_interval_ms=250, signal_change_threshold_ticks=1)
+        observer.on_book_update("B", FakeOrderBook(bids={1098: 10}, asks={1102: 10}))
+        observer.on_book_update("B_C_950", FakeOrderBook(bids={150: 10}, asks={154: 10}))
+        observer.on_book_update("B_P_950", FakeOrderBook(bids={0: 10}, asks={4: 10}))
+        observer.on_book_update("B_C_1000", FakeOrderBook(bids={100: 10}, asks={104: 10}))
+        observer.on_book_update("B_P_1000", FakeOrderBook(bids={0: 10}, asks={4: 10}))
+        observer.on_book_update("B_C_1050", FakeOrderBook(bids={50: 10}, asks={54: 10}))
+        observer.on_book_update("B_P_1050", FakeOrderBook(bids={0: 10}, asks={4: 10}))
+
+        self.assertIsNotNone(observer.derived_signal_bundle(now_ms=1_000))
+        self.assertIsNone(observer.derived_signal_bundle(now_ms=1_100))
+
+        observer.on_book_update("B_C_1000", FakeOrderBook(bids={104: 10}, asks={108: 10}))
+        self.assertIsNotNone(observer.derived_signal_bundle(now_ms=1_150))
+
+    def test_summarize_trace_events_reports_a_episode_mm_loss_and_b_cost_stats(self) -> None:
+        events = [
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "POST_EARNINGS_SHOCK",
+                "relevant": True,
+                "current_earnings_signal_id": "a_eps_1",
+                "mode_before_news": "STEADY_MM",
+                "old_fair_value": 1000,
+                "new_fair_value": 1080,
+                "raw_payload": {
+                    "kind": "structured",
+                    "new_data": {"asset": "A", "structured_subtype": "earnings", "value": 1.08},
+                },
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_100,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "POST_EARNINGS_SHOCK",
+                "pnl_owner": "a_earnings",
+                "action_class": "shock_take",
+                "intent": "post_earnings_shock_take",
+                "signal_id": "a_eps_1",
+                "side": "BUY",
+                "fill_price": 1000,
+                "fill_qty": 12,
+                "inventory": 12,
+                "earnings_position": 12,
+                "active_earnings_cycle_id": "a_eps_1",
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_200,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "UNWIND",
+                "mode_at_submit": "STEADY_MM",
+                "pnl_owner": "a_market_making",
+                "action_class": "market_making",
+                "intent": "steady_mm_passive",
+                "side": "BUY",
+                "fill_price": 1002,
+                "fill_qty": 1,
+                "inventory": 13,
+                "earnings_position": 13,
+                "active_earnings_cycle_id": "a_eps_1",
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_500,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "UNWIND",
+                "mid": 1010.0,
+                "inventory": 40,
+                "earnings_position": 40,
+            },
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "A",
+                "market_key": "A",
+                "mode": "POST_EARNINGS_SHOCK",
+                "relevant": True,
+                "current_earnings_signal_id": "a_eps_2",
+                "mode_before_news": "UNWIND",
+                "old_fair_value": 1080,
+                "new_fair_value": 1040,
+                "raw_payload": {
+                    "kind": "structured",
+                    "new_data": {"asset": "A", "structured_subtype": "earnings", "value": 1.04},
+                },
+            },
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 2_100,
+                "symbol": "B",
+                "market_key": "B",
+                "strategy_family": "b_observe_only",
+                "payload": {
+                    "parity_residual_by_strike": {"1000": 4.0},
+                    "parity_edge_after_cost_by_strike": {"1000": 1.5},
+                    "composite_basis": 0.75,
+                    "call_monotonicity_violations": [],
+                    "put_monotonicity_violations": [],
+                    "vertical_spread_bound_violations": [],
+                    "butterfly_convexity_violations": [],
+                },
+            },
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 2_400,
+                "symbol": "B",
+                "market_key": "B",
+                "strategy_family": "b_observe_only",
+                "payload": {
+                    "parity_residual_by_strike": {"1000": 2.0},
+                    "parity_edge_after_cost_by_strike": {"1000": -0.5},
+                    "composite_basis": 0.25,
+                    "call_monotonicity_violations": [],
+                    "put_monotonicity_violations": [],
+                    "vertical_spread_bound_violations": [],
+                    "butterfly_convexity_violations": [],
+                },
+            },
+        ]
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        self.assertEqual(summary["a_episode_summaries"][0]["shock_take_qty"], 12)
+        self.assertTrue(summary["a_episode_summaries"][0]["next_earnings_arrived_during_unwind"])
+        self.assertEqual(summary["a_episode_summaries"][0]["peak_total_inventory"], 40)
+        self.assertIn("STEADY_MM", summary["a_mm_loss_by_mode"])
+        self.assertEqual(summary["a_mm_loss_by_mode"]["fills_inside_earnings_cycle"], 1)
+        self.assertEqual(summary["b_cost_adjusted_residual_stats"]["by_strike"]["1000"]["positive_edge_count"], 1)
+        self.assertEqual(
+            summary["b_cost_adjusted_residual_stats"]["by_strike"]["1000"]["positive_edge_persistence_ms"],
+            300,
+        )
+        self.assertEqual(summary["trace_volume_summary"]["event_counts"]["derived_signal"], 2)
 
 
 if __name__ == "__main__":
