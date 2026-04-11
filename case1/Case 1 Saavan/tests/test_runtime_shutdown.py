@@ -135,14 +135,14 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._shutdown_note, "round_complete_auto_stop:market_resolved")
         self.assertEqual(bot.call.cancel_count, 1)
 
-    async def test_settlement_payout_requests_clean_auto_stop(self) -> None:
+    async def test_settlement_payout_is_observed_without_stopping(self) -> None:
         bot = self.make_bot()
 
         await bot.bot_handle_settlement_payout("user", "market-1", 100, 4350)
 
-        self.assertTrue(bot._shutdown.is_set())
-        self.assertEqual(bot._shutdown_note, "round_complete_auto_stop:settlement_payout")
-        self.assertEqual(bot.call.cancel_count, 1)
+        self.assertFalse(bot._shutdown.is_set())
+        self.assertEqual(bot._shutdown_note, "Bot shutdown")
+        self.assertEqual(bot.call.cancel_count, 0)
 
     async def test_b_option_updates_refresh_observer_without_repricing_live_quotes(self) -> None:
         bot = MarketABot.__new__(MarketABot)

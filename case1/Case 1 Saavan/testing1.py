@@ -1127,8 +1127,6 @@ class MarketABot(XChangeClient):
             reason="settlement_payout",
             details={"user": user, "market_id": market_id, "amount": int(amount), "tick": int(tick)},
         )
-        if self.config.auto_stop_after_round_complete:
-            self._request_round_complete_stop("settlement_payout")
 
     def _on_position_snapshot_received(self, now_ms: int) -> bool:
         self._position_snapshot_count += 1
