@@ -89,6 +89,63 @@ class MarketCStrategyTests(unittest.TestCase):
         self.assertEqual(plan.aggressive_actions[0].strategy_family, "c_earnings")
         self.assertEqual(plan.aggressive_actions[0].action_class, "shock_take")
 
+    def test_unwind_waits_for_live_order_cancel_before_flatten(self) -> None:
+        strategy = self.make_strategy()
+        strategy.on_news(self.c_earnings_news(2.0), now_ms=1_100)
+        strategy.on_news(self.c_earnings_news(2.2, tick=200), now_ms=2_000)
+        strategy.sync_inventory_from_exchange("C", 12, now_ms=2_050)
+        strategy.c_earnings_shock.mode = "UNWIND"
+        strategy.order_manager.note_submitted(
+            order_id="c-buy-1",
+            side="BUY",
+            px=1002,
+            qty=12,
+            now_ms=2_060,
+            aggressive=True,
+            intent="c_earnings_shock",
+            mode_at_submit="C_EARNINGS_SHOCK",
+            action_class="shock_take",
+            market_key="C",
+            strategy_family="c_earnings",
+            pnl_owner="c_earnings",
+            signal_id="c_earnings_1",
+            trade_group_id="c_earnings_1",
+        )
+
+        plan = strategy.compute_quotes(now_ms=2_100)
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "waiting_for_c_cancel_before_flatten")
+        self.assertEqual(strategy.trace_state(2_100)["c_unwind_wait_reason"], "waiting_for_c_cancel_before_flatten")
+
+    def test_reversal_waits_for_opposite_live_order_cancel(self) -> None:
+        strategy = self.make_strategy()
+        strategy.on_news(self.c_earnings_news(2.0), now_ms=1_100)
+        strategy.on_news(self.c_earnings_news(2.2, tick=200), now_ms=2_000)
+        strategy.sync_inventory_from_exchange("C", -12, now_ms=2_050)
+        strategy.order_manager.note_submitted(
+            order_id="c-sell-1",
+            side="SELL",
+            px=998,
+            qty=12,
+            now_ms=2_060,
+            aggressive=True,
+            intent="c_earnings_shock",
+            mode_at_submit="C_EARNINGS_SHOCK",
+            action_class="shock_take",
+            market_key="C",
+            strategy_family="c_earnings",
+            pnl_owner="c_earnings",
+            signal_id="c_earnings_1",
+            trade_group_id="c_earnings_1",
+        )
+
+        plan = strategy.compute_quotes(now_ms=2_100)
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "waiting_for_c_cancel_before_reversal")
+        self.assertEqual(strategy.trace_state(2_100)["c_live_order_side"], "SELL")
+
     def test_late_weak_earnings_is_blocked(self) -> None:
         strategy = self.make_strategy()
         strategy.on_news(self.c_earnings_news(2.0), now_ms=1_100)

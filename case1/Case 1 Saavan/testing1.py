@@ -154,6 +154,7 @@ class MarketABot(XChangeClient):
         )
         if config.a_strategy_mode == "ayush_port":
             self.strategy = AyushPortStrategy(
+                a_config=config.market_a,
                 risk=config.risk,
                 restored_orders=replay_state.live_orders,
                 recovered_multiplier=recovered_multiplier,

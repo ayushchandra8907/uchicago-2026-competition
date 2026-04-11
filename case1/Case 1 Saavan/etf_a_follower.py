@@ -327,8 +327,8 @@ class ETFAFollowerStrategy:
             return QuotePlan(self.mode, None, None, (), True, "waiting_for_a_shock_signal")
         diag = self.entry_diagnostics.setdefault(signal.signal_id, ETFEntryDiagnostics())
         elapsed_ms = int(now_ms) - int(signal.started_ms)
-        active_guard_reason = self._active_entry_guard_reason(now_ms)
         if diag.first_fill_ms is None and self.inventory == 0 and elapsed_ms >= int(self.config.entry_retry_window_ms):
+            active_guard_reason = self._active_entry_guard_reason(now_ms)
             diag.terminal_reason = active_guard_reason or "entry_retry_window_expired"
             self.last_block_reason = diag.terminal_reason
             self.active_signal = None
@@ -338,13 +338,6 @@ class ETFAFollowerStrategy:
             self.mode = "ETF_CHURN_GUARD"
             self.last_block_reason = "missing_etf_book"
             return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, "missing_etf_book")
-        if active_guard_reason is not None:
-            self.mode = "ETF_CHURN_GUARD"
-            self.last_block_reason = active_guard_reason
-            return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
-        if int(self.book.spread) < max(1, int(self.config.min_book_spread_ticks)):
-            self.last_block_reason = "etf_book_too_tight_or_crossed"
-            return self._unwind_plan(now_ms, reason="etf_book_too_tight_or_crossed", allow_only_if_flat=False)
 
         if self.mode == "ETF_A_SHOCK" and self._target_reached(signal):
             diag.terminal_reason = "etf_target_reached"
@@ -358,6 +351,20 @@ class ETFAFollowerStrategy:
 
         if self.mode == "ETF_UNWIND":
             return self._unwind_plan(now_ms, reason=self.unwind_reason or "unwinding_etf_a_follower")
+
+        active_guard_reason = self._active_entry_guard_reason(now_ms)
+        if active_guard_reason is not None:
+            if self.inventory != 0:
+                self.mode = "ETF_UNWIND"
+                self.unwind_reason = self.unwind_reason or "guarded_reduce_only_unwind"
+                self.last_block_reason = "guarded_reduce_only_unwind"
+                return self._unwind_plan(now_ms, reason="guarded_reduce_only_unwind", allow_only_if_flat=False)
+            self.mode = "ETF_CHURN_GUARD"
+            self.last_block_reason = "entry_blocked_by_churn_guard"
+            return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
+        if int(self.book.spread) < max(1, int(self.config.min_book_spread_ticks)):
+            self.last_block_reason = "etf_book_too_tight_or_crossed"
+            return self._unwind_plan(now_ms, reason="etf_book_too_tight_or_crossed", allow_only_if_flat=False)
 
         if self.mode == "ETF_A_HOLD":
             if abs(signal.target_inventory - int(self.inventory)) >= max(1, int(self.config.quote_size)):
@@ -496,23 +503,29 @@ class ETFAFollowerStrategy:
                 diag.terminal_reason = reason
             self.active_signal = None
             self.mode = "ETF_OBSERVE_ONLY"
+            self.last_block_reason = "etf_a_follower_flat"
             return QuotePlan(self.mode, None, None, (), True, "etf_a_follower_flat")
         live_buy = self.order_manager.live_order("BUY")
         live_sell = self.order_manager.live_order("SELL")
         if self.inventory > 0 and live_buy is not None and not live_buy.cancel_pending:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "waiting_for_buy_cancel_before_sell_unwind")
+            self.last_block_reason = "unwind_waiting_for_cancel"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_cancel")
         if self.inventory < 0 and live_sell is not None and not live_sell.cancel_pending:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "waiting_for_sell_cancel_before_buy_unwind")
+            self.last_block_reason = "unwind_waiting_for_cancel"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_cancel")
         if self.book.best_bid is None or self.book.best_ask is None:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "missing_etf_book_for_unwind")
+            self.last_block_reason = "unwind_waiting_for_fill"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_fill")
         if allow_only_if_flat and self.book.spread is not None and int(self.book.spread) <= 0:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "waiting_for_uncrossed_etf_unwind_book")
+            self.last_block_reason = "unwind_waiting_for_fill"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_fill")
         side = "SELL" if self.inventory > 0 else "BUY"
         px = self.book.best_bid.px if side == "SELL" else self.book.best_ask.px
         qty = min(abs(int(self.inventory)), max(1, int(self.config.quote_size)))
         signal_id = self.active_signal.signal_id if self.active_signal is not None else f"etf_unwind_{int(now_ms)}"
         order = self._desired(side, px, qty, reason=reason, signal_id=signal_id, action_class="etf_shock_unwind")
         self.mode = "ETF_UNWIND"
+        self.last_block_reason = reason
         return QuotePlan("ETF_UNWIND", None, None, (order,), False, reason)
 
     def _target_reached(self, signal: ETFASignal) -> bool:

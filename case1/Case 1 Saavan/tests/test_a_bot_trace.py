@@ -523,6 +523,7 @@ class TraceTests(unittest.TestCase):
             self.assertFalse(config.trace.trace_record_book_updates)
             self.assertFalse(config.trace.trace_record_observe_only_decisions)
             self.assertFalse(config.market_a.recover_pricing_state)
+            self.assertEqual(config.market_a.earnings_shock_entry_guard_ticks, 24)
             self.assertEqual(config.market_b.mm_min_eval_interval_ms, 150)
             self.assertEqual(config.market_b.max_position, 4)
             self.assertEqual(config.market_b.quote_size, 1)
@@ -1909,6 +1910,62 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(summary["c_summary"]["fill_count"], 1)
         self.assertEqual(summary["c_signal_episode_summaries"][0]["signal_id"], "c_earnings_1")
         self.assertEqual(summary["c_rate_context_summary"]["sample_count"], 2)
+
+    def test_summarize_trace_events_reports_provisional_c_totals_when_unreliable(self) -> None:
+        events = [
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "C",
+                "market_key": "C",
+                "strategy_family": "c_earnings",
+                "action_class": "earnings_signal",
+                "signal_id": "c_earnings_1",
+                "payload": {
+                    "signal_id": "c_earnings_1",
+                    "tick": 200,
+                    "fair_before": 1000.0,
+                    "fair_after": 1080.0,
+                    "fair_shift_ticks": 80.0,
+                    "edge": 78.0,
+                    "target_inventory": 80,
+                    "live_trading_enabled": True,
+                },
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_020,
+                "symbol": "C",
+                "market_key": "C",
+                "strategy_family": "c_earnings",
+                "pnl_owner": "c_earnings",
+                "action_class": "shock_take",
+                "signal_id": "c_earnings_1",
+                "side": "BUY",
+                "fill_qty": 10,
+                "fill_price": 1002,
+            },
+            {
+                "event_type": "inventory_updated",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "C",
+                "market_key": "C",
+                "mid": 1040.0,
+                "inventory": 0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+
+        self.assertNotIn("C", summary["pnl_by_market"])
+        self.assertEqual(summary["pnl_by_market_provisional"]["C"], 380.0)
+        self.assertFalse(summary["c_summary"]["reliable"])
+        self.assertEqual(summary["c_summary"]["pnl_provisional_fill_mtm"], 380.0)
+        self.assertEqual(summary["c_signal_episode_summaries"][0]["fill_count"], 1)
+        self.assertFalse(summary["c_signal_episode_summaries"][0]["reliable"])
 
     def test_etf_episode_summary_tracks_c_source_attribution(self) -> None:
         events = [

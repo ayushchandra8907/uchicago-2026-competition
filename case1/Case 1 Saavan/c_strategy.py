@@ -201,6 +201,7 @@ class MarketCStrategy:
         self.last_shadow_signal: CSignal | None = None
         self.c_earnings_shock = CEarningsShockState()
         self.signal_seq = 0
+        self.c_unwind_wait_reason: str | None = None
 
     def on_book_update_at(self, symbol: str, book, now_ms: int) -> bool:
         if symbol not in self.books:
@@ -291,14 +292,20 @@ class MarketCStrategy:
         self.maybe_initialize_anchor()
         self._record_c_shock_mid(int(now_ms))
         if self.c_earnings_shock.mode == "IDLE":
+            self.c_unwind_wait_reason = None
             self.mode = "C_OBSERVE_ONLY"
             return QuotePlan(self.mode, None, None, (), True, self.last_block_reason or "waiting_for_c_earnings_signal")
 
         if self.c_earnings_shock.mode == "UNWIND":
             self.mode = "C_EARNINGS_UNWIND"
-            if self.inventory == 0 and not self._has_live_orders():
+            if self.inventory == 0:
+                if self._has_live_orders():
+                    self.c_unwind_wait_reason = "waiting_for_c_cancel_before_flatten"
+                    self.last_block_reason = self.c_unwind_wait_reason
+                    return QuotePlan(self.mode, None, None, (), True, self.c_unwind_wait_reason)
                 self.reset_c_earnings_shock()
                 self.active_signal = None
+                self.c_unwind_wait_reason = None
                 self.mode = "C_OBSERVE_ONLY"
                 return QuotePlan(self.mode, None, None, (), True, "c_earnings_flat")
             return self._target_plan(
@@ -427,6 +434,10 @@ class MarketCStrategy:
             "c_shock_fair_before": shock.fair_before,
             "c_shock_fair_after": shock.fair_after,
             "c_shock_edge": shock.initial_edge if shock.mode != "IDLE" else None,
+            "c_unwind_wait_reason": self.c_unwind_wait_reason,
+            "c_live_order_count": len(self.order_manager.live_orders_snapshot()),
+            "c_live_order_side": self._live_order_side_tag(),
+            "c_target_side": self._target_side_for_inventory(shock.target_inventory),
             "exchange_tick": self.last_tick_seen,
         }
 
@@ -1158,6 +1169,12 @@ class MarketCStrategy:
         mode: str,
         signal_id: str | None,
     ) -> QuotePlan:
+        wait_reason = self._c_wait_reason_before_target(int(target_inventory))
+        if wait_reason is not None:
+            self.c_unwind_wait_reason = wait_reason
+            self.last_block_reason = wait_reason
+            return QuotePlan(mode, None, None, (), True, wait_reason)
+        self.c_unwind_wait_reason = None
         current_inventory = int(self.inventory)
         desired_delta = int(target_inventory) - current_inventory
         if desired_delta == 0:
@@ -1190,6 +1207,46 @@ class MarketCStrategy:
         )
         self.last_block_reason = None
         return QuotePlan(mode, None, None, (order,), False, reason)
+
+    def _c_wait_reason_before_target(self, target_inventory: int) -> str | None:
+        live_buy = self.order_manager.live_order("BUY")
+        live_sell = self.order_manager.live_order("SELL")
+        if target_inventory == 0:
+            if live_buy is not None and not live_buy.cancel_pending:
+                return "waiting_for_c_cancel_before_flatten"
+            if live_sell is not None and not live_sell.cancel_pending:
+                return "waiting_for_c_cancel_before_flatten"
+            return None
+        desired_delta = int(target_inventory) - int(self.inventory)
+        if desired_delta == 0:
+            return None
+        desired_side = "BUY" if desired_delta > 0 else "SELL"
+        opposite_order = self.order_manager.live_order("SELL" if desired_side == "BUY" else "BUY")
+        if opposite_order is not None and not opposite_order.cancel_pending:
+            return "waiting_for_c_cancel_before_reversal"
+        return None
+
+    def _live_order_side_tag(self) -> str:
+        sides = [
+            side
+            for side in ("BUY", "SELL")
+            if (order := self.order_manager.live_order(side)) is not None and int(order.remaining_qty) > 0
+        ]
+        if not sides:
+            return "NONE"
+        if len(sides) == 2:
+            return "BOTH"
+        return sides[0]
+
+    @staticmethod
+    def _target_side_for_inventory(target_inventory: int | None) -> str:
+        if target_inventory is None:
+            return "NONE"
+        if int(target_inventory) > 0:
+            return "BUY"
+        if int(target_inventory) < 0:
+            return "SELL"
+        return "FLAT"
 
     def best_price_for_cross(self, symbol: str, side: str) -> int | None:
         book = self.books.get(symbol) or BookSnapshot()

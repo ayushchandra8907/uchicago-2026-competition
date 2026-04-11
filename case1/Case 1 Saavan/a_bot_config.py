@@ -89,6 +89,7 @@ class AConfig:
     shock_window_ms: int = 3_000
     shock_take_fraction: float = 0.20
     shock_take_min_edge: int = 4
+    earnings_shock_entry_guard_ticks: int = 24
     news_emergency_dump_min_elapsed_ms: int = 250
     news_emergency_dump_ticks: int = 40
     news_emergency_dump_fraction: float = 0.20
@@ -504,6 +505,7 @@ def load_bot_config(
             shock_window_ms=_optional_int("A_SHOCK_WINDOW_MS", 3_000) or 3_000,
             shock_take_fraction=_optional_float("A_SHOCK_TAKE_FRACTION", 0.20) or 0.20,
             shock_take_min_edge=_optional_int("A_SHOCK_TAKE_MIN_EDGE", 4) or 4,
+            earnings_shock_entry_guard_ticks=_optional_int("A_EARNINGS_SHOCK_ENTRY_GUARD_TICKS", 24) or 24,
             news_emergency_dump_min_elapsed_ms=_optional_int("A_NEWS_EMERGENCY_DUMP_MIN_ELAPSED_MS", 250) or 250,
             news_emergency_dump_ticks=_optional_int("A_NEWS_EMERGENCY_DUMP_TICKS", 40) or 40,
             news_emergency_dump_fraction=_optional_float("A_NEWS_EMERGENCY_DUMP_FRACTION", 0.20) or 0.20,

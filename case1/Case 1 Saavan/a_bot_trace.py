@@ -108,6 +108,10 @@ SNAPSHOT_FIELDNAMES = [
     "unknown_candidate_phrases_json",
     "unknown_candidate_unigrams_json",
     "unknown_candidate_bigrams_json",
+    "a_shock_entry_guard_ticks",
+    "a_shock_entry_price_vs_fair",
+    "a_shock_price_guard_blocked",
+    "a_shock_entry_block_count",
     "composite_synthetic_fair",
     "synthetic_dispersion",
     "composite_basis",
@@ -160,6 +164,10 @@ SNAPSHOT_FIELDNAMES = [
     "c_shock_fair_before",
     "c_shock_fair_after",
     "c_shock_edge",
+    "c_unwind_wait_reason",
+    "c_live_order_count",
+    "c_live_order_side",
+    "c_target_side",
     "etf_signal_id",
     "etf_alpha_from_a",
     "etf_source_market",
@@ -1249,6 +1257,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             "open_started_ms": None,
         }
 
+    c_provisional_market_bucket = _bucket()
+    c_provisional_signal_buckets: dict[str, dict[str, Any]] = {}
+
     def _apply_fill(bucket: dict[str, Any], signed_qty: int, price: float, now_ms: int) -> None:
         if signed_qty == 0:
             return
@@ -1593,6 +1604,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             _apply_fill(owner_bucket, signed_qty, fill_price, now_ms)
             _apply_fill(action_bucket, signed_qty, fill_price, now_ms)
             _apply_fill(signal_bucket, signed_qty, fill_price, now_ms)
+            if market_key == "C":
+                _apply_fill(c_provisional_market_bucket, signed_qty, fill_price, now_ms)
+                _apply_fill(c_provisional_signal_buckets.setdefault(signal_id, _bucket()), signed_qty, fill_price, now_ms)
             mm_fill_inside_active_cycle = pnl_owner == "a_market_making" and market_key == "A" and bool(event.get("active_earnings_cycle_id"))
             if mm_fill_inside_active_cycle:
                 mm_fills_inside_earnings_cycle += 1
@@ -1739,6 +1753,29 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 if values:
                     summary[key][label] = sum(values) / len(values)
         return summary
+
+    def _bucket_total_pnl(bucket: dict[str, Any], symbol: str) -> float:
+        position = int(bucket["position"])
+        avg_cost = float(bucket["avg_cost"])
+        latest_mark = latest_mark_by_symbol.get(symbol)
+        unrealized = 0.0
+        if latest_mark is not None:
+            if position > 0:
+                unrealized = position * (latest_mark - avg_cost)
+            elif position < 0:
+                unrealized = abs(position) * (avg_cost - latest_mark)
+        return float(bucket["realized_pnl"]) + unrealized
+
+    c_reliable = bool((attribution_reliability.get("C") or {}).get("reliable", True))
+    c_provisional_market_pnl = (
+        round(_bucket_total_pnl(c_provisional_market_bucket, "C"), 4)
+        if int(c_provisional_market_bucket.get("fill_count") or 0) > 0
+        else None
+    )
+    c_provisional_signal_pnl = {
+        signal_id: round(_bucket_total_pnl(bucket, "C"), 4)
+        for signal_id, bucket in c_provisional_signal_buckets.items()
+    }
 
     top_losing_strategy_families = [
         {
@@ -2100,6 +2137,14 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         fill_count = sum(int(row.get("fill_count") or 0) for row in matching_rows)
         fill_qty = sum(int(row.get("fill_qty") or 0) for row in matching_rows)
         peak_abs_inventory = max((int(row.get("peak_abs_inventory") or 0) for row in matching_rows), default=0)
+        provisional_bucket = c_provisional_signal_buckets.get(signal_id)
+        provisional_total_pnl = c_provisional_signal_pnl.get(signal_id)
+        if provisional_bucket is not None and not c_reliable:
+            fill_count = max(fill_count, int(provisional_bucket.get("fill_count") or 0))
+            fill_qty = max(fill_qty, int(provisional_bucket.get("fill_qty") or 0))
+            peak_abs_inventory = max(peak_abs_inventory, int(provisional_bucket.get("peak_abs_inventory") or 0))
+            if provisional_total_pnl is not None:
+                total_pnl = float(provisional_total_pnl)
         c_signal_episode_summaries.append(
             {
                 "signal_id": signal_id,
@@ -2117,6 +2162,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 "fill_count": fill_count,
                 "fill_qty": fill_qty,
                 "peak_abs_inventory": peak_abs_inventory,
+                "reliable": c_reliable,
+                "provisional_total_pnl": provisional_total_pnl if not c_reliable else None,
             }
         )
     c_inventory_events = [
@@ -2155,7 +2202,12 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "max_long_inventory": max(c_inventory_values) if c_inventory_values else 0,
         "max_short_inventory": min(c_inventory_values) if c_inventory_values else 0,
         "pnl": round(pnl_by_market.get("C", 0.0), 4),
+        "reliable": c_reliable,
+        "pnl_provisional_fill_mtm": c_provisional_market_pnl,
     }
+    pnl_by_market_provisional: dict[str, float] = {}
+    if not c_reliable and c_provisional_market_pnl is not None:
+        pnl_by_market_provisional["C"] = c_provisional_market_pnl
     action_markout_summary = _average_markouts(fill_markouts_by_action_class)
     b_mean_reversion_summary = {
         "decision_count": int(b_meanrev_decision_count),
@@ -2290,6 +2342,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "fill_markouts_by_intent": _average_markouts(fill_markouts_by_intent),
         "markouts_by_action_class": action_markout_summary,
         "pnl_by_market": {key: round(value, 4) for key, value in sorted(pnl_by_market.items())},
+        "pnl_by_market_provisional": {key: round(value, 4) for key, value in sorted(pnl_by_market_provisional.items())},
         "pnl_by_strategy_family": {key: round(value, 4) for key, value in sorted(pnl_by_strategy_family.items())},
         "pnl_by_action_class": {key: round(value, 4) for key, value in sorted(pnl_by_action_class.items())},
         "attribution_reliability": attribution_reliability,
@@ -2677,6 +2730,10 @@ class TraceRecorder:
             "unknown_candidate_phrases": state.get("unknown_candidate_phrases"),
             "unknown_candidate_unigrams": state.get("unknown_candidate_unigrams"),
             "unknown_candidate_bigrams": state.get("unknown_candidate_bigrams"),
+            "a_shock_entry_guard_ticks": state.get("a_shock_entry_guard_ticks"),
+            "a_shock_entry_price_vs_fair": state.get("a_shock_entry_price_vs_fair"),
+            "a_shock_price_guard_blocked": state.get("a_shock_price_guard_blocked"),
+            "a_shock_entry_block_count": state.get("a_shock_entry_block_count"),
             "earnings_budget": state.get("earnings_budget"),
             "mm_budget": state.get("mm_budget"),
             "budget_shift_active": state.get("budget_shift_active"),
@@ -2763,6 +2820,10 @@ class TraceRecorder:
             "c_shock_fair_before": state.get("c_shock_fair_before"),
             "c_shock_fair_after": state.get("c_shock_fair_after"),
             "c_shock_edge": state.get("c_shock_edge"),
+            "c_unwind_wait_reason": state.get("c_unwind_wait_reason"),
+            "c_live_order_count": state.get("c_live_order_count"),
+            "c_live_order_side": state.get("c_live_order_side"),
+            "c_target_side": state.get("c_target_side"),
             "etf_signal_id": state.get("etf_signal_id"),
             "etf_alpha_from_a": state.get("etf_alpha_from_a"),
             "etf_source_market": state.get("etf_source_market"),
@@ -3381,6 +3442,10 @@ class TraceRecorder:
             "unknown_candidate_phrases_json": json.dumps(event.get("unknown_candidate_phrases") or [], sort_keys=True, default=_json_default),
             "unknown_candidate_unigrams_json": json.dumps(event.get("unknown_candidate_unigrams") or [], sort_keys=True, default=_json_default),
             "unknown_candidate_bigrams_json": json.dumps(event.get("unknown_candidate_bigrams") or [], sort_keys=True, default=_json_default),
+            "a_shock_entry_guard_ticks": event.get("a_shock_entry_guard_ticks"),
+            "a_shock_entry_price_vs_fair": event.get("a_shock_entry_price_vs_fair"),
+            "a_shock_price_guard_blocked": event.get("a_shock_price_guard_blocked"),
+            "a_shock_entry_block_count": event.get("a_shock_entry_block_count"),
             "composite_synthetic_fair": event.get("composite_synthetic_fair"),
             "synthetic_dispersion": event.get("synthetic_dispersion"),
             "composite_basis": event.get("composite_basis"),
@@ -3428,6 +3493,10 @@ class TraceRecorder:
             "c_shock_fair_before": event.get("c_shock_fair_before"),
             "c_shock_fair_after": event.get("c_shock_fair_after"),
             "c_shock_edge": event.get("c_shock_edge"),
+            "c_unwind_wait_reason": event.get("c_unwind_wait_reason"),
+            "c_live_order_count": event.get("c_live_order_count"),
+            "c_live_order_side": event.get("c_live_order_side"),
+            "c_target_side": event.get("c_target_side"),
             "etf_signal_id": event.get("etf_signal_id"),
             "etf_alpha_from_a": event.get("etf_alpha_from_a"),
             "etf_source_market": event.get("etf_source_market"),
