@@ -36,6 +36,22 @@ class MacroPairSignal:
     unknown_candidate_bigrams: tuple[str, ...]
     no_trade_reason: str | None
     contract_edges: dict[str, dict[str, float | None]]
+    terminal_probs: dict[str, float]
+    memory_logits: dict[str, float]
+    dominant_regime: str | None
+    contrary_signal_score: float
+    regime_break_score: float
+    pair_edge_ticks: float
+
+
+@dataclass(frozen=True)
+class FedProbabilityState:
+    market_prior_probs: dict[str, float]
+    posterior_probs: dict[str, float]
+    terminal_probs: dict[str, float]
+    memory_logits: dict[str, float]
+    dominant_regime: str | None
+    expected_rate_delta_bp: float
 
 
 @dataclass
@@ -65,8 +81,14 @@ class CStrategy:
 
         self.prior_probs = self._equal_probs()
         self.posterior_probs = self._equal_probs()
+        self.terminal_probs = self._equal_probs()
         self.fair_values = self._fair_values_from_probs(self.posterior_probs)
         self.expected_rate_delta_bp = 0.0
+        self.memory_logits = {symbol: 0.0 for symbol in self.tracked_symbols}
+        self.dominant_regime: str | None = None
+        self.contrary_signal_score = 0.0
+        self.regime_break_score = 0.0
+        self._memory_last_updated_ms: int | None = None
 
         self.baseline_targets_by_symbol = self._zero_targets()
         self.macro_pair_targets_by_symbol = self._zero_targets()
@@ -108,14 +130,32 @@ class CStrategy:
         self.rate_macro_leg_reference_mids: dict[str, float | None] = {symbol: None for symbol in self.tracked_symbols}
         self.rate_macro_leg_fairs: dict[str, float | None] = {symbol: None for symbol in self.tracked_symbols}
         self.rate_macro_leg_bucket: str | None = None
+        self.rate_market_prior_probs = dict(self.prior_probs)
+        self.rate_memory_logits = {symbol: 0.0 for symbol in self.tracked_symbols}
+        self.rate_dominant_regime: str | None = None
+        self.rate_contrary_signal_score = 0.0
+        self.rate_regime_break_score = 0.0
         self.latest_signal_positive_symbol: str | None = None
         self.latest_signal_negative_symbol: str | None = None
         self.latest_signal_pair_size: int = 0
+        self.flatten_affected_symbols: set[str] = set()
+        self.rate_global_flatten_signal: bool = False
+        self.rate_global_flatten_reason: str | None = None
         self._macro_event_counter = 0
 
     @property
     def tracked_symbols(self) -> tuple[str, str, str]:
         return self.config.tracked_symbols
+
+    def probability_state(self) -> FedProbabilityState:
+        return FedProbabilityState(
+            market_prior_probs=dict(self.prior_probs),
+            posterior_probs=dict(self.posterior_probs),
+            terminal_probs=dict(self.terminal_probs),
+            memory_logits=dict(self.memory_logits),
+            dominant_regime=self.dominant_regime,
+            expected_rate_delta_bp=self.expected_rate_delta_bp,
+        )
 
     def on_book(self, snapshot: StrategySnapshot) -> Decision:
         return self._evaluate(snapshot, trigger="book")
@@ -142,10 +182,15 @@ class CStrategy:
                     self.rate_no_trade_reason = "headline_below_relevance_threshold"
                 else:
                     self.rate_no_trade_reason = "irrelevant_macro_news"
+                self.rate_global_flatten_signal = False
+                self.rate_global_flatten_reason = None
                 return self._evaluate(snapshot, trigger="news")
-            self._apply_signal_state(signal)
+            self._apply_signal_state(signal, int(snapshot.now_ms))
             self.last_tradeable_macro_ms = int(snapshot.now_ms)
-            self._queue_or_activate_macro_signal(snapshot, signal)
+            if bool(self.config.flatten_only_mode):
+                self._activate_flatten_only_signal(signal)
+            else:
+                self._queue_or_activate_macro_signal(snapshot, signal)
             self.last_signal_ms = snapshot.now_ms
             return self._evaluate(snapshot, trigger=signal.source)
 
@@ -153,17 +198,29 @@ class CStrategy:
             self.rate_no_trade_reason = "final_phase_market_only"
         else:
             self.rate_no_trade_reason = "irrelevant_macro_news"
+        self.rate_global_flatten_signal = False
+        self.rate_global_flatten_reason = None
         return self._evaluate(snapshot, trigger="news")
 
     def export_state(self) -> dict[str, int | float | str | list[str] | dict[str, int | float | str | None] | None]:
         return {
             "active_signal_kind": "prediction_market",
+            "market_prior_hike": round(self.prior_probs[self.config.fed_hike], 6),
+            "market_prior_hold": round(self.prior_probs[self.config.fed_hold], 6),
+            "market_prior_cut": round(self.prior_probs[self.config.fed_cut], 6),
             "posterior_hike": round(self.posterior_probs[self.config.fed_hike], 6),
             "posterior_hold": round(self.posterior_probs[self.config.fed_hold], 6),
             "posterior_cut": round(self.posterior_probs[self.config.fed_cut], 6),
+            "terminal_hike": round(self.terminal_probs[self.config.fed_hike], 6),
+            "terminal_hold": round(self.terminal_probs[self.config.fed_hold], 6),
+            "terminal_cut": round(self.terminal_probs[self.config.fed_cut], 6),
             "prior_hike": round(self.prior_probs[self.config.fed_hike], 6),
             "prior_hold": round(self.prior_probs[self.config.fed_hold], 6),
             "prior_cut": round(self.prior_probs[self.config.fed_cut], 6),
+            "memory_logit_hike": round(float(self.memory_logits[self.config.fed_hike]), 6),
+            "memory_logit_hold": round(float(self.memory_logits[self.config.fed_hold]), 6),
+            "memory_logit_cut": round(float(self.memory_logits[self.config.fed_cut]), 6),
+            "dominant_regime": self.dominant_regime,
             "fair_value_hike": self.fair_values[self.config.fed_hike],
             "fair_value_hold": self.fair_values[self.config.fed_hold],
             "fair_value_cut": self.fair_values[self.config.fed_cut],
@@ -177,6 +234,9 @@ class CStrategy:
             "rate_target_inventory": self.latest_signal_pair_size,
             "rate_chosen_edge_ticks": round(self.rate_chosen_edge_ticks, 3),
             "rate_no_arb_gap_ticks": round(self.rate_no_arb_gap_ticks, 3),
+            "rate_dominant_regime": self.rate_dominant_regime,
+            "rate_contrary_signal_score": round(self.rate_contrary_signal_score, 3),
+            "rate_regime_break_score": round(self.rate_regime_break_score, 3),
             "rate_long_edge_hike": self._rounded_edge(self.config.fed_hike, "long_edge"),
             "rate_long_edge_hold": self._rounded_edge(self.config.fed_hold, "long_edge"),
             "rate_long_edge_cut": self._rounded_edge(self.config.fed_cut, "long_edge"),
@@ -230,10 +290,15 @@ class CStrategy:
             "rate_reversion_last_event_reason": None,
             "rate_reversion_last_entry_px": None,
             "rate_reversion_last_exit_px": None,
+            "rate_global_flatten_signal": self.rate_global_flatten_signal,
+            "rate_global_flatten_reason": self.rate_global_flatten_reason,
         }
 
     def _evaluate(self, snapshot: StrategySnapshot, *, trigger: str) -> Decision:
         self._ensure_session_started(snapshot)
+
+        if bool(self.config.flatten_only_mode):
+            return self._evaluate_flatten_only(snapshot, trigger=trigger)
 
         if self._is_endgame(snapshot):
             self._clear_trading_phase_state()
@@ -278,6 +343,26 @@ class CStrategy:
         self.mode = "IDLE"
         return self._observe("waiting for CPI, FedSpeak, or contract dislocations")
 
+    def _evaluate_flatten_only(self, snapshot: StrategySnapshot, *, trigger: str) -> Decision:
+        self._clear_probe_targets()
+        self._clear_endgame_targets()
+        self.final_phase_targets_by_symbol = self._zero_targets()
+        self.baseline_targets_by_symbol = self._zero_targets()
+        self.macro_pair_targets_by_symbol = self._zero_targets()
+        self._refresh_flatten_only_targets(snapshot)
+        self.combined_targets_by_symbol = dict(self.trading_phase_targets_by_symbol)
+        self.active_target_inventories = dict(self.combined_targets_by_symbol)
+        self.active_target_symbol = None
+        self.active_target_inventory = 0
+
+        target_symbol, target_inventory = self._next_target_delta(snapshot)
+        if target_symbol is not None and target_inventory != snapshot.inventory_for(target_symbol):
+            self.mode = "UNWIND"
+            return self._build_entry_decision(snapshot, trigger=trigger)
+
+        self.mode = "IDLE"
+        return self._observe("flatten-only C: preserving manual inventory unless macro news flags a contract")
+
     def _signal_from_news(self, snapshot: StrategySnapshot, news_event: NewsEvent) -> MacroPairSignal | None:
         if news_event.is_structured_cpi_print:
             return self._signal_from_cpi(snapshot, news_event)
@@ -285,11 +370,13 @@ class CStrategy:
             return self._signal_from_fedspeak(snapshot, news_event)
         return None
 
-    def _apply_signal_state(self, signal: MacroPairSignal) -> None:
+    def _apply_signal_state(self, signal: MacroPairSignal, now_ms: int) -> None:
         self.posterior_probs = dict(signal.posterior_probs)
         self.prior_probs = dict(signal.prior_probs)
+        self.terminal_probs = dict(signal.terminal_probs)
         self.fair_values = dict(signal.fair_values)
         self.expected_rate_delta_bp = signal.expected_rate_delta_bp
+        self.rate_market_prior_probs = dict(signal.prior_probs)
         self.last_signal_source = signal.source
         self.rate_macro_event_id = signal.macro_event_id
         self.rate_no_trade_reason = signal.no_trade_reason
@@ -316,7 +403,20 @@ class CStrategy:
         self.latest_signal_negative_symbol = signal.negative_symbol
         self.latest_signal_pair_size = signal.pair_size
         self.rate_macro_leg_bucket = signal.bucket
-        self.rate_chosen_edge_ticks = 0.0
+        self.rate_chosen_edge_ticks = signal.pair_edge_ticks
+        self.rate_memory_logits = dict(signal.memory_logits)
+        self.dominant_regime = signal.dominant_regime
+        self.rate_dominant_regime = signal.dominant_regime
+        self.regime_break_score = signal.regime_break_score
+        self.rate_regime_break_score = signal.regime_break_score
+        self.rate_contrary_signal_score = signal.contrary_signal_score
+        self._update_memory_from_signal(signal, now_ms)
+        self._update_contrary_signal_state(signal, now_ms)
+        self.terminal_probs = self._terminal_probs(self.prior_probs, now_ms)
+        self.dominant_regime = self._dominant_regime(self.terminal_probs)
+        self.rate_dominant_regime = self.dominant_regime
+        self.rate_contrary_signal_score = self.contrary_signal_score
+        self.rate_memory_logits = dict(self.memory_logits)
 
     def _queue_or_activate_macro_signal(self, snapshot: StrategySnapshot, signal: MacroPairSignal) -> None:
         if signal.positive_symbol is None or signal.negative_symbol is None or signal.pair_size <= 0:
@@ -332,6 +432,58 @@ class CStrategy:
         self.pending_macro_signal = None
         self.macro_pair_takeover_symbols.clear()
         self._activate_macro_signal(snapshot, signal)
+
+    def _activate_flatten_only_signal(self, signal: MacroPairSignal) -> None:
+        should_flatten = self._should_flatten_all_positions_on_signal(signal)
+        self.rate_global_flatten_signal = should_flatten
+        if should_flatten:
+            affected_symbols = list(self.tracked_symbols)
+            self.flatten_affected_symbols = set(affected_symbols)
+            self.rate_macro_pair_symbols = list(affected_symbols)
+            self.rate_no_trade_reason = None
+            self.rate_global_flatten_reason = self._flatten_reason_for_signal(signal)
+            return
+
+        self.flatten_affected_symbols.clear()
+        self.rate_macro_pair_symbols = None
+        self.rate_no_trade_reason = "macro_signal_not_large_enough_to_flatten"
+        self.rate_global_flatten_reason = None
+
+    def _flatten_symbols_from_signal(self, signal: MacroPairSignal) -> list[str]:
+        delta_map = {
+            self.config.fed_hike: abs(float(signal.delta_hike)),
+            self.config.fed_hold: abs(float(signal.delta_hold)),
+            self.config.fed_cut: abs(float(signal.delta_cut)),
+        }
+        threshold = float(self.config.flatten_signal_min_abs_delta)
+        affected = [symbol for symbol in self.tracked_symbols if delta_map[symbol] >= threshold]
+        if affected:
+            return affected
+
+        ranked = sorted(self.tracked_symbols, key=lambda symbol: delta_map[symbol], reverse=True)
+        if ranked and delta_map[ranked[0]] > 0:
+            return [ranked[0]]
+        return []
+
+    def _refresh_flatten_only_targets(self, snapshot: StrategySnapshot) -> None:
+        if self._macro_signal_window_active(snapshot) and self.flatten_affected_symbols:
+            targets = {}
+            for symbol in self.tracked_symbols:
+                if symbol in self.flatten_affected_symbols:
+                    targets[symbol] = 0
+                else:
+                    targets[symbol] = self._clip_contract_target(snapshot.inventory_for(symbol))
+            self.trading_phase_targets_by_symbol = targets
+            return
+
+        self.flatten_affected_symbols.clear()
+        self.rate_macro_pair_symbols = None
+        self.rate_global_flatten_signal = False
+        self.rate_global_flatten_reason = None
+        self.trading_phase_targets_by_symbol = {
+            symbol: self._clip_contract_target(snapshot.inventory_for(symbol))
+            for symbol in self.tracked_symbols
+        }
 
     def _activate_macro_signal(self, snapshot: StrategySnapshot, signal: MacroPairSignal) -> None:
         self.active_macro_signal = signal
@@ -377,6 +529,10 @@ class CStrategy:
         lower = float(self.config.baseline_neutral_low_price)
         upper = float(self.config.baseline_neutral_high_price)
         cap = int(self.config.baseline_target_cap)
+        if cap <= 0:
+            self.baseline_targets_by_symbol = self._zero_targets()
+            return
+
         full_distance = max(1.0, float(self.config.baseline_full_size_distance_ticks))
         marks = {symbol: self._mark_price(snapshot.book_for(symbol)) for symbol in self.tracked_symbols}
         centerish = [
@@ -544,8 +700,11 @@ class CStrategy:
                 symbol=target_symbol,
                 context_id=context_id,
             )
+        decision_mode = "SHOCK"
+        if bool(self.config.flatten_only_mode) and target_symbol in self.flatten_affected_symbols and target_inventory == 0:
+            decision_mode = "UNWIND"
         return Decision(
-            mode="SHOCK",
+            mode=decision_mode,
             target_inventory=target_inventory,
             desired_order=order,
             cancel_all=True,
@@ -610,6 +769,8 @@ class CStrategy:
         )
 
     def _entry_metadata_for_symbol(self, symbol: str, delta: int) -> tuple[str, str, str | None]:
+        if bool(self.config.flatten_only_mode) and symbol in self.flatten_affected_symbols:
+            return "prediction_market_unwind_macro", "flattening macro-affected contract back to zero", self.rate_macro_event_id
         if self.endgame_targets_by_symbol.get(symbol, 0) != 0:
             return "prediction_market_take_endgame", "building final winner/loser resolution inventory", self.rate_macro_event_id
         if self.probe_targets_by_symbol.get(symbol, 0) != 0:
@@ -649,13 +810,13 @@ class CStrategy:
         if surprise > 0:
             deltas = {
                 self.config.fed_hike: shift,
-                self.config.fed_hold: -0.45 * shift,
+                self.config.fed_hold: -0.35 * shift,
                 self.config.fed_cut: -shift,
             }
         else:
             deltas = {
                 self.config.fed_hike: -shift,
-                self.config.fed_hold: -0.45 * shift,
+                self.config.fed_hold: -0.35 * shift,
                 self.config.fed_cut: shift,
             }
         return self._build_macro_pair_signal(
@@ -711,6 +872,181 @@ class CStrategy:
             prior_probs=prior_probs,
         )
 
+    def _signal_vector(self, deltas: dict[str, float]) -> tuple[float, float, float]:
+        return (
+            float(deltas[self.config.fed_hike]),
+            float(deltas[self.config.fed_hold]),
+            float(deltas[self.config.fed_cut]),
+        )
+
+    def _decay_regime_state(self, now_ms: int) -> None:
+        if self._memory_last_updated_ms is None:
+            self._memory_last_updated_ms = int(now_ms)
+            return
+        elapsed = max(0, int(now_ms) - int(self._memory_last_updated_ms))
+        if elapsed <= 0:
+            return
+
+        memory_half_life = max(1.0, float(self.config.memory_half_life_ms))
+        memory_decay = math.exp(-math.log(2.0) * (float(elapsed) / memory_half_life))
+        for symbol in self.tracked_symbols:
+            self.memory_logits[symbol] *= memory_decay
+
+        contrary_half_life = max(1.0, float(self.config.contrary_signal_half_life_ms))
+        contrary_decay = math.exp(-math.log(2.0) * (float(elapsed) / contrary_half_life))
+        self.contrary_signal_score *= contrary_decay
+        self._memory_last_updated_ms = int(now_ms)
+
+    def _softmax(self, logits: list[float]) -> list[float]:
+        if not logits:
+            return []
+        temperature = max(1e-6, float(self.config.posterior_temperature))
+        scaled = [value / temperature for value in logits]
+        max_logit = max(scaled)
+        exp_values = [math.exp(value - max_logit) for value in scaled]
+        total = sum(exp_values)
+        if total <= 0:
+            return [1.0 / len(logits) for _ in logits]
+        return [value / total for value in exp_values]
+
+    def _terminal_probs(self, prior_probs: dict[str, float], now_ms: int) -> dict[str, float]:
+        self._decay_regime_state(now_ms)
+        floor = max(float(self.config.posterior_floor_probability), 1e-6)
+        logits = []
+        for symbol in self.tracked_symbols:
+            prior = max(floor, min(1.0 - floor, float(prior_probs.get(symbol, 1.0 / 3.0))))
+            logits.append(math.log(prior) + (float(self.config.memory_weight) * float(self.memory_logits[symbol])))
+        probs = self._softmax(logits)
+        return {symbol: probs[index] for index, symbol in enumerate(self.tracked_symbols)}
+
+    def _posterior_from_deltas(self, prior_probs: dict[str, float], deltas: tuple[float, float, float], now_ms: int) -> dict[str, float]:
+        terminal_probs = self._terminal_probs(prior_probs, now_ms)
+        floor = max(float(self.config.posterior_floor_probability), 1e-6)
+        logits = []
+        for index, symbol in enumerate(self.tracked_symbols):
+            terminal = max(floor, min(1.0 - floor, float(terminal_probs.get(symbol, 1.0 / 3.0))))
+            logits.append(math.log(terminal) + float(deltas[index]))
+        probs = self._softmax(logits)
+        return {symbol: probs[index] for index, symbol in enumerate(self.tracked_symbols)}
+
+    def _dominant_regime(self, probs: dict[str, float]) -> str | None:
+        ranked = sorted(self.tracked_symbols, key=lambda symbol: float(probs.get(symbol, 0.0)), reverse=True)
+        top = ranked[0]
+        second = ranked[1]
+        top_prob = float(probs.get(top, 0.0))
+        gap = top_prob - float(probs.get(second, 0.0))
+        if top_prob >= float(self.config.dominant_regime_probability_threshold) and gap >= float(self.config.dominant_regime_gap_threshold):
+            return top
+        return None
+
+    def _memory_kappa_for_signal(self, signal: MacroPairSignal) -> float:
+        if signal.source == "cpi_print":
+            return float(self.config.cpi_memory_kappa)
+        if signal.source != "FedSpeak":
+            return 0.0
+        if signal.bucket == "extreme" or signal.bucket == "strong":
+            return float(self.config.fedspeak_memory_kappa_strong)
+        if signal.bucket == "medium":
+            return float(self.config.fedspeak_memory_kappa_medium)
+        return float(self.config.fedspeak_memory_kappa_light)
+
+    def _update_memory_from_signal(self, signal: MacroPairSignal, now_ms: int) -> None:
+        self._decay_regime_state(now_ms)
+        kappa = self._memory_kappa_for_signal(signal)
+        if kappa <= 0:
+            return
+        delta_map = {
+            self.config.fed_hike: signal.delta_hike,
+            self.config.fed_hold: signal.delta_hold,
+            self.config.fed_cut: signal.delta_cut,
+        }
+        clip_abs = max(0.1, float(self.config.memory_max_abs_logit))
+        for symbol in self.tracked_symbols:
+            updated = float(self.memory_logits[symbol]) + (kappa * float(delta_map[symbol]))
+            self.memory_logits[symbol] = max(-clip_abs, min(clip_abs, updated))
+
+    def _update_contrary_signal_state(self, signal: MacroPairSignal, now_ms: int) -> None:
+        self._decay_regime_state(now_ms)
+        dominant_regime = signal.dominant_regime
+        if dominant_regime is None or signal.source != "FedSpeak":
+            if dominant_regime is None or signal.source == "cpi_print":
+                self.contrary_signal_score = 0.0
+            return
+        delta_map = {
+            self.config.fed_hike: float(signal.delta_hike),
+            self.config.fed_hold: float(signal.delta_hold),
+            self.config.fed_cut: float(signal.delta_cut),
+        }
+        proposed_positive = signal.positive_symbol
+        if proposed_positive is None:
+            proposed_positive = max(self.tracked_symbols, key=lambda symbol: delta_map[symbol])
+            if delta_map[proposed_positive] <= 0:
+                return
+        is_supportive = proposed_positive == dominant_regime
+        if is_supportive:
+            self.contrary_signal_score = 0.0
+            return
+        if signal.bucket not in {"strong", "extreme"} or signal.relevance_score < float(self.config.reversal_min_relevance):
+            return
+        increment = 1.35 if signal.bucket == "extreme" else 1.0
+        self.contrary_signal_score = min(4.0, float(self.contrary_signal_score) + increment)
+
+    def _pair_edge_ticks(
+        self,
+        contract_edges: dict[str, dict[str, float | None]],
+        positive_symbol: str | None,
+        negative_symbol: str | None,
+    ) -> float:
+        if positive_symbol is None or negative_symbol is None:
+            return 0.0
+        long_edge = contract_edges.get(positive_symbol, {}).get("long_edge")
+        short_edge = contract_edges.get(negative_symbol, {}).get("short_edge")
+        if long_edge is None or short_edge is None:
+            return 0.0
+        return float(long_edge) + float(short_edge)
+
+    def _apply_regime_gate(
+        self,
+        prior_probs: dict[str, float],
+        terminal_probs: dict[str, float],
+        *,
+        source: str,
+        bucket: str,
+        relevance_score: float,
+        deltas: dict[str, float],
+        positive_symbol: str | None,
+        pair_edge_ticks: float,
+    ) -> tuple[str | None, str | None, float]:
+        dominant_regime = self._dominant_regime(terminal_probs)
+        if dominant_regime is None or positive_symbol is None:
+            return None, dominant_regime, 0.0
+        if positive_symbol == dominant_regime or source == "cpi_print":
+            return None, dominant_regime, 0.0
+
+        dominant_prob = float(prior_probs.get(dominant_regime, 0.0))
+        contrary_prob = float(prior_probs.get(positive_symbol, 0.0))
+        market_gap = max(0.0, dominant_prob - contrary_prob)
+        signal_strength = max(0.0, float(deltas.get(positive_symbol, 0.0))) + max(0.0, -float(deltas.get(dominant_regime, 0.0)))
+        regime_break_score = (
+            float(self.contrary_signal_score)
+            + signal_strength
+            + max(0.0, float(self.config.reversal_market_gap_threshold) - market_gap) * 10.0
+        )
+        if bucket not in {"strong", "extreme"}:
+            return "isolated_contrary_no_trade", dominant_regime, regime_break_score
+        if relevance_score < float(self.config.reversal_min_relevance):
+            return "isolated_contrary_no_trade", dominant_regime, regime_break_score
+        if signal_strength < (float(self.config.macro_pair_min_delta) + float(self.config.reversal_extra_delta)):
+            return "reversal_gate", dominant_regime, regime_break_score
+        if pair_edge_ticks < (float(self.config.entry_edge_ticks) + float(self.config.reversal_extra_edge_ticks)):
+            return "reversal_gate", dominant_regime, regime_break_score
+        if (
+            float(self.contrary_signal_score) < float(self.config.contrary_signal_required_count)
+            and market_gap > float(self.config.reversal_market_gap_threshold)
+        ):
+            return "isolated_contrary_no_trade", dominant_regime, regime_break_score
+        return None, dominant_regime, regime_break_score
+
     def _build_macro_pair_signal(
         self,
         snapshot: StrategySnapshot,
@@ -733,21 +1069,40 @@ class CStrategy:
         no_arb_gap_ticks: float,
         prior_probs: dict[str, float],
     ) -> MacroPairSignal | None:
+        terminal_probs = self._terminal_probs(prior_probs, int(snapshot.now_ms))
         posterior_probs = self._posterior_from_deltas(
             prior_probs,
-            (
-                deltas[self.config.fed_hike],
-                deltas[self.config.fed_hold],
-                deltas[self.config.fed_cut],
-            ),
+            self._signal_vector(deltas),
+            int(snapshot.now_ms),
         )
         fair_values = self._fair_values_from_probs(posterior_probs)
+        contract_edges = self._contract_edges(snapshot, fair_values)
         positive_symbol, negative_symbol, no_trade_reason = self._select_macro_pair(snapshot, deltas)
+        pair_edge_ticks = self._pair_edge_ticks(contract_edges, positive_symbol, negative_symbol)
+        dominant_regime = self._dominant_regime(terminal_probs)
+        regime_break_score = 0.0
+        if positive_symbol is not None and negative_symbol is not None and pair_edge_ticks < float(self.config.entry_edge_ticks):
+            positive_symbol = None
+            negative_symbol = None
+            no_trade_reason = "pair_edge_too_small"
+        gate_reason, dominant_regime, regime_break_score = self._apply_regime_gate(
+            prior_probs,
+            terminal_probs,
+            source=source,
+            bucket=bucket,
+            relevance_score=relevance_score,
+            deltas=deltas,
+            positive_symbol=positive_symbol,
+            pair_edge_ticks=pair_edge_ticks,
+        )
+        if gate_reason is not None:
+            positive_symbol = None
+            negative_symbol = None
+            no_trade_reason = gate_reason
         pair_size = 0 if positive_symbol is None or negative_symbol is None else min(
             self.config.trading_macro_target_cap,
             self._position_for_bucket(bucket),
         )
-        contract_edges = self._contract_edges(snapshot, fair_values)
         return MacroPairSignal(
             macro_event_id=macro_event_id,
             source=source,
@@ -775,6 +1130,12 @@ class CStrategy:
             unknown_candidate_bigrams=unknown_candidate_bigrams,
             no_trade_reason=no_trade_reason,
             contract_edges=contract_edges,
+            terminal_probs=terminal_probs,
+            memory_logits=dict(self.memory_logits),
+            dominant_regime=dominant_regime,
+            contrary_signal_score=float(self.contrary_signal_score),
+            regime_break_score=float(regime_break_score),
+            pair_edge_ticks=float(pair_edge_ticks),
         )
 
     def _select_macro_pair(
@@ -929,10 +1290,12 @@ class CStrategy:
                 return
 
         prior_probs, no_arb_gap = self._prior_from_market(snapshot)
-        self.posterior_probs = dict(prior_probs)
         self.prior_probs = dict(prior_probs)
-        self.fair_values = self._fair_values_from_probs(prior_probs)
-        self.expected_rate_delta_bp = self._expected_rate_delta_bp(prior_probs)
+        self.terminal_probs = self._terminal_probs(prior_probs, int(snapshot.now_ms))
+        self.posterior_probs = dict(self.terminal_probs)
+        self.fair_values = self._fair_values_from_probs(self.terminal_probs)
+        self.expected_rate_delta_bp = self._expected_rate_delta_bp(self.terminal_probs)
+        self.dominant_regime = self._dominant_regime(self.terminal_probs)
         self.rate_macro_event_id = f"endgame:{snapshot.now_ms}"
         self.last_signal_source = "endgame_market_prior"
         self.rate_no_trade_reason = None
@@ -943,14 +1306,34 @@ class CStrategy:
         self.rate_cut_score = 0.0
         self.rate_no_arb_gap_ticks = no_arb_gap
         self.rate_edge_map = self._empty_edge_map()
+        self.rate_dominant_regime = self.dominant_regime
+        self.rate_contrary_signal_score = self.contrary_signal_score
+        self.rate_regime_break_score = 0.0
 
         marks = {symbol: float(self._mark_price(snapshot.book_for(symbol)) or 0.0) for symbol in self.tracked_symbols}
-        winner_symbol = max(self.tracked_symbols, key=lambda symbol: marks[symbol])
-        targets = {symbol: int(self.config.endgame_short_target) for symbol in self.tracked_symbols}
-        targets[winner_symbol] = int(self.config.endgame_long_target)
+        model_winner_symbol = max(self.tracked_symbols, key=lambda symbol: float(self.terminal_probs[symbol]))
+        market_winner_symbol = max(self.tracked_symbols, key=lambda symbol: marks[symbol])
+        winner_symbol = model_winner_symbol
+        if (
+            model_winner_symbol != market_winner_symbol
+            and (float(self.terminal_probs[model_winner_symbol]) - float(self.terminal_probs[market_winner_symbol]))
+            < float(self.config.late_consensus_anchor_gap)
+        ):
+            winner_symbol = market_winner_symbol
+        ranked = sorted(self.tracked_symbols, key=lambda symbol: float(self.terminal_probs[symbol]), reverse=True)
+        top_prob = float(self.terminal_probs[ranked[0]])
+        gap = top_prob - float(self.terminal_probs[ranked[1]])
+        confident = (
+            top_prob >= float(self.config.terminal_confident_probability)
+            or gap >= float(self.config.terminal_confident_gap)
+        )
+        long_target = int(self.config.endgame_long_target if confident else self.config.terminal_reduced_long_target)
+        short_target = int(self.config.endgame_short_target if confident else self.config.terminal_reduced_short_target)
+        targets = {symbol: short_target for symbol in self.tracked_symbols}
+        targets[winner_symbol] = long_target
         for symbol in self.tracked_symbols:
             if marks[symbol] < float(self.config.endgame_almost_dead_price):
-                targets[symbol] = int(self.config.endgame_short_target)
+                targets[symbol] = short_target
         self.endgame_targets_by_symbol = targets
 
     def _refresh_probe_targets(self, snapshot: StrategySnapshot) -> None:
@@ -964,10 +1347,12 @@ class CStrategy:
                 return
 
         prior_probs, no_arb_gap = self._prior_from_market(snapshot)
-        self.posterior_probs = dict(prior_probs)
         self.prior_probs = dict(prior_probs)
-        self.fair_values = self._fair_values_from_probs(prior_probs)
-        self.expected_rate_delta_bp = self._expected_rate_delta_bp(prior_probs)
+        self.terminal_probs = self._terminal_probs(prior_probs, int(snapshot.now_ms))
+        self.posterior_probs = dict(self.terminal_probs)
+        self.fair_values = self._fair_values_from_probs(self.terminal_probs)
+        self.expected_rate_delta_bp = self._expected_rate_delta_bp(self.terminal_probs)
+        self.dominant_regime = self._dominant_regime(self.terminal_probs)
         self.rate_macro_event_id = f"decision_probe:{snapshot.now_ms}"
         self.last_signal_source = "decision_probe_market_prior"
         self.rate_no_trade_reason = None
@@ -978,8 +1363,11 @@ class CStrategy:
         self.rate_cut_score = 0.0
         self.rate_no_arb_gap_ticks = no_arb_gap
         self.rate_edge_map = self._empty_edge_map()
+        self.rate_dominant_regime = self.dominant_regime
+        self.rate_contrary_signal_score = self.contrary_signal_score
+        self.rate_regime_break_score = 0.0
 
-        marks = {symbol: float(self._mark_price(snapshot.book_for(symbol)) or 0.0) for symbol in self.tracked_symbols}
+        marks = {symbol: float(self.fair_values[symbol]) for symbol in self.tracked_symbols}
         ranked = sorted(self.tracked_symbols, key=lambda symbol: marks[symbol], reverse=True)
         leader_symbol = ranked[0]
         leader_mark = marks[leader_symbol]
@@ -1054,6 +1442,47 @@ class CStrategy:
             return int(self.config.signal_extreme_position)
         return 0
 
+    @staticmethod
+    def _bucket_rank(bucket: str) -> int:
+        return {
+            "none": 0,
+            "light": 1,
+            "medium": 2,
+            "strong": 3,
+            "extreme": 4,
+        }.get(str(bucket or "none").lower(), 0)
+
+    def _should_flatten_all_positions_on_signal(self, signal: MacroPairSignal) -> bool:
+        if not bool(self.config.flatten_all_positions_on_major_macro):
+            return False
+
+        max_abs_delta = max(abs(float(signal.delta_hike)), abs(float(signal.delta_hold)), abs(float(signal.delta_cut)))
+        if max_abs_delta < float(self.config.flatten_signal_min_abs_delta):
+            return False
+
+        if signal.source == "cpi_print":
+            min_bucket = self._bucket_rank(self.config.flatten_major_cpi_min_bucket)
+            return self._bucket_rank(signal.bucket) >= min_bucket
+
+        if signal.source != "FedSpeak":
+            return False
+
+        min_bucket = self._bucket_rank(self.config.flatten_major_fedspeak_min_bucket)
+        if self._bucket_rank(signal.bucket) < min_bucket:
+            return False
+        if max(abs(float(signal.delta_hike)), abs(float(signal.delta_cut))) < abs(float(signal.delta_hold)):
+            return False
+        if float(signal.relevance_score) < float(self.config.flatten_major_fedspeak_min_relevance):
+            return False
+        if float(signal.pair_edge_ticks) < float(self.config.flatten_major_min_pair_edge_ticks):
+            return False
+        return True
+
+    def _flatten_reason_for_signal(self, signal: MacroPairSignal) -> str:
+        if signal.source == "cpi_print":
+            return f"major {signal.bucket} CPI surprise; flattening all positions"
+        return f"major {signal.bucket} FedSpeak repricing risk; flattening all positions"
+
     def _bucket_logit_shift(self, bucket: str) -> float:
         if bucket == "light":
             return float(self.config.news_light_logit_shift)
@@ -1085,19 +1514,6 @@ class CStrategy:
         if exp_total <= 0:
             return self._equal_probs(), total - scale
         return {symbol: exp_values[symbol] / exp_total for symbol in self.tracked_symbols}, total - scale
-
-    def _posterior_from_deltas(self, prior_probs: dict[str, float], deltas: tuple[float, float, float]) -> dict[str, float]:
-        floor = max(float(self.config.posterior_floor_probability), 1e-6)
-        logits = []
-        for index, symbol in enumerate(self.tracked_symbols):
-            prior = max(floor, min(1.0 - floor, float(prior_probs.get(symbol, 1.0 / 3.0))))
-            logits.append(math.log(prior) + deltas[index])
-        max_logit = max(logits)
-        exp_values = [math.exp(value - max_logit) for value in logits]
-        total = sum(exp_values)
-        if total <= 0:
-            return self._equal_probs()
-        return {symbol: exp_values[index] / total for index, symbol in enumerate(self.tracked_symbols)}
 
     def _fair_values_from_probs(self, probs: dict[str, float]) -> dict[str, int]:
         return {

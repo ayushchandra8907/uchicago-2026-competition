@@ -26,6 +26,15 @@ class CPredictionEventAnalysis:
     prior_hike: float | None
     prior_hold: float | None
     prior_cut: float | None
+    terminal_hike: float | None
+    terminal_hold: float | None
+    terminal_cut: float | None
+    memory_logit_hike: float | None
+    memory_logit_hold: float | None
+    memory_logit_cut: float | None
+    dominant_regime: str | None
+    contrary_signal_score: float | None
+    regime_break_score: float | None
     posterior_hike: float | None
     posterior_hold: float | None
     posterior_cut: float | None
@@ -150,6 +159,9 @@ def render_c_prediction_tracker_markdown(report: dict[str, Any], run_dir: Path) 
                     f"- Event kind / id: `{row['event_kind']}` / `{row['macro_event_id']}`",
                     f"- Time: `{row['monotonic_ms']}`",
                     f"- Bucket / relevance / no-trade reason: `{row['bucket']}` / `{row['relevance_score']}` / `{row['no_trade_reason']}`",
+                    f"- Terminal H/Hd/C: `{row['terminal_hike']}` / `{row['terminal_hold']}` / `{row['terminal_cut']}`",
+                    f"- Memory logits H/Hd/C: `{row['memory_logit_hike']}` / `{row['memory_logit_hold']}` / `{row['memory_logit_cut']}`",
+                    f"- Dominant regime / contrary score / regime-break score: `{row['dominant_regime']}` / `{row['contrary_signal_score']}` / `{row['regime_break_score']}`",
                     f"- Positive / negative leg: `{row['positive_leg_symbol']}` / `{row['negative_leg_symbol']}`",
                     f"- Prior H/Hd/C: `{row['prior_hike']}` / `{row['prior_hold']}` / `{row['prior_cut']}`",
                     f"- Posterior H/Hd/C: `{row['posterior_hike']}` / `{row['posterior_hold']}` / `{row['posterior_cut']}`",
@@ -315,6 +327,15 @@ def _analyze_c_event(
         prior_hike=_optional_float(event.get("prior_hike")),
         prior_hold=_optional_float(event.get("prior_hold")),
         prior_cut=_optional_float(event.get("prior_cut")),
+        terminal_hike=_optional_float(event.get("terminal_hike")),
+        terminal_hold=_optional_float(event.get("terminal_hold")),
+        terminal_cut=_optional_float(event.get("terminal_cut")),
+        memory_logit_hike=_optional_float(event.get("memory_logit_hike")),
+        memory_logit_hold=_optional_float(event.get("memory_logit_hold")),
+        memory_logit_cut=_optional_float(event.get("memory_logit_cut")),
+        dominant_regime=None if event.get("dominant_regime") is None else str(event.get("dominant_regime")),
+        contrary_signal_score=_optional_float(event.get("rate_contrary_signal_score")),
+        regime_break_score=_optional_float(event.get("rate_regime_break_score")),
         posterior_hike=_optional_float(event.get("posterior_hike")),
         posterior_hold=_optional_float(event.get("posterior_hold")),
         posterior_cut=_optional_float(event.get("posterior_cut")),

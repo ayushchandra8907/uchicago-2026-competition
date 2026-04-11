@@ -116,14 +116,37 @@ class BotRunnerTests(unittest.TestCase):
 
     def test_c_runner_snapshot_exposes_multi_symbol_state(self):
         runner = BotRunner(build_config(), active_strategy="C")
+        runner._inventory_estimate = 30
+        runner._inventory_estimate_by_symbol["A"] = 30
         runner._inventory_estimate_by_symbol["R_HIKE"] = 10
         runner._inventory_estimate_by_symbol["R_HOLD"] = -5
         runner._last_trade_px_by_symbol["R_CUT"] = 444
         snapshot = runner._snapshot(event_symbol="R_HIKE")
+        self.assertEqual(snapshot.inventory_for("A"), 30)
         self.assertEqual(snapshot.inventory_for("R_HIKE"), 10)
         self.assertEqual(snapshot.inventory_for("R_HOLD"), -5)
         self.assertEqual(snapshot.last_trade_for("R_CUT"), 444)
         self.assertEqual(snapshot.event_symbol, "R_HIKE")
+
+    def test_c_runner_tracks_a_for_global_flatten(self):
+        runner = BotRunner(build_config(), active_strategy="C")
+        self.assertIn("A", runner._tracked_symbols)
+        self.assertIn("R_HIKE", runner._tracked_symbols)
+
+    def test_global_flatten_decision_targets_a_inventory_in_c_mode(self):
+        runner = BotRunner(build_config(), active_strategy="C")
+        runner._inventory_estimate = 50
+        runner._inventory_estimate_by_symbol["A"] = 50
+        runner.order_books["A"] = type("Book", (), {"bids": {1000: 20}, "asks": {1004: 20}})()
+        runner._global_macro_flatten_until_ms = runner._now_ms() + 5_000
+        runner._global_macro_flatten_reason = "major CPI shock"
+        snapshot = runner._snapshot(event_symbol="A")
+        decision = runner._global_flatten_decision(snapshot, event_symbol="A")
+        self.assertEqual(decision.mode, "UNWIND")
+        self.assertIsNotNone(decision.desired_order)
+        self.assertEqual(decision.desired_order.symbol, "A")
+        self.assertEqual(decision.desired_order.side, "SELL")
+        self.assertEqual(decision.desired_order.intent, "global_macro_risk_off_flatten")
 
     def test_c_risk_adjusted_order_respects_per_contract_cap(self):
         config = build_config()
@@ -242,6 +265,41 @@ class BotRunnerAsyncTests(unittest.IsolatedAsyncioTestCase):
         await runner._apply_decision(decision)
 
         self.assertEqual(submitted, [("R_HOLD", 12)])
+
+    async def test_global_flatten_can_submit_a_order_even_when_a_trading_disabled(self):
+        runner = BotRunner(build_config(), active_strategy="C", a_trading_enable=False, c_trading_enable=True)
+        submitted: list[tuple[str, int]] = []
+
+        async def fake_place_order(symbol, qty, side, px):
+            submitted.append((str(symbol), int(qty)))
+            return f"oid-{len(submitted)}"
+
+        async def fake_cancel_order(order_id):
+            raise AssertionError("cancel_order should not be called")
+
+        runner.place_order = fake_place_order  # type: ignore[method-assign]
+        runner.cancel_order = fake_cancel_order  # type: ignore[method-assign]
+
+        decision = Decision(
+            mode="UNWIND",
+            target_inventory=0,
+            desired_order=DesiredOrder(
+                side="SELL",
+                px=1000,
+                qty=20,
+                aggressive=True,
+                intent="global_macro_risk_off_flatten",
+                reason="macro shock",
+                symbol="A",
+            ),
+            cancel_all=True,
+            observe_only=False,
+            reason="macro shock",
+        )
+
+        await runner._apply_decision(decision)
+
+        self.assertEqual(submitted, [("A", 12)])
 
 
 if __name__ == "__main__":

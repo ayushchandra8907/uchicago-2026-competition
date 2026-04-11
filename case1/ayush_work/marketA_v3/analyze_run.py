@@ -118,7 +118,12 @@ def summarize_events(events: list[dict]) -> dict:
 
 def render_summary_markdown(summary: dict, run_dir: Path) -> str:
     active_strategy = str(summary.get("active_strategy") or "unknown").upper()
-    title = "# Market C Prediction Run Summary" if active_strategy == "C" else "# Market A v3 Run Summary"
+    if active_strategy == "C":
+        title = "# Market C Prediction Run Summary"
+    elif active_strategy == "CM":
+        title = "# Market C Equity MM Run Summary"
+    else:
+        title = "# Market A v3 Run Summary"
     c_sections = []
     if active_strategy == "C":
         c_sections = [
