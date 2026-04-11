@@ -140,9 +140,26 @@ class BMeanReversionStrategyTests(unittest.TestCase):
         plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
 
         self.assertFalse(plan.observe_only)
-        self.assertIsNotNone(plan.ask)
         self.assertEqual(plan.mode, "B_MEANREV_EXIT")
-        self.assertEqual(plan.ask.action_class, "mean_reversion_exit")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "SELL")
+        self.assertTrue(plan.aggressive_actions[0].aggressive)
+        self.assertEqual(plan.aggressive_actions[0].action_class, "mean_reversion_exit")
+
+    def test_exit_z_triggers_aggressive_exit_even_outside_tick_band(self) -> None:
+        strategy = self.make_strategy()
+        strategy.sync_inventory_from_exchange(-4)
+        self.seed_signal(strategy, mid=1002.0)
+        strategy.last_sigma = 8.0
+        strategy.ewma_var = 64.0
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+
+        self.assertEqual(plan.mode, "B_MEANREV_EXIT")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "BUY")
+        self.assertTrue(plan.aggressive_actions[0].aggressive)
+        self.assertEqual(plan.aggressive_actions[0].action_class, "mean_reversion_exit")
 
     def test_low_z_blocks_non_extreme_entry_even_when_ticks_are_large_enough(self) -> None:
         strategy = self.make_strategy()

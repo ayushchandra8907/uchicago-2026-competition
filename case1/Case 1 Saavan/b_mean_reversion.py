@@ -324,8 +324,17 @@ class BMeanReversionStrategy:
             self.last_block_reason = "b_meanrev_max_hold_elapsed"
             return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion max hold exit", bool(self.config.meanrev_aggressive_exit)
 
-        if abs_deviation <= float(self.config.meanrev_exit_ticks) and self.inventory != 0:
-            return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean reverted inside exit band", False
+        if self.inventory != 0 and (
+            abs_deviation <= float(self.config.meanrev_exit_ticks)
+            or abs_z <= float(self.config.meanrev_exit_z)
+        ):
+            return (
+                0,
+                "B_MEANREV_EXIT",
+                "mean_reversion_exit",
+                "B mean reverted inside exit band",
+                bool(self.config.meanrev_aggressive_exit),
+            )
 
         residual_block = self._residual_entry_block(deviation, residual_payload)
         if residual_block is not None:
