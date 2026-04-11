@@ -355,10 +355,9 @@ class ETFAFollowerStrategy:
         active_guard_reason = self._active_entry_guard_reason(now_ms)
         if active_guard_reason is not None:
             if self.inventory != 0:
-                self.mode = "ETF_UNWIND"
-                self.unwind_reason = self.unwind_reason or "guarded_reduce_only_unwind"
-                self.last_block_reason = "guarded_reduce_only_unwind"
-                return self._unwind_plan(now_ms, reason="guarded_reduce_only_unwind", allow_only_if_flat=False)
+                self.mode = "ETF_CHURN_GUARD"
+                self.last_block_reason = "entry_blocked_by_churn_guard"
+                return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
             self.mode = "ETF_CHURN_GUARD"
             self.last_block_reason = "entry_blocked_by_churn_guard"
             return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
@@ -552,33 +551,35 @@ class ETFAFollowerStrategy:
             return True, "etf_max_hold_elapsed"
 
         if signal.source_market == "A":
-            a_mode = str((a_state or {}).get("mode") or "")
+            a_snapshot = a_state or {}
+            a_mode = str(a_snapshot.get("mode") or "")
             a_active = a_mode in {"POST_EARNINGS_SHOCK", "POST_NEWS_SHOCK"}
-            a_direction = int((a_state or {}).get("shock_direction") or 0)
+            a_direction = int(a_snapshot.get("shock_direction") or 0)
             if a_active and a_direction and a_direction != signal.source_direction:
                 return True, "a_shock_direction_flipped"
-            if elapsed_ms < int(self.config.min_hold_ms):
-                return False, ""
-            if not a_active:
+            if "mode" in a_snapshot and not a_active:
                 if self.inventory == 0:
                     return True, "a_signal_invalidated_before_entry"
-                return True, "a_shock_lifecycle_inactive_after_min_hold"
+                return True, "a_shock_lifecycle_inactive"
+            if elapsed_ms < int(self.config.min_hold_ms):
+                return False, ""
             return False, ""
 
         if signal.source_market == "C":
-            c_mode = str((c_state or {}).get("mode") or "")
+            c_snapshot = c_state or {}
+            c_mode = str(c_snapshot.get("mode") or "")
             c_active = c_mode in {"C_EARNINGS_SHOCK", "C_EARNINGS_UNWIND"}
-            c_direction = int((c_state or {}).get("c_shock_target_inventory") or 0)
+            c_direction = int(c_snapshot.get("c_shock_target_inventory") or 0)
             if c_direction:
                 c_direction = 1 if c_direction > 0 else -1
             if c_active and c_direction and c_direction != signal.source_direction:
                 return True, "c_shock_direction_flipped"
-            if elapsed_ms < int(self.config.min_hold_ms):
-                return False, ""
-            if not c_active:
+            if "mode" in c_snapshot and not c_active:
                 if self.inventory == 0:
                     return True, "c_signal_invalidated_before_entry"
-                return True, "c_shock_lifecycle_inactive_after_min_hold"
+                return True, "c_shock_lifecycle_inactive"
+            if elapsed_ms < int(self.config.min_hold_ms):
+                return False, ""
             return False, ""
 
         a_mode = str((a_state or {}).get("mode") or "")

@@ -197,6 +197,33 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(expired.reason, "entry_retry_window_expired")
         self.assertIsNone(strategy.active_signal)
 
+    def test_partial_entry_does_not_force_unwind_just_because_churn_guard_is_active(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        strategy.sync_inventory_from_exchange(8, now_ms=1_200)
+        strategy._churn_guard_reason = "crossed_or_locked_etf_book"
+        strategy._stable_book_since_ms = None
+
+        plan = strategy.compute_quotes(
+            now_ms=1_250,
+            a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": 1},
+        )
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.mode, "ETF_CHURN_GUARD")
+        self.assertEqual(plan.reason, "crossed_or_locked_etf_book")
+        self.assertIsNotNone(strategy.active_signal)
+        self.assertEqual(strategy.inventory, 8)
+
     def test_c_projection_creates_c_origin_signal(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
 
@@ -413,7 +440,7 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(plan.mode, "ETF_UNWIND")
         self.assertEqual(len(plan.aggressive_actions), 1)
         self.assertEqual(plan.aggressive_actions[0].side, "BUY")
-        self.assertEqual(strategy.trace_state(1_230)["block_reason"], "guarded_reduce_only_unwind")
+        self.assertEqual(strategy.trace_state(1_230)["block_reason"], "a_shock_lifecycle_inactive")
 
     def test_churn_guard_clears_after_stable_book_period(self) -> None:
         strategy = self.make_strategy(alpha=0.25)

@@ -147,3 +147,40 @@ class ANewsSentimentParityTests(unittest.TestCase):
                 for term in ("intellectual property", "loss key", "delivers blow", "key ip")
             )
         )
+
+    def test_glowing_praise_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Swift execution of a strategic pivot draws glowing praise for A."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("glowing praise", "swift execution")
+            )
+        )
+
+    def test_data_centers_cloud_growth_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "A expands data centers, signaling strong cloud growth."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("data centers", "cloud growth")
+            )
+        )
+
+    def test_rising_liabilities_phrase_scores_negative(self) -> None:
+        result = score_a_unstructured_headline(
+            "Newly released financials from A reveal rising liabilities."
+        )
+
+        self.assertLess(result.score, 0.0)
+        self.assertEqual(result.direction, -1)
+        self.assertIn("rising liabilities", result.matched_bigrams)
