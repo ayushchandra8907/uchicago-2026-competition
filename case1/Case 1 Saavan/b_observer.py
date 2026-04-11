@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from a_bot_strategy import BookSnapshot
+from b_parity_opportunist import BParityOpportunist
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class MarketBObserver:
             + [self.put_symbols[strike] for strike in self.STRIKES]
         )
         self.books: dict[str, BookSnapshot] = {symbol: BookSnapshot() for symbol in self.symbols}
+        self.last_book_ms: dict[str, int | None] = {symbol: None for symbol in self.symbols}
         self.positions: dict[str, int] = {symbol: 0 for symbol in self.symbols}
         self.last_trade_px: dict[str, int | None] = {symbol: None for symbol in self.symbols}
         self.last_trade_qty: dict[str, int | None] = {symbol: None for symbol in self.symbols}
@@ -46,10 +48,11 @@ class MarketBObserver:
         self.last_emitted_payload: dict[str, Any] | None = None
         self.last_emitted_ms: int | None = None
 
-    def on_book_update(self, symbol: str, book) -> bool:
+    def on_book_update(self, symbol: str, book, now_ms: int | None = None) -> bool:
         if symbol not in self.books:
             return False
         self.books[symbol] = BookSnapshot.from_order_book(book, depth_levels=self.depth_levels)
+        self.last_book_ms[symbol] = self._now_ms() if now_ms is None else int(now_ms)
         return True
 
     def on_market_trade(self, symbol: str, price: int, qty: int, now_ms: int | None = None) -> bool:
@@ -116,10 +119,10 @@ class MarketBObserver:
         }
 
     def derived_signal_bundle(self, *, now_ms: int | None = None) -> BSignalBundle | None:
-        payload = self.compute_residuals()
+        event_ms = self._now_ms() if now_ms is None else int(now_ms)
+        payload = self.compute_residuals(now_ms=event_ms)
         if payload is None:
             return None
-        event_ms = self._now_ms() if now_ms is None else int(now_ms)
         if not self._should_emit_signal(payload, event_ms):
             return None
         self.signal_seq += 1
@@ -134,7 +137,7 @@ class MarketBObserver:
             return None
         return payload.get("composite_synthetic_fair")
 
-    def compute_residuals(self) -> dict[str, Any] | None:
+    def compute_residuals(self, *, now_ms: int | None = None) -> dict[str, Any] | None:
         underlying_mid = self.books[self.underlying_symbol].mid
         if underlying_mid is None:
             return None
@@ -225,15 +228,28 @@ class MarketBObserver:
 
         composite_synthetic_fair = sum(synthetic_forward_by_strike.values()) / len(synthetic_forward_by_strike)
         composite_basis = sum(basis_by_strike.values()) / len(basis_by_strike)
+        synthetic_values = list(synthetic_forward_by_strike.values())
+        synthetic_dispersion = max(synthetic_values) - min(synthetic_values) if synthetic_values else None
+        tradeable_parity_by_strike = BParityOpportunist.compute_tradeable_parity(
+            books=self.books,
+            underlying_symbol=self.underlying_symbol,
+            strikes=self.STRIKES,
+            call_symbols=self.call_symbols,
+            put_symbols=self.put_symbols,
+            last_book_ms=self.last_book_ms,
+            now_ms=now_ms,
+        )
         return {
             "underlying_mid": float(underlying_mid),
             "parity_residual_by_strike": parity_residual_by_strike,
             "estimated_aggressive_crossing_cost_by_strike": crossing_cost_by_strike,
             "parity_edge_after_cost_by_strike": parity_edge_after_cost_by_strike,
             "synthetic_forward_by_strike": synthetic_forward_by_strike,
+            "synthetic_dispersion": None if synthetic_dispersion is None else round(synthetic_dispersion, 4),
             "underlying_vs_synthetic_basis": basis_by_strike,
             "composite_synthetic_fair": round(composite_synthetic_fair, 4),
             "composite_basis": round(composite_basis, 4),
+            "tradeable_parity_by_strike": tradeable_parity_by_strike,
             "call_monotonicity_violations": call_monotonicity_violations,
             "put_monotonicity_violations": put_monotonicity_violations,
             "vertical_spread_bound_violations": vertical_spread_bound_violations,

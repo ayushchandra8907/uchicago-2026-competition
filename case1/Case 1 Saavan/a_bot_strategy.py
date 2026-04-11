@@ -216,6 +216,7 @@ class NewsReaction:
     resolved_news_text: str | None = None
     resolved_news_text_source: str | None = None
     shock_direction: int = 0
+    shock_target_inventory: int | None = None
     shock_threshold: int | None = None
     tick: int | None = None
 
