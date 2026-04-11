@@ -143,6 +143,9 @@ class MarketCStrategyConfig:
 @dataclass(frozen=True)
 class StrategyConfig:
     symbol: str = "A"
+    rate_hike_symbol: str = "R_HIKE"
+    rate_hold_symbol: str = "R_HOLD"
+    rate_cut_symbol: str = "R_CUT"
     position_cap: int = 200
     max_exchange_order_qty: int = 40
     max_open_orders: int = 50
@@ -239,6 +242,14 @@ class StrategyConfig:
     maker_aggressive_flatten_inventory: int = 80
     maker_aggressive_flatten_spread_ticks: int = 2
     maker_fair_value_offset_ticks: float = 0.0
+    c_default_eps: float = 2.0
+    c_ops_weight: float = 0.72
+    c_bond_weight: float = 0.28
+    c_pe_yield_gamma: float = 13.0
+    c_bond_duration: float = 4.5
+    c_bond_convexity: float = 30.0
+    c_rate_step_bp: float = 25.0
+    c_earnings_ignore_delta: float = 0.010
 
 
 @dataclass(frozen=True)
@@ -433,11 +444,14 @@ def load_bot_config(base_dir: str | Path) -> BotConfig:
     )
     c_mm_strategy = StrategyConfig(
         symbol="C",
-        position_cap=_optional_int("C_MM_POSITION_CAP", 80),
+        rate_hike_symbol=os.getenv("C_MM_RATE_HIKE_SYMBOL", "R_HIKE").strip() or "R_HIKE",
+        rate_hold_symbol=os.getenv("C_MM_RATE_HOLD_SYMBOL", "R_HOLD").strip() or "R_HOLD",
+        rate_cut_symbol=os.getenv("C_MM_RATE_CUT_SYMBOL", "R_CUT").strip() or "R_CUT",
+        position_cap=_optional_int("C_MM_POSITION_CAP", 200),
         max_exchange_order_qty=_optional_int("C_MM_MAX_EXCHANGE_ORDER_QTY", 40),
         max_open_orders=_optional_int("C_MM_MAX_OPEN_ORDERS", 50),
         max_outstanding_volume=_optional_int("C_MM_MAX_OUTSTANDING_VOLUME", 120),
-        max_absolute_position=_optional_int("C_MM_MAX_ABSOLUTE_POSITION", 80),
+        max_absolute_position=_optional_int("C_MM_MAX_ABSOLUTE_POSITION", 200),
         order_slice_target_qty=_optional_int("C_MM_ORDER_SLICE_TARGET_QTY", 12),
         order_slice_min_qty=_optional_int("C_MM_ORDER_SLICE_MIN_QTY", 7),
         order_slice_max_qty=_optional_int("C_MM_ORDER_SLICE_MAX_QTY", 15),
@@ -455,6 +469,14 @@ def load_bot_config(base_dir: str | Path) -> BotConfig:
         maker_aggressive_flatten_inventory=_optional_int("C_MM_AGGRESSIVE_FLATTEN_INVENTORY", 80),
         maker_aggressive_flatten_spread_ticks=_optional_int("C_MM_AGGRESSIVE_FLATTEN_SPREAD_TICKS", 2),
         maker_fair_value_offset_ticks=_optional_float("C_MM_FAIR_VALUE_OFFSET_TICKS", 0.0),
+        c_default_eps=_optional_float("C_MM_DEFAULT_EPS", 2.0),
+        c_ops_weight=_optional_float("C_MM_OPS_WEIGHT", 0.72),
+        c_bond_weight=_optional_float("C_MM_BOND_WEIGHT", 0.28),
+        c_pe_yield_gamma=_optional_float("C_MM_PE_YIELD_GAMMA", 13.0),
+        c_bond_duration=_optional_float("C_MM_BOND_DURATION", 4.5),
+        c_bond_convexity=_optional_float("C_MM_BOND_CONVEXITY", 30.0),
+        c_rate_step_bp=_optional_float("C_MM_RATE_STEP_BP", 25.0),
+        c_earnings_ignore_delta=_optional_float("C_MM_EARNINGS_IGNORE_DELTA", 0.010),
     )
     return BotConfig(
         exchange=exchange,

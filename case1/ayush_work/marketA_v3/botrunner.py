@@ -24,9 +24,9 @@ except ModuleNotFoundError as exc:
 LOGGER = logging.getLogger("market-a-v3")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 
-A_TRADING_ENABLE = False
-C_TRADING_ENABLE = True
-ACTIVE_STRATEGY = "CM"
+A_TRADING_ENABLE = True
+C_TRADING_ENABLE = False
+ACTIVE_STRATEGY = "A"
 GLOBAL_MACRO_FLATTEN_INTENT = "global_macro_risk_off_flatten"
 
 
@@ -62,7 +62,12 @@ class BotRunner(XChangeClient):
             session_prefix = "marketA_v3"
         elif self.active_strategy == "CM":
             strategy_symbols = (config.c_mm_strategy.symbol,)
-            tracked_symbols = strategy_symbols
+            tracked_symbols = (
+                config.c_mm_strategy.symbol,
+                config.c_mm_strategy.rate_hike_symbol,
+                config.c_mm_strategy.rate_hold_symbol,
+                config.c_mm_strategy.rate_cut_symbol,
+            )
             self.strategy = CMarketMakerStrategy(config.c_mm_strategy)
             self._primary_symbol = config.c_mm_strategy.symbol
             session_prefix = "marketCmm_v1"

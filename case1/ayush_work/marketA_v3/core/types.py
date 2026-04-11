@@ -68,6 +68,15 @@ class NewsEvent:
         )
 
     @property
+    def is_structured_c_earnings(self) -> bool:
+        return (
+            self.kind == "structured"
+            and self.structured_subtype == "earnings"
+            and (self.asset or self.symbol or "").upper() == "C"
+            and self.value is not None
+        )
+
+    @property
     def is_a_specific_unstructured(self) -> bool:
         return self.kind == "unstructured" and (self.asset or self.symbol or "").upper() == "A"
 
