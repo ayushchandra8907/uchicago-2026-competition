@@ -11,7 +11,7 @@ if str(BOT_DIR) not in sys.path:
 
 from a_bot_config import ETFConfig, RiskConfig
 from a_bot_strategy import NewsReaction
-from etf_a_follower import ETFAFollowerStrategy
+from etf_a_follower import ETFAFollowerStrategy, ETFShockProjection
 
 
 class FakeOrderBook:
@@ -196,6 +196,55 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertTrue(second.aggressive_actions[0].aggressive)
         self.assertEqual(expired.reason, "entry_retry_window_expired")
         self.assertIsNone(strategy.active_signal)
+
+    def test_c_projection_creates_c_origin_signal(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+
+        signal = strategy.on_shock_projection(
+            ETFShockProjection(
+                source_market="C",
+                source_kind="structured_earnings",
+                source_signal_id="c_earnings_1",
+                fair_shift_ticks=100.0,
+                alpha=0.25,
+                source_target_inventory=120,
+                source_combo="C_only",
+                source_direction=1,
+            ),
+            now_ms=1_100,
+        )
+        assert signal is not None
+        strategy.activate_signal(signal)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source_market, "C")
+        self.assertEqual(signal.source_combo, "C_only")
+        self.assertEqual(signal.target_inventory, 50)
+        state = strategy.trace_state(1_100)
+        self.assertEqual(state["etf_source_market"], "C")
+        self.assertEqual(state["etf_source_combo"], "C_only")
+
+    def test_preview_projection_reports_target_inventory(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+
+        preview = strategy.preview_projection(
+            ETFShockProjection(
+                source_market="C",
+                source_kind="structured_earnings",
+                source_signal_id="c_earnings_2",
+                fair_shift_ticks=120.0,
+                alpha=0.25,
+                source_target_inventory=200,
+                source_combo="A_C_aligned",
+                source_direction=1,
+            )
+        )
+
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview["direction"], 1)
+        self.assertEqual(preview["target_inventory"], 50)
+        self.assertEqual(preview["target_from_source_position"], 70)
 
     def test_cancel_response_does_not_clear_unfilled_signal(self) -> None:
         strategy = self.make_strategy(alpha=0.25)

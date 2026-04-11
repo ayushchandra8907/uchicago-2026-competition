@@ -134,10 +134,39 @@ SNAPSHOT_FIELDNAMES = [
     "b_meanrev_regime_block_reason",
     "b_meanrev_risk_off_forced",
     "b_meanrev_entry_style",
+    "c_fair_value",
+    "c_fair_gap",
+    "c_anchor_price",
+    "c_anchor_eps",
+    "c_anchor_rate_bp",
+    "c_current_eps",
+    "c_last_earnings_delta",
+    "c_signal_id",
+    "c_signal_thesis",
+    "c_signal_strength",
+    "c_signal_target",
+    "c_signal_fresh",
+    "c_market_rate_bp",
+    "c_effective_rate_bp",
+    "c_cpi_bias_bp",
+    "c_last_cpi_surprise",
+    "c_q_hike",
+    "c_q_hold",
+    "c_q_cut",
+    "c_shock_mode",
+    "c_shock_target_inventory",
+    "c_shock_original_target_inventory",
+    "c_shock_reference_mid",
+    "c_shock_fair_before",
+    "c_shock_fair_after",
+    "c_shock_edge",
     "etf_signal_id",
     "etf_alpha_from_a",
+    "etf_source_market",
+    "etf_source_combo",
     "etf_source_signal_id",
     "etf_source_signal_kind",
+    "etf_source_fair_shift",
     "etf_a_fair_shift",
     "etf_projected_shift",
     "etf_base_mid",
@@ -805,7 +834,7 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
         for event in events
         if str(event.get("event_type") or "") == "derived_signal"
         and str(event.get("strategy_family") or "") == "etf_a_follower"
-        and str(event.get("action_class") or "") == "a_shock_projection"
+        and str(event.get("action_class") or "") in {"a_shock_projection", "c_shock_projection", "ac_shock_projection"}
     ]
     if not signal_events:
         return []
@@ -925,6 +954,7 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
                 terminal_reason = str(terminal)
                 break
         base_mid = payload.get("base_mid")
+        source_fair_shift = payload.get("source_fair_shift", payload.get("a_fair_shift"))
         direction_matches: dict[str, bool | None] = {}
         for horizon_ms in (1_000, 3_000, 5_000):
             mark = _mark_at_or_after(etf_series, start_ms + horizon_ms)
@@ -932,13 +962,16 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
                 direction_matches[str(horizon_ms)] = None
             else:
                 move = float(mark) - float(base_mid)
-                fair_shift = float(payload.get("a_fair_shift", 0.0) or 0.0)
+                fair_shift = float(source_fair_shift or 0.0)
                 direction_matches[str(horizon_ms)] = None if fair_shift == 0 else bool(move * fair_shift > 0)
         rows.append(
             {
                 "signal_id": signal_id,
+                "source_market": payload.get("source_market"),
+                "source_combo": payload.get("source_combo"),
                 "source_kind": payload.get("source_kind"),
                 "started_ms": start_ms,
+                "source_fair_shift": source_fair_shift,
                 "a_fair_shift": payload.get("a_fair_shift"),
                 "configured_alpha": payload.get("alpha"),
                 "target_inventory": payload.get("target_inventory"),
@@ -2034,6 +2067,95 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "missed_entry_reasons": dict(etf_missed_entry_reasons.most_common()),
         "churn_guard_count": int(etf_churn_guard_count),
     }
+    c_signal_events = [
+        event
+        for event in event_list
+        if str(event.get("event_type") or "") == "derived_signal"
+        and str(event.get("strategy_family") or "") in {"c_earnings", "c_cpi_shadow", "c_macro_shadow"}
+    ]
+    c_signal_episode_summaries: list[dict[str, Any]] = []
+    c_signal_counts: Counter[str] = Counter()
+    c_live_signal_count = 0
+    c_blocked_signal_count = 0
+    for signal_event in c_signal_events:
+        strategy_family = str(signal_event.get("strategy_family") or "unknown")
+        action_class = str(signal_event.get("action_class") or "unknown")
+        payload = signal_event.get("payload") or {}
+        signal_id = str(signal_event.get("signal_id") or payload.get("signal_id") or "")
+        if not signal_id:
+            continue
+        c_signal_counts[strategy_family] += 1
+        live_trading_enabled = bool(payload.get("live_trading_enabled"))
+        blocked_reason = payload.get("blocked_reason")
+        if live_trading_enabled:
+            c_live_signal_count += 1
+        if blocked_reason or action_class == "shadow_blocked":
+            c_blocked_signal_count += 1
+        matching_rows = [
+            row
+            for row in signal_episode_rows
+            if str(row.get("market_key") or "") == "C" and str(row.get("signal_id") or "") == signal_id
+        ]
+        total_pnl = sum(float(row.get("total_pnl") or 0.0) for row in matching_rows)
+        fill_count = sum(int(row.get("fill_count") or 0) for row in matching_rows)
+        fill_qty = sum(int(row.get("fill_qty") or 0) for row in matching_rows)
+        peak_abs_inventory = max((int(row.get("peak_abs_inventory") or 0) for row in matching_rows), default=0)
+        c_signal_episode_summaries.append(
+            {
+                "signal_id": signal_id,
+                "strategy_family": strategy_family,
+                "action_class": action_class,
+                "tick": payload.get("tick"),
+                "blocked_reason": blocked_reason,
+                "live_trading_enabled": live_trading_enabled,
+                "target_inventory": payload.get("target_inventory"),
+                "fair_before": payload.get("fair_before"),
+                "fair_after": payload.get("fair_after"),
+                "fair_shift_ticks": payload.get("fair_shift_ticks"),
+                "edge": payload.get("edge"),
+                "total_pnl": round(total_pnl, 4),
+                "fill_count": fill_count,
+                "fill_qty": fill_qty,
+                "peak_abs_inventory": peak_abs_inventory,
+            }
+        )
+    c_inventory_events = [
+        event
+        for event in event_list
+        if str(event.get("market_key") or "") == "C" and event.get("inventory") is not None
+    ]
+    c_inventory_values = [int(event.get("inventory") or 0) for event in c_inventory_events]
+    c_fill_count = sum(
+        count for action_class, count in fills_by_action_class.items() if action_class in {"shock_take", "shock_unwind", "overshoot_trim", "decay_trim", "risk_flatten"}
+    )
+    c_fill_qty = sum(
+        qty for action_class, qty in fill_qty_by_action_class.items() if action_class in {"shock_take", "shock_unwind", "overshoot_trim", "decay_trim", "risk_flatten"}
+    )
+    c_rate_sample_events = [event for event in event_list if event.get("c_market_rate_bp") is not None]
+    c_market_rate_values = [float(event.get("c_market_rate_bp") or 0.0) for event in c_rate_sample_events]
+    c_effective_rate_values = [float(event.get("c_effective_rate_bp") or 0.0) for event in c_rate_sample_events]
+    c_cpi_bias_values = [float(event.get("c_cpi_bias_bp") or 0.0) for event in c_rate_sample_events]
+    c_rate_context_summary = {
+        "sample_count": len(c_rate_sample_events),
+        "avg_market_rate_bp": round(sum(c_market_rate_values) / len(c_market_rate_values), 4) if c_market_rate_values else None,
+        "avg_effective_rate_bp": round(sum(c_effective_rate_values) / len(c_effective_rate_values), 4) if c_effective_rate_values else None,
+        "cpi_bias_activation_count": sum(1 for value in c_cpi_bias_values if abs(value) > 1e-9),
+        "avg_cpi_bias_bp": round(sum(c_cpi_bias_values) / len(c_cpi_bias_values), 4) if c_cpi_bias_values else None,
+    }
+    c_summary = {
+        "signal_count": len(c_signal_episode_summaries),
+        "strategy_signal_counts": dict(sorted(c_signal_counts.items())),
+        "live_signal_count": int(c_live_signal_count),
+        "blocked_signal_count": int(c_blocked_signal_count),
+        "earnings_signal_count": int(c_signal_counts.get("c_earnings", 0)),
+        "cpi_signal_count": int(c_signal_counts.get("c_cpi_shadow", 0)),
+        "macro_signal_count": int(c_signal_counts.get("c_macro_shadow", 0)),
+        "fill_count": int(c_fill_count),
+        "fill_qty": int(c_fill_qty),
+        "max_long_inventory": max(c_inventory_values) if c_inventory_values else 0,
+        "max_short_inventory": min(c_inventory_values) if c_inventory_values else 0,
+        "pnl": round(pnl_by_market.get("C", 0.0), 4),
+    }
     action_markout_summary = _average_markouts(fill_markouts_by_action_class)
     b_mean_reversion_summary = {
         "decision_count": int(b_meanrev_decision_count),
@@ -2200,6 +2322,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "b_adverse_selection_stats": b_adverse_selection_stats,
         "b_option_lottery_summary": b_option_lottery_summary,
         "b_shadow_underlying_mm": b_shadow_underlying_mm,
+        "c_summary": c_summary,
+        "c_rate_context_summary": c_rate_context_summary,
+        "c_signal_episode_summaries": c_signal_episode_summaries,
         "etf_a_shock_calibration": etf_a_shock_calibration,
         "etf_episode_summaries": etf_episode_summaries,
         "etf_entry_summary": etf_entry_summary,
@@ -2243,6 +2368,9 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     b_adverse_selection_stats = summary.get("b_adverse_selection_stats") or {}
     b_option_lottery_summary = summary.get("b_option_lottery_summary") or {}
     b_shadow_underlying_mm = summary.get("b_shadow_underlying_mm") or {}
+    c_summary = summary.get("c_summary") or {}
+    c_rate_context_summary = summary.get("c_rate_context_summary") or {}
+    c_signal_episode_summaries = summary.get("c_signal_episode_summaries") or []
     etf_a_shock_calibration = summary.get("etf_a_shock_calibration") or {}
     etf_episode_summaries = summary.get("etf_episode_summaries") or []
     etf_entry_summary = summary.get("etf_entry_summary") or {}
@@ -2379,6 +2507,20 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "## B Shadow Underlying MM",
             *(f"- `{key}`: `{value}`" for key, value in b_shadow_underlying_mm.items()),
             "",
+            "## C Summary",
+            *(f"- `{key}`: `{value}`" for key, value in c_summary.items()),
+            "",
+            "## C Rate Context Summary",
+            *(f"- `{key}`: `{value}`" for key, value in c_rate_context_summary.items()),
+            "",
+            "## C Signal Episode Summaries",
+            *(
+                f"- `{row.get('signal_id')}` family=`{row.get('strategy_family')}` action=`{row.get('action_class')}` "
+                f"target=`{row.get('target_inventory')}` blocked=`{row.get('blocked_reason')}` "
+                f"live=`{row.get('live_trading_enabled')}` pnl=`{row.get('total_pnl')}` fills=`{row.get('fill_count')}`"
+                for row in c_signal_episode_summaries
+            ),
+            "",
             "## ETF A-Shock Calibration",
             f"- Signal count: `{etf_a_shock_calibration.get('signal_count', 0)}`",
             f"- By horizon: `{etf_a_shock_calibration.get('by_horizon_ms')}`",
@@ -2394,7 +2536,8 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "",
             "## ETF Episode Summaries",
             *(
-                f"- `{row.get('signal_id')}` source=`{row.get('source_kind')}` target=`{row.get('target_inventory')}` "
+                f"- `{row.get('signal_id')}` source_market=`{row.get('source_market')}` combo=`{row.get('source_combo')}` "
+                f"source=`{row.get('source_kind')}` target=`{row.get('target_inventory')}` "
                 f"entry_qty=`{row.get('entry_qty')}` unwind_qty=`{row.get('unwind_qty')}` peak=`{row.get('peak_inventory')}` "
                 f"hold_ms=`{row.get('hold_time_ms')}` pnl=`{row.get('episode_pnl')}` "
                 f"unwind_reason=`{row.get('unwind_reason')}` first_block=`{row.get('first_block_reason')}` "
@@ -2594,10 +2737,39 @@ class TraceRecorder:
             "b_meanrev_regime_block_reason": state.get("b_meanrev_regime_block_reason"),
             "b_meanrev_risk_off_forced": state.get("b_meanrev_risk_off_forced"),
             "b_meanrev_entry_style": state.get("b_meanrev_entry_style"),
+            "c_fair_value": state.get("c_fair_value"),
+            "c_fair_gap": state.get("c_fair_gap"),
+            "c_anchor_price": state.get("c_anchor_price"),
+            "c_anchor_eps": state.get("c_anchor_eps"),
+            "c_anchor_rate_bp": state.get("c_anchor_rate_bp"),
+            "c_current_eps": state.get("c_current_eps"),
+            "c_last_earnings_delta": state.get("c_last_earnings_delta"),
+            "c_signal_id": state.get("c_signal_id"),
+            "c_signal_thesis": state.get("c_signal_thesis"),
+            "c_signal_strength": state.get("c_signal_strength"),
+            "c_signal_target": state.get("c_signal_target"),
+            "c_signal_fresh": state.get("c_signal_fresh"),
+            "c_market_rate_bp": state.get("c_market_rate_bp"),
+            "c_effective_rate_bp": state.get("c_effective_rate_bp"),
+            "c_cpi_bias_bp": state.get("c_cpi_bias_bp"),
+            "c_last_cpi_surprise": state.get("c_last_cpi_surprise"),
+            "c_q_hike": state.get("c_q_hike"),
+            "c_q_hold": state.get("c_q_hold"),
+            "c_q_cut": state.get("c_q_cut"),
+            "c_shock_mode": state.get("c_shock_mode"),
+            "c_shock_target_inventory": state.get("c_shock_target_inventory"),
+            "c_shock_original_target_inventory": state.get("c_shock_original_target_inventory"),
+            "c_shock_reference_mid": state.get("c_shock_reference_mid"),
+            "c_shock_fair_before": state.get("c_shock_fair_before"),
+            "c_shock_fair_after": state.get("c_shock_fair_after"),
+            "c_shock_edge": state.get("c_shock_edge"),
             "etf_signal_id": state.get("etf_signal_id"),
             "etf_alpha_from_a": state.get("etf_alpha_from_a"),
+            "etf_source_market": state.get("etf_source_market"),
+            "etf_source_combo": state.get("etf_source_combo"),
             "etf_source_signal_id": state.get("etf_source_signal_id"),
             "etf_source_signal_kind": state.get("etf_source_signal_kind"),
+            "etf_source_fair_shift": state.get("etf_source_fair_shift"),
             "etf_a_fair_shift": state.get("etf_a_fair_shift"),
             "etf_projected_shift": state.get("etf_projected_shift"),
             "etf_base_mid": state.get("etf_base_mid"),
@@ -3230,10 +3402,39 @@ class TraceRecorder:
             "b_meanrev_hold_ms": event.get("b_meanrev_hold_ms"),
             "b_meanrev_regime_block_reason": event.get("b_meanrev_regime_block_reason"),
             "b_meanrev_risk_off_forced": event.get("b_meanrev_risk_off_forced"),
+            "c_fair_value": event.get("c_fair_value"),
+            "c_fair_gap": event.get("c_fair_gap"),
+            "c_anchor_price": event.get("c_anchor_price"),
+            "c_anchor_eps": event.get("c_anchor_eps"),
+            "c_anchor_rate_bp": event.get("c_anchor_rate_bp"),
+            "c_current_eps": event.get("c_current_eps"),
+            "c_last_earnings_delta": event.get("c_last_earnings_delta"),
+            "c_signal_id": event.get("c_signal_id"),
+            "c_signal_thesis": event.get("c_signal_thesis"),
+            "c_signal_strength": event.get("c_signal_strength"),
+            "c_signal_target": event.get("c_signal_target"),
+            "c_signal_fresh": event.get("c_signal_fresh"),
+            "c_market_rate_bp": event.get("c_market_rate_bp"),
+            "c_effective_rate_bp": event.get("c_effective_rate_bp"),
+            "c_cpi_bias_bp": event.get("c_cpi_bias_bp"),
+            "c_last_cpi_surprise": event.get("c_last_cpi_surprise"),
+            "c_q_hike": event.get("c_q_hike"),
+            "c_q_hold": event.get("c_q_hold"),
+            "c_q_cut": event.get("c_q_cut"),
+            "c_shock_mode": event.get("c_shock_mode"),
+            "c_shock_target_inventory": event.get("c_shock_target_inventory"),
+            "c_shock_original_target_inventory": event.get("c_shock_original_target_inventory"),
+            "c_shock_reference_mid": event.get("c_shock_reference_mid"),
+            "c_shock_fair_before": event.get("c_shock_fair_before"),
+            "c_shock_fair_after": event.get("c_shock_fair_after"),
+            "c_shock_edge": event.get("c_shock_edge"),
             "etf_signal_id": event.get("etf_signal_id"),
             "etf_alpha_from_a": event.get("etf_alpha_from_a"),
+            "etf_source_market": event.get("etf_source_market"),
+            "etf_source_combo": event.get("etf_source_combo"),
             "etf_source_signal_id": event.get("etf_source_signal_id"),
             "etf_source_signal_kind": event.get("etf_source_signal_kind"),
+            "etf_source_fair_shift": event.get("etf_source_fair_shift"),
             "etf_a_fair_shift": event.get("etf_a_fair_shift"),
             "etf_projected_shift": event.get("etf_projected_shift"),
             "etf_base_mid": event.get("etf_base_mid"),
@@ -3246,6 +3447,10 @@ class TraceRecorder:
             "etf_first_order_attempt_latency_ms": event.get("etf_first_order_attempt_latency_ms"),
             "etf_first_fill_latency_ms": event.get("etf_first_fill_latency_ms"),
             "etf_missed_entry_terminal_reason": event.get("etf_missed_entry_terminal_reason"),
+            "etf_churn_guard_reason": event.get("etf_churn_guard_reason"),
+            "etf_churn_guard_active": event.get("etf_churn_guard_active"),
+            "etf_book_change_count_250ms": event.get("etf_book_change_count_250ms"),
+            "etf_stable_book_age_ms": event.get("etf_stable_book_age_ms"),
             "b_option_lottery_premium_spent": event.get("b_option_lottery_premium_spent"),
             "b_option_lottery_premium_recovered": event.get("b_option_lottery_premium_recovered"),
             "b_option_lottery_symbol_premium_remaining": event.get("b_option_lottery_symbol_premium_remaining"),

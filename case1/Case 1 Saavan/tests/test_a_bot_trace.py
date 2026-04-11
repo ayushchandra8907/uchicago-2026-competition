@@ -1849,6 +1849,134 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(etf_entry["mean_target_fill_ratio"], round(16 / 60, 4))
         self.assertEqual(etf_entry["churn_guard_count"], 1)
 
+    def test_summarize_trace_events_reports_c_strategy_summary(self) -> None:
+        events = [
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "C",
+                "market_key": "C",
+                "strategy_family": "c_earnings",
+                "action_class": "earnings_signal",
+                "signal_id": "c_earnings_1",
+                "payload": {
+                    "signal_id": "c_earnings_1",
+                    "tick": 200,
+                    "fair_before": 1000.0,
+                    "fair_after": 1080.0,
+                    "fair_shift_ticks": 80.0,
+                    "edge": 78.0,
+                    "target_inventory": 80,
+                    "live_trading_enabled": True,
+                },
+                "c_market_rate_bp": 0.0,
+                "c_effective_rate_bp": 0.0,
+                "c_cpi_bias_bp": 0.0,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_020,
+                "symbol": "C",
+                "market_key": "C",
+                "strategy_family": "c_earnings",
+                "pnl_owner": "c_earnings",
+                "action_class": "shock_take",
+                "signal_id": "c_earnings_1",
+                "side": "BUY",
+                "fill_qty": 10,
+                "fill_price": 1002,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "C",
+                "market_key": "C",
+                "mid": 1040.0,
+                "inventory": 10,
+                "c_market_rate_bp": 0.0,
+                "c_effective_rate_bp": 0.0,
+                "c_cpi_bias_bp": 0.0,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+
+        self.assertEqual(summary["pnl_by_market"]["C"], 380.0)
+        self.assertEqual(summary["c_summary"]["earnings_signal_count"], 1)
+        self.assertEqual(summary["c_summary"]["fill_count"], 1)
+        self.assertEqual(summary["c_signal_episode_summaries"][0]["signal_id"], "c_earnings_1")
+        self.assertEqual(summary["c_rate_context_summary"]["sample_count"], 2)
+
+    def test_etf_episode_summary_tracks_c_source_attribution(self) -> None:
+        events = [
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "c_shock_projection",
+                "signal_id": "etf_c_1",
+                "payload": {
+                    "source_market": "C",
+                    "source_combo": "C_only",
+                    "source_kind": "structured_earnings",
+                    "source_fair_shift": 120.0,
+                    "alpha": 0.25,
+                    "base_mid": 500.0,
+                    "target_fair": 530.0,
+                    "target_inventory": 30,
+                },
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_050,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "etf_shock_take",
+                "signal_id": "etf_c_1",
+                "side": "BUY",
+                "qty": 8,
+                "price": 502,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_060,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "etf_shock_take",
+                "signal_id": "etf_c_1",
+                "side": "BUY",
+                "fill_qty": 8,
+                "fill_price": 502,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 520.0,
+                "inventory": 8,
+            },
+        ]
+
+        summary = summarize_trace_events(events, markout_windows_ms=(250,))
+        row = summary["etf_episode_summaries"][0]
+
+        self.assertEqual(row["signal_id"], "etf_c_1")
+        self.assertEqual(row["source_market"], "C")
+        self.assertEqual(row["source_combo"], "C_only")
+        self.assertEqual(row["source_fair_shift"], 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()

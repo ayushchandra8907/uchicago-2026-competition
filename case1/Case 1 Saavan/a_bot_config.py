@@ -233,6 +233,19 @@ class BConfig:
 
 
 @dataclass(frozen=True)
+class MarketCConfig:
+    enabled: bool = True
+    trading_enabled: bool = True
+    symbol: str = "C"
+    live_earnings_enabled: bool = True
+    live_cpi_enabled: bool = False
+    live_macro_enabled: bool = False
+    mm_enabled: bool = False
+    min_eval_interval_ms: int = 100
+    pm_symbols: tuple[str, ...] = ("R_HIKE", "R_HOLD", "R_CUT")
+
+
+@dataclass(frozen=True)
 class ETFConfig:
     enabled: bool = True
     trading_enabled: bool = True
@@ -265,6 +278,10 @@ class ETFConfig:
     churn_window_ms: int = 250
     churn_max_top_of_book_updates: int = 25
     churn_resume_stable_ms: int = 500
+    enable_c_earnings: bool = True
+    alpha_from_c_earnings: float = 0.25
+    min_c_fair_shift_ticks: int = 60
+    ac_conflict_policy: str = "suppress"
 
 
 @dataclass(frozen=True)
@@ -302,6 +319,7 @@ class BotConfig:
     exchange: ExchangeConfig
     market_a: AConfig
     market_b: BConfig
+    market_c: MarketCConfig
     etf: ETFConfig
     risk: RiskConfig
     paths: BotPaths
@@ -623,6 +641,16 @@ def load_bot_config(
             option_hedge_target_ratio=_optional_float("B_OPTION_HEDGE_TARGET_RATIO", 0.5) or 0.5,
             option_hedge_premium_budget=_optional_int("B_OPTION_HEDGE_PREMIUM_BUDGET", 300) or 300,
         ),
+        market_c=MarketCConfig(
+            enabled=_optional_bool("C_ENABLED", True),
+            trading_enabled=_optional_bool("C_TRADING_ENABLED", True),
+            symbol=str(os.getenv("C_SYMBOL", "C") or "C").strip(),
+            live_earnings_enabled=_optional_bool("C_LIVE_EARNINGS_ENABLED", True),
+            live_cpi_enabled=_optional_bool("C_LIVE_CPI_ENABLED", False),
+            live_macro_enabled=_optional_bool("C_LIVE_MACRO_ENABLED", False),
+            mm_enabled=_optional_bool("C_MM_ENABLED", False),
+            min_eval_interval_ms=_optional_int("C_MIN_EVAL_INTERVAL_MS", 100) or 100,
+        ),
         etf=ETFConfig(
             enabled=_optional_bool("ETF_ENABLED", True),
             trading_enabled=_optional_bool("ETF_TRADING_ENABLED", True),
@@ -660,6 +688,10 @@ def load_bot_config(
             churn_window_ms=_optional_int("ETF_CHURN_WINDOW_MS", 250) or 250,
             churn_max_top_of_book_updates=_optional_int("ETF_CHURN_MAX_TOP_OF_BOOK_UPDATES", 25) or 25,
             churn_resume_stable_ms=_optional_int("ETF_CHURN_RESUME_STABLE_MS", 500) or 500,
+            enable_c_earnings=_optional_bool("ETF_ENABLE_C_EARNINGS", True),
+            alpha_from_c_earnings=_optional_float("ETF_ALPHA_FROM_C_EARNINGS", 0.25) or 0.25,
+            min_c_fair_shift_ticks=_optional_int("ETF_MIN_C_FAIR_SHIFT_TICKS", 60) or 60,
+            ac_conflict_policy=str(os.getenv("ETF_AC_CONFLICT_POLICY", "suppress") or "suppress").strip().lower(),
         ),
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
