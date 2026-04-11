@@ -162,8 +162,8 @@ class BConfig:
     mm_min_healthy_book_age_ms: int = 500
     mm_cancel_on_bad_book: bool = True
     mm_bad_fill_cooldown_ms: int = 750
-    meanrev_max_position: int = 24
-    meanrev_quote_size: int = 4
+    meanrev_max_position: int = 16
+    meanrev_quote_size: int = 2
     meanrev_ema_fast_ms: int = 30_000
     meanrev_ema_slow_ms: int = 180_000
     meanrev_vol_ewma_ms: int = 60_000
@@ -180,8 +180,8 @@ class BConfig:
     meanrev_entry_ticks: int = 10
     meanrev_full_entry_ticks: int = 15
     meanrev_exit_ticks: int = 3
-    meanrev_base_target: int = 8
-    meanrev_full_target: int = 24
+    meanrev_base_target: int = 6
+    meanrev_full_target: int = 16
     meanrev_extreme_entry_ticks: int = 20
     meanrev_risk_off_deviation_ticks: int = 35
     meanrev_turn_confirm_ms: int = 300
@@ -197,7 +197,7 @@ class BConfig:
     parity_trade_size: int = 1
     parity_max_exposure: int = 3
     parity_max_quote_age_ms: int = 1_000
-    option_lottery_enabled: bool = True
+    option_lottery_enabled: bool = False
     option_lottery_max_ask: int = 3
     option_lottery_floor_ask: int = 0
     option_lottery_quote_size: int = 1
@@ -217,7 +217,7 @@ class BConfig:
     option_lottery_profit_take_multiple: float = 2.0
     option_lottery_profit_take_quote_size: int = 20
     option_lottery_stale_hold_ms: int = 45_000
-    option_hedge_enabled: bool = True
+    option_hedge_enabled: bool = False
     option_hedge_max_ask: int = 6
     option_hedge_min_underlying_inventory: int = 4
     option_hedge_target_ratio: float = 0.5
@@ -582,8 +582,8 @@ def load_bot_config(
             mm_min_healthy_book_age_ms=_optional_int("B_MM_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
             mm_cancel_on_bad_book=_optional_bool("B_MM_CANCEL_ON_BAD_BOOK", True),
             mm_bad_fill_cooldown_ms=_optional_int("B_MM_BAD_FILL_COOLDOWN_MS", 750) or 750,
-            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 24) or 24,
-            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 4) or 4,
+            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 16) or 16,
+            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 2) or 2,
             meanrev_ema_fast_ms=_optional_int("B_MEANREV_EMA_FAST_MS", 30_000) or 30_000,
             meanrev_ema_slow_ms=_optional_int("B_MEANREV_EMA_SLOW_MS", 180_000) or 180_000,
             meanrev_vol_ewma_ms=_optional_int("B_MEANREV_VOL_EWMA_MS", 60_000) or 60_000,
@@ -600,8 +600,8 @@ def load_bot_config(
             meanrev_entry_ticks=_optional_int("B_MEANREV_ENTRY_TICKS", 10) or 10,
             meanrev_full_entry_ticks=_optional_int("B_MEANREV_FULL_ENTRY_TICKS", 15) or 15,
             meanrev_exit_ticks=_optional_int("B_MEANREV_EXIT_TICKS", 3) or 3,
-            meanrev_base_target=_optional_int("B_MEANREV_BASE_TARGET", 8) or 8,
-            meanrev_full_target=_optional_int("B_MEANREV_FULL_TARGET", 24) or 24,
+            meanrev_base_target=_optional_int("B_MEANREV_BASE_TARGET", 6) or 6,
+            meanrev_full_target=_optional_int("B_MEANREV_FULL_TARGET", 16) or 16,
             meanrev_extreme_entry_ticks=_optional_int("B_MEANREV_EXTREME_ENTRY_TICKS", 20) or 20,
             meanrev_risk_off_deviation_ticks=_optional_int("B_MEANREV_RISK_OFF_DEVIATION_TICKS", 35) or 35,
             meanrev_turn_confirm_ms=_optional_int("B_MEANREV_TURN_CONFIRM_MS", 300) or 300,
@@ -617,7 +617,7 @@ def load_bot_config(
             parity_trade_size=_optional_int("B_PARITY_TRADE_SIZE", 1) or 1,
             parity_max_exposure=_optional_int("B_PARITY_MAX_EXPOSURE", 3) or 3,
             parity_max_quote_age_ms=_optional_int("B_PARITY_MAX_QUOTE_AGE_MS", 1_000) or 1_000,
-            option_lottery_enabled=_optional_bool("B_OPTION_LOTTERY_ENABLED", True),
+            option_lottery_enabled=_optional_bool("B_OPTION_LOTTERY_ENABLED", False),
             option_lottery_max_ask=_optional_int("B_OPTION_LOTTERY_MAX_ASK", 3) or 3,
             option_lottery_floor_ask=_optional_int("B_OPTION_LOTTERY_FLOOR_ASK", 0) or 0,
             option_lottery_quote_size=_optional_int("B_OPTION_LOTTERY_QUOTE_SIZE", 1) or 1,
@@ -637,7 +637,7 @@ def load_bot_config(
             option_lottery_profit_take_multiple=_optional_float("B_OPTION_LOTTERY_PROFIT_TAKE_MULTIPLE", 2.0) or 2.0,
             option_lottery_profit_take_quote_size=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_QUOTE_SIZE", 20) or 20,
             option_lottery_stale_hold_ms=_optional_int("B_OPTION_LOTTERY_STALE_HOLD_MS", 45_000) or 45_000,
-            option_hedge_enabled=_optional_bool("B_OPTION_HEDGE_ENABLED", True),
+            option_hedge_enabled=_optional_bool("B_OPTION_HEDGE_ENABLED", False),
             option_hedge_max_ask=_optional_int("B_OPTION_HEDGE_MAX_ASK", 6) or 6,
             option_hedge_min_underlying_inventory=_optional_int("B_OPTION_HEDGE_MIN_UNDERLYING_INVENTORY", 4) or 4,
             option_hedge_target_ratio=_optional_float("B_OPTION_HEDGE_TARGET_RATIO", 0.5) or 0.5,
