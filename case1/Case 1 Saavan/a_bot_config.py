@@ -215,6 +215,7 @@ class BConfig:
     option_lottery_profit_take_min_edge: int = 6
     option_lottery_profit_take_multiple: float = 2.0
     option_lottery_profit_take_quote_size: int = 20
+    option_lottery_stale_hold_ms: int = 45_000
     option_hedge_enabled: bool = True
     option_hedge_max_ask: int = 6
     option_hedge_min_underlying_inventory: int = 4
@@ -615,6 +616,7 @@ def load_bot_config(
             option_lottery_profit_take_min_edge=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_MIN_EDGE", 6) or 6,
             option_lottery_profit_take_multiple=_optional_float("B_OPTION_LOTTERY_PROFIT_TAKE_MULTIPLE", 2.0) or 2.0,
             option_lottery_profit_take_quote_size=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_QUOTE_SIZE", 20) or 20,
+            option_lottery_stale_hold_ms=_optional_int("B_OPTION_LOTTERY_STALE_HOLD_MS", 45_000) or 45_000,
             option_hedge_enabled=_optional_bool("B_OPTION_HEDGE_ENABLED", True),
             option_hedge_max_ask=_optional_int("B_OPTION_HEDGE_MAX_ASK", 6) or 6,
             option_hedge_min_underlying_inventory=_optional_int("B_OPTION_HEDGE_MIN_UNDERLYING_INVENTORY", 4) or 4,

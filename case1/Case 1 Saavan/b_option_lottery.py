@@ -55,6 +55,7 @@ class BOptionLotteryStrategy:
         self.last_hedge_needed: dict[str, bool] = {symbol: False for symbol in self.option_symbols}
         self.last_hedge_target_qty: dict[str, int] = {symbol: 0 for symbol in self.option_symbols}
         self.last_profit_take_trigger: dict[str, float | None] = {symbol: None for symbol in self.option_symbols}
+        self.position_opened_ms: dict[str, int | None] = {symbol: None for symbol in self.option_symbols}
         self._order_to_symbol: dict[str, str] = {}
 
     def on_book_update_at(self, symbol: str, book, now_ms: int) -> bool:
@@ -76,17 +77,22 @@ class BOptionLotteryStrategy:
         self.last_trade_ms[symbol] = self._now_ms() if now_ms is None else int(now_ms)
         return True
 
-    def sync_inventory(self, symbol: str, inventory: int) -> bool:
+    def sync_inventory(self, symbol: str, inventory: int, *, now_ms: int | None = None) -> bool:
         if symbol == self.config.underlying_symbol:
             self.underlying_inventory = int(inventory)
             return True
         if symbol not in self.positions:
             return False
+        event_ms = self._now_ms() if now_ms is None else int(now_ms)
         incoming = int(inventory)
+        prior = int(self.positions.get(symbol, 0))
         self.positions[symbol] = incoming
         if incoming <= 0:
             self.open_cost_basis[symbol] = 0.0
             self.costed_qty[symbol] = 0
+            self.position_opened_ms[symbol] = None
+        elif prior <= 0:
+            self.position_opened_ms[symbol] = event_ms
         elif self.costed_qty.get(symbol, 0) > incoming:
             avg_cost = self._average_entry(symbol)
             self.costed_qty[symbol] = incoming
@@ -131,6 +137,8 @@ class BOptionLotteryStrategy:
             self.open_cost_basis[symbol] = float(self.open_cost_basis.get(symbol, 0.0)) + (qty * price)
             self.costed_qty[symbol] = int(self.costed_qty.get(symbol, 0)) + qty
             next_inventory = int(self.positions.get(symbol, 0)) + qty
+            if before_inventory <= 0 and next_inventory > 0:
+                self.position_opened_ms[symbol] = self._now_ms() if now_ms is None else int(now_ms)
         else:
             costed_before = int(self.costed_qty.get(symbol, 0))
             closing_qty = min(max(0, costed_before if costed_before > 0 else before_inventory), qty)
@@ -146,6 +154,7 @@ class BOptionLotteryStrategy:
         if self.positions[symbol] <= 0:
             self.open_cost_basis[symbol] = 0.0
             self.costed_qty[symbol] = 0
+            self.position_opened_ms[symbol] = None
         elif self.costed_qty.get(symbol, 0) > self.positions[symbol]:
             avg_cost = self._average_entry(symbol)
             self.costed_qty[symbol] = self.positions[symbol]
@@ -223,12 +232,19 @@ class BOptionLotteryStrategy:
                 False,
                 "keeping_existing_option_profit_take_order",
             )
+        stale_exit = self._stale_exit_order(symbol, now_ms=now_ms)
+        if stale_exit is not None:
+            self.last_mode[symbol] = "B_OPTION_LOTTERY_TIME_STOP"
+            self.last_block_reason[symbol] = None
+            return QuotePlan("B_OPTION_LOTTERY_TIME_STOP", None, stale_exit, (), False, stale_exit.reason)
         if book.best_ask is None:
             return self._blocked(symbol, "missing_option_ask")
         ask_px = int(book.best_ask.px)
         hedge_plan = self._hedge_buy_plan(symbol, ask_px=ask_px, now_ms=now_ms)
         if hedge_plan is not None:
             return hedge_plan
+        if symbol not in {"B_C_1050", "B_P_950"}:
+            return self._blocked(symbol, "option_lottery_non_wing_disabled")
         if ask_px > int(self.config.option_lottery_max_ask):
             return self._blocked(symbol, "option_ask_above_lottery_threshold")
         symbol_cap = self._symbol_position_cap(symbol)
@@ -242,13 +258,6 @@ class BOptionLotteryStrategy:
             return self._blocked(symbol, "option_lottery_premium_budget_spent")
 
         parsed = self.parsed[symbol]
-        tail_wing = symbol in {"B_C_1050", "B_P_950"}
-        if (
-            ask_px > int(self.config.option_lottery_floor_ask)
-            and not tail_wing
-            and not self._directional_setup_ok(parsed, residual_payload)
-        ):
-            return self._blocked(symbol, "option_lottery_direction_filter")
 
         max_position_qty = symbol_cap - self.positions[symbol] - manager.buy_exposure()
         budget_qty = int(self.config.option_lottery_quote_size) if ask_px <= 0 else premium_remaining // max(1, ask_px)
@@ -326,6 +335,11 @@ class BOptionLotteryStrategy:
             "b_option_hedge_budget_remaining": self._hedge_premium_remaining(),
             "b_option_profit_take_trigger": self.last_profit_take_trigger.get(symbol),
             "b_option_hedge_premium_spent": self.hedge_premium_spent,
+            "b_option_position_age_ms": (
+                None
+                if self.position_opened_ms.get(symbol) is None or int(self.positions.get(symbol, 0)) <= 0
+                else max(0, int(now_ms) - int(self.position_opened_ms[symbol] or 0))
+            ),
         }
 
     def _profit_take_order(self, symbol: str, *, now_ms: int) -> DesiredOrder | None:
@@ -462,6 +476,49 @@ class BOptionLotteryStrategy:
         self.last_mode[symbol] = "B_OPTION_HEDGE"
         self.last_block_reason[symbol] = None
         return QuotePlan("B_OPTION_HEDGE", order, None, (), False, order.reason)
+
+    def _stale_exit_order(self, symbol: str, *, now_ms: int) -> DesiredOrder | None:
+        manager = self.order_managers[symbol]
+        position = int(self.positions.get(symbol, 0))
+        opened_ms = self.position_opened_ms.get(symbol)
+        if position <= 0 or opened_ms is None:
+            return None
+        if manager.sell_exposure() > 0:
+            return None
+        if symbol in {"B_C_1000", "B_P_1000"} and abs(int(self.underlying_inventory)) >= int(self.config.option_hedge_min_underlying_inventory):
+            return None
+        age_ms = int(now_ms) - int(opened_ms)
+        if age_ms < int(self.config.option_lottery_stale_hold_ms):
+            return None
+        book = self.books[symbol]
+        if book.best_bid is None:
+            return None
+        qty = min(
+            position,
+            max(1, int(self.config.option_lottery_profit_take_quote_size)),
+            max(0, position - manager.sell_exposure()),
+        )
+        if qty <= 0:
+            return None
+        signal_id = f"b_option_lottery_stale_{symbol}_{int(now_ms)}"
+        return DesiredOrder(
+            side="SELL",
+            px=int(book.best_bid.px),
+            qty=int(qty),
+            overlay="mm",
+            aggressive=False,
+            reason=f"stale {symbol} lottery position timed out after {age_ms}ms",
+            intent="b_option_lottery_time_stop",
+            mode_at_submit="B_OPTION_LOTTERY_TIME_STOP",
+            evaluation_reason="cheap_option_time_stop",
+            market_key="B",
+            strategy_family="b_option_lottery",
+            action_class="cheap_option_time_stop",
+            pnl_owner=f"b_option_lottery:{symbol}",
+            signal_id=signal_id,
+            trade_group_id=signal_id,
+            leg_role=self.parsed[symbol].option_type.lower(),
+        )
 
     def _directional_setup_ok(self, parsed: ParsedOptionSymbol, residual_payload: dict[str, Any] | None) -> bool:
         underlying_mid = self.current_underlying_mid

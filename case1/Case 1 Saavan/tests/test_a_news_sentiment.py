@@ -95,3 +95,26 @@ class ANewsSentimentParityTests(unittest.TestCase):
         self.assertEqual(result.direction, 1)
         self.assertIn("analysts commend", result.matched_bigrams)
         self.assertIn("product differentiation", result.matched_bigrams)
+
+    def test_battery_breakthrough_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "A's revolutionary battery breakthrough is widely praised by analysts."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue("battery breakthrough" in result.matched_bigrams or "widely praised" in result.matched_bigrams)
+
+    def test_intellectual_property_loss_phrase_scores_negative(self) -> None:
+        result = score_a_unstructured_headline(
+            "Loss of key intellectual property rights delivers a blow to A's core business."
+        )
+
+        self.assertLess(result.score, 0.0)
+        self.assertEqual(result.direction, -1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("intellectual property", "loss key", "delivers blow", "key ip")
+            )
+        )

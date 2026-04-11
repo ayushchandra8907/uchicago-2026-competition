@@ -275,9 +275,10 @@ class MarketABot(XChangeClient):
             self.b_option_strategy.sync_inventory(
                 self.config.market_b.underlying_symbol,
                 int(self.positions.get(self.config.market_b.underlying_symbol, 0)),
+                now_ms=now_ms,
             )
             for symbol in self.config.market_b.option_symbols:
-                self.b_option_strategy.sync_inventory(symbol, int(self.positions.get(symbol, 0)))
+                self.b_option_strategy.sync_inventory(symbol, int(self.positions.get(symbol, 0)), now_ms=now_ms)
         if self.etf_strategy is not None:
             self.etf_strategy.sync_inventory_from_exchange(int(self.positions.get(self.config.etf.symbol, 0)), now_ms=now_ms)
         for symbol in self.b_observer.symbols:
@@ -399,9 +400,9 @@ class MarketABot(XChangeClient):
             if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
                 self.b_strategy.sync_inventory_from_exchange(inventory)
             if self.b_option_strategy is not None and symbol == self.config.market_b.underlying_symbol:
-                self.b_option_strategy.sync_inventory(symbol, inventory)
+                self.b_option_strategy.sync_inventory(symbol, inventory, now_ms=now_ms)
             if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
-                self.b_option_strategy.sync_inventory(symbol, inventory)
+                self.b_option_strategy.sync_inventory(symbol, inventory, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.record_inventory_update(
                     now_ms=now_ms,
@@ -584,6 +585,7 @@ class MarketABot(XChangeClient):
                     self.b_option_strategy.sync_inventory(
                         self.config.market_b.underlying_symbol,
                         int(self.positions.get(self.config.market_b.underlying_symbol, 0)),
+                        now_ms=now_ms,
                     )
             if self.tracer is not None and symbol is not None:
                 self.tracer.record_fill(
@@ -613,7 +615,11 @@ class MarketABot(XChangeClient):
             order = self.b_strategy.on_fill(order_id, qty, price, authoritative_inventory=authoritative_inventory)
             self.b_observer.sync_inventory(self.config.market_b.underlying_symbol, authoritative_inventory)
             if self.b_option_strategy is not None:
-                self.b_option_strategy.sync_inventory(self.config.market_b.underlying_symbol, authoritative_inventory)
+                self.b_option_strategy.sync_inventory(
+                    self.config.market_b.underlying_symbol,
+                    authoritative_inventory,
+                    now_ms=now_ms,
+                )
             if self.tracer is not None:
                 self.tracer.record_fill(
                     now_ms=now_ms,
@@ -1569,7 +1575,10 @@ class MarketABot(XChangeClient):
                     plan=plan,
                 )
 
-            actions = self.b_strategy.order_manager.build_actions(plan, now_ms)
+            if hasattr(self.b_strategy, "build_actions"):
+                actions = self.b_strategy.build_actions(plan, now_ms)
+            else:
+                actions = self.b_strategy.order_manager.build_actions(plan, now_ms)
             for cancel in actions.cancels:
                 order = self.b_strategy.order_manager.mark_cancel_requested(cancel.order_id, now_ms)
                 if self.tracer is not None:

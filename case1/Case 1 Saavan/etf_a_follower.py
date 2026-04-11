@@ -56,6 +56,7 @@ class ETFAFollowerStrategy:
         self.last_trade_ms: int | None = None
         self.mode = "ETF_OBSERVE_ONLY"
         self.active_signal: ETFASignal | None = None
+        self.pending_signal: ETFASignal | None = None
         self._signal_seq = 0
         self.last_block_reason: str | None = None
         self.unwind_reason: str | None = None
@@ -200,14 +201,50 @@ class ETFAFollowerStrategy:
             target_from_a_position=target_from_a_position,
             source_direction=direction,
         )
-        self.active_signal = signal
         self.entry_diagnostics[signal.signal_id] = ETFEntryDiagnostics()
+        active = self.active_signal
+        if (
+            active is not None
+            and active.source_direction != signal.source_direction
+            and (self.inventory != 0 or self._has_live_orders())
+        ):
+            active_diag = self.entry_diagnostics.setdefault(active.signal_id, ETFEntryDiagnostics())
+            if active_diag.terminal_reason is None:
+                active_diag.terminal_reason = "handoff_flatten"
+            self.pending_signal = signal
+            self.mode = "ETF_HANDOFF_FLATTEN"
+            self.last_block_reason = "etf_signal_handoff_pending"
+            self.unwind_reason = "handoff_flatten"
+            return signal
+        self.pending_signal = None
+        self.active_signal = signal
         self.mode = "ETF_A_SHOCK"
         self.last_block_reason = None
         self.unwind_reason = None
         return signal
 
     def compute_quotes(self, *, now_ms: int, a_state: dict[str, Any] | None = None) -> QuotePlan:
+        if self.pending_signal is not None:
+            pending_diag = self.entry_diagnostics.setdefault(self.pending_signal.signal_id, ETFEntryDiagnostics())
+            pending_elapsed_ms = int(now_ms) - int(self.pending_signal.started_ms)
+            if pending_diag.first_fill_ms is None and pending_elapsed_ms >= int(self.config.entry_retry_window_ms):
+                pending_diag.terminal_reason = "entry_retry_window_expired"
+                self.pending_signal = None
+            elif self.inventory == 0 and not self._has_live_orders():
+                self.active_signal = self.pending_signal
+                self.pending_signal = None
+                self.mode = "ETF_A_SHOCK"
+                self.last_block_reason = None
+                self.unwind_reason = None
+            elif self.inventory == 0 and self._has_live_orders():
+                self.mode = "ETF_HANDOFF_FLATTEN"
+                self.last_block_reason = "handoff_flatten"
+                return QuotePlan("ETF_HANDOFF_FLATTEN", None, None, (), False, "waiting_for_etf_order_cancel_before_handoff")
+            else:
+                self.mode = "ETF_HANDOFF_FLATTEN"
+                self.last_block_reason = "handoff_flatten"
+                self.unwind_reason = "handoff_flatten"
+                return self._unwind_plan(now_ms, reason="handoff_flatten", allow_only_if_flat=False)
         signal = self.active_signal
         if signal is None:
             self.mode = "ETF_OBSERVE_ONLY"
@@ -216,7 +253,7 @@ class ETFAFollowerStrategy:
         elapsed_ms = int(now_ms) - int(signal.started_ms)
         active_guard_reason = self._active_entry_guard_reason(now_ms)
         if diag.first_fill_ms is None and self.inventory == 0 and elapsed_ms >= int(self.config.entry_retry_window_ms):
-            diag.terminal_reason = active_guard_reason or "etf_entry_retry_window_expired"
+            diag.terminal_reason = active_guard_reason or "entry_retry_window_expired"
             self.last_block_reason = diag.terminal_reason
             self.active_signal = None
             self.mode = "ETF_OBSERVE_ONLY"
@@ -288,6 +325,7 @@ class ETFAFollowerStrategy:
             "last_trade_qty": self.last_trade_qty,
             "last_trade_ms": self.last_trade_ms,
             "etf_signal_id": None if signal is None else signal.signal_id,
+            "etf_pending_signal_id": None if self.pending_signal is None else self.pending_signal.signal_id,
             "etf_alpha_from_a": None if signal is None else signal.alpha,
             "etf_source_signal_id": None if signal is None else signal.source_signal_id,
             "etf_source_signal_kind": None if signal is None else signal.source_kind,
@@ -314,6 +352,7 @@ class ETFAFollowerStrategy:
             "etf_missed_entry_terminal_reason": None if diag is None else diag.terminal_reason,
             "etf_churn_guard_reason": self._churn_guard_reason,
             "etf_churn_guard_active": self._active_entry_guard_reason(now_ms) is not None,
+            "etf_handoff_pending": self.pending_signal is not None,
             "etf_book_change_count_250ms": len(self._top_of_book_change_ms),
             "etf_stable_book_age_ms": (
                 None if self._stable_book_since_ms is None else max(0, int(now_ms) - int(self._stable_book_since_ms))
@@ -425,6 +464,8 @@ class ETFAFollowerStrategy:
         if elapsed_ms < int(self.config.min_hold_ms):
             return False, ""
         if not a_active:
+            if self.inventory == 0:
+                return True, "a_signal_invalidated_before_entry"
             return True, "a_shock_lifecycle_inactive_after_min_hold"
         return False, ""
 
@@ -512,3 +553,9 @@ class ETFAFollowerStrategy:
         if stable_age < int(self.config.churn_resume_stable_ms):
             return self._churn_guard_reason
         return None
+
+    def _has_live_orders(self) -> bool:
+        return any(
+            order is not None and not order.cancel_pending
+            for order in (self.order_manager.live_order("BUY"), self.order_manager.live_order("SELL"))
+        )

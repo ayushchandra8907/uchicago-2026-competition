@@ -419,6 +419,11 @@ def build_a_news_episode_summaries(events: list[dict[str, Any]], signal_episode_
         for row in (signal_episode_rows or [])
         if str(row.get("market_key") or "") == "A" and str(row.get("strategy_family") or "") == "a_news"
     }
+    signal_rows_by_id = {
+        str(row.get("signal_id")): row
+        for row in (signal_episode_rows or [])
+        if str(row.get("market_key") or "") == "A" and str(row.get("strategy_family") or "") == "a_news" and row.get("signal_id")
+    }
     summaries: list[dict[str, Any]] = []
     final_ms = int(event_list[-1].get("monotonic_ms", 0)) if event_list else 0
 
@@ -456,9 +461,18 @@ def build_a_news_episode_summaries(events: list[dict[str, Any]], signal_episode_
             notional = sum(int(row.get("fill_qty") or row.get("qty") or 0) * float(row.get("fill_price") or row.get("price") or 0.0) for row in rows)
             return notional / qty
 
-        episode_end = max(
-            [event_ms, min(next_news_ms, event_ms + config.news_max_hold_ms)]
-            + [int(event.get("monotonic_ms", event_ms)) for event in fill_events]
+        signal_row = signal_rows_by_id.get(signal_id)
+        traced_episode_end = None
+        if signal_row is not None and int(signal_row.get("time_in_position_ms") or 0) > 0:
+            traced_episode_end = event_ms + int(signal_row.get("time_in_position_ms") or 0)
+        episode_cap = min(next_news_ms, event_ms + config.news_max_hold_ms)
+        episode_end = min(
+            episode_cap,
+            max(
+                [event_ms]
+                + ([traced_episode_end] if traced_episode_end is not None else [])
+                + [int(event.get("monotonic_ms", event_ms)) for event in fill_events]
+            ),
         )
         peak_news_inventory = 0
         for event in event_list:
@@ -1100,6 +1114,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     quoted_spreads: list[int] = []
     latest_mtm: float | None = None
     latest_mtm_basis: str | None = None
+    latest_cash: float | None = None
+    latest_cash_ms = -1
     budget_shift_active_ms = 0
     last_budget_shift_state: bool | None = None
     last_budget_shift_started_ms: int | None = None
@@ -1174,6 +1190,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     trace_symbol_counts: Counter[str] = Counter()
     first_inventory_by_symbol: dict[str, int] = {}
     latest_inventory_by_symbol: dict[str, int] = {}
+    latest_portfolio_inventory_by_symbol: dict[str, int] = {}
     reconstructed_fill_delta_by_symbol: Counter[str] = Counter()
     inventory_divergence_by_symbol: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"sample_count": 0, "divergent_sample_count": 0, "max_abs_difference": 0, "latest_difference": 0}
@@ -1265,6 +1282,11 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         trace_event_counts[event_type] += 1
         trace_symbol_counts[symbol or "_ALL"] += 1
 
+        if event.get("cash") is not None and now_ms >= latest_cash_ms:
+            latest_cash = float(event.get("cash") or 0.0)
+            latest_cash_ms = now_ms
+        if symbol and event.get("inventory") is not None:
+            latest_portfolio_inventory_by_symbol[symbol] = int(event.get("inventory") or 0)
         if symbol and event_type in {"inventory_updated", "session_end"} and event.get("inventory") is not None:
             if event_type == "inventory_updated" and symbol not in first_inventory_by_symbol:
                 first_inventory_by_symbol[symbol] = int(event.get("inventory") or 0)
@@ -1957,6 +1979,23 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     b_option_lottery_summary = build_b_option_lottery_summary(event_list)
     etf_a_shock_calibration = build_etf_a_shock_calibration_summary(event_list)
     etf_episode_summaries = build_etf_episode_summaries(event_list)
+    portfolio_mtm = latest_cash
+    portfolio_marked_symbols = 0
+    missing_mark_symbols: list[str] = []
+    for symbol, inventory in latest_portfolio_inventory_by_symbol.items():
+        if symbol == "cash":
+            continue
+        if int(inventory) == 0:
+            continue
+        mark = latest_mark_by_symbol.get(symbol)
+        if mark is None:
+            missing_mark_symbols.append(symbol)
+            continue
+        portfolio_marked_symbols += 1
+        portfolio_mtm = float(portfolio_mtm or 0.0) + (float(inventory) * float(mark))
+    if portfolio_mtm is not None:
+        latest_mtm = round(float(portfolio_mtm), 4)
+        latest_mtm_basis = "portfolio_latest_marks"
     etf_missed_entry_reasons = Counter(
         str(row.get("missed_entry_terminal_reason") or row.get("first_block_reason") or "no_order_attempt_recorded")
         for row in etf_episode_summaries
@@ -2124,6 +2163,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "budget_shift_active_ms": budget_shift_active_ms,
         "estimated_final_mtm_pnl": latest_mtm,
         "estimated_final_mtm_basis": latest_mtm_basis,
+        "estimated_final_mtm_missing_mark_symbols": missing_mark_symbols,
         "fill_markouts_by_intent": _average_markouts(fill_markouts_by_intent),
         "markouts_by_action_class": action_markout_summary,
         "pnl_by_market": {key: round(value, 4) for key, value in sorted(pnl_by_market.items())},
@@ -3258,6 +3298,12 @@ class TraceRecorder:
                     "reduces costs",
                     "analysts commend",
                     "product differentiation",
+                    "battery breakthrough",
+                    "widely praised",
+                    "renewable energy",
+                    "widespread attention",
+                    "intellectual property",
+                    "loss of key",
                 )
             }
             summary["a_news_summary"] = {

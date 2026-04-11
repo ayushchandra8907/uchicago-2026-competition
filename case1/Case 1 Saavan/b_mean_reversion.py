@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from a_bot_config import BConfig, RiskConfig
-from a_bot_strategy import BookSnapshot, DesiredOrder, OrderManager, QuotePlan
+from a_bot_strategy import BookSnapshot, CancelCommand, DesiredOrder, OrderManager, QuotePlan, SyncActions
 
 
 @dataclass(frozen=True)
@@ -115,6 +115,40 @@ class BMeanReversionStrategy:
 
     def on_rejection(self, order_id: str) -> Any | None:
         return self.order_manager.handle_rejection(order_id)
+
+    def build_actions(self, plan: QuotePlan, now_ms: int) -> SyncActions:
+        actions = self.order_manager.build_actions(plan, now_ms)
+        desired_side: str | None = None
+        if plan.aggressive_actions:
+            desired_side = str(plan.aggressive_actions[0].side)
+        elif plan.bid is not None:
+            desired_side = "BUY"
+        elif plan.ask is not None:
+            desired_side = "SELL"
+        if desired_side not in {"BUY", "SELL"}:
+            return actions
+
+        opposite_side = "SELL" if desired_side == "BUY" else "BUY"
+        opposite_live = self.order_manager.live_order(opposite_side)  # type: ignore[arg-type]
+        if opposite_live is None:
+            return actions
+
+        cancels = list(actions.cancels)
+        if (
+            not opposite_live.cancel_pending
+            and all(cancel.order_id != opposite_live.order_id for cancel in cancels)
+        ):
+            cancels.append(
+                CancelCommand(
+                    order_id=opposite_live.order_id,
+                    side=opposite_side,  # type: ignore[arg-type]
+                    reason="single-intent B mean-reversion handoff",
+                )
+            )
+
+        placements = [placement for placement in actions.placements if placement.side != desired_side]
+        self.last_block_reason = "b_meanrev_waiting_for_opposite_cancel"
+        return SyncActions(cancels=tuple(cancels), placements=tuple(placements))
 
     def compute_quotes(self, *, now_ms: int, residual_payload: dict[str, Any] | None) -> QuotePlan:
         self.last_block_reason = None

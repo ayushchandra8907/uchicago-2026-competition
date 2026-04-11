@@ -160,7 +160,16 @@ class BOptionLotteryTests(unittest.TestCase):
         )
 
         self.assertTrue(plan.observe_only)
-        self.assertEqual(plan.reason, "option_lottery_premium_budget_spent")
+        self.assertEqual(plan.reason, "option_lottery_non_wing_disabled")
+
+    def test_non_wing_call_symbol_is_disabled_without_hedge(self) -> None:
+        strategy = self.make_strategy()
+        strategy.on_book_update_at("B_C_950", FakeOrderBook(bids={1: 10}, asks={3: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan("B_C_950", now_ms=1_200, residual_payload={"underlying_mid": 1000.0})
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "option_lottery_non_wing_disabled")
 
     def test_fill_after_position_update_does_not_double_count_inventory(self) -> None:
         strategy = self.make_strategy()
@@ -295,6 +304,21 @@ class BOptionLotteryTests(unittest.TestCase):
         actions = strategy.order_managers["B_P_950"].build_actions(second_plan, 1_250)
         self.assertEqual(actions.cancels, ())
         self.assertEqual(actions.placements, ())
+
+    def test_stale_wing_position_time_stop_sells_inventory(self) -> None:
+        strategy = self.make_strategy()
+        strategy.positions["B_C_1050"] = 4
+        strategy.costed_qty["B_C_1050"] = 4
+        strategy.open_cost_basis["B_C_1050"] = 12.0
+        strategy.position_opened_ms["B_C_1050"] = 0
+        strategy.on_book_update_at("B_C_1050", FakeOrderBook(bids={2: 10}, asks={3: 10}), now_ms=50_000)
+
+        plan = strategy.compute_quote_plan("B_C_1050", now_ms=50_000, residual_payload=None)
+
+        self.assertFalse(plan.observe_only)
+        self.assertIsNotNone(plan.ask)
+        self.assertEqual(plan.ask.side, "SELL")
+        self.assertEqual(plan.ask.action_class, "cheap_option_time_stop")
 
 
 if __name__ == "__main__":

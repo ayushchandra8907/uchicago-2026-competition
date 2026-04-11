@@ -194,7 +194,7 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(len(first.aggressive_actions), 1)
         self.assertEqual(len(second.aggressive_actions), 1)
         self.assertTrue(second.aggressive_actions[0].aggressive)
-        self.assertEqual(expired.reason, "etf_entry_retry_window_expired")
+        self.assertEqual(expired.reason, "entry_retry_window_expired")
         self.assertIsNone(strategy.active_signal)
 
     def test_cancel_response_does_not_clear_unfilled_signal(self) -> None:
@@ -358,6 +358,51 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(still_blocked.reason, "crossed_or_locked_etf_book")
         self.assertEqual(len(resumed.aggressive_actions), 1)
         self.assertTrue(resumed.aggressive_actions[0].aggressive)
+
+    def test_opposite_signal_flattens_before_handoff(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        first = strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        self.assertIsNotNone(first)
+        strategy.sync_inventory_from_exchange(20, now_ms=1_200)
+
+        second = strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=0.9,
+                old_fair_value=1100,
+                new_fair_value=1000,
+            ),
+            now_ms=1_300,
+        )
+
+        self.assertIsNotNone(second)
+        self.assertEqual(strategy.active_signal.signal_id, first.signal_id)
+        self.assertEqual(strategy.pending_signal.signal_id, second.signal_id)
+
+        flatten_plan = strategy.compute_quotes(now_ms=1_301, a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": 1})
+        self.assertEqual(flatten_plan.mode, "ETF_UNWIND")
+        self.assertEqual(len(flatten_plan.aggressive_actions), 1)
+        self.assertEqual(flatten_plan.aggressive_actions[0].side, "SELL")
+
+        strategy.sync_inventory_from_exchange(0, now_ms=1_400)
+        next_plan = strategy.compute_quotes(now_ms=1_401, a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": -1})
+
+        self.assertIsNotNone(strategy.active_signal)
+        self.assertEqual(strategy.active_signal.signal_id, second.signal_id)
+        self.assertIsNone(strategy.pending_signal)
+        self.assertEqual(next_plan.mode, "ETF_A_SHOCK")
+        self.assertEqual(len(next_plan.aggressive_actions), 1)
+        self.assertEqual(next_plan.aggressive_actions[0].side, "SELL")
 
     def test_retry_window_reports_guard_reason_if_guard_persists(self) -> None:
         strategy = self.make_strategy(alpha=0.25)

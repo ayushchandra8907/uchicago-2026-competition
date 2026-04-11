@@ -199,6 +199,28 @@ class BMeanReversionStrategyTests(unittest.TestCase):
 
         self.assertTrue(strategy.should_force_bad_book_cancel())
 
+    def test_single_intent_actions_wait_for_opposite_cancel(self) -> None:
+        strategy = self.make_strategy()
+        strategy.order_manager.note_submitted(
+            order_id="b-buy-1",
+            side="BUY",
+            px=998,
+            qty=2,
+            now_ms=900,
+            aggressive=False,
+            intent="b_mean_reversion",
+            mode_at_submit="B_MEANREV_EXIT",
+            action_class="mean_reversion_exit",
+        )
+        self.seed_signal(strategy, mid=1015.0)
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+        actions = strategy.build_actions(plan, 1_000)
+
+        self.assertTrue(any(cancel.order_id == "b-buy-1" for cancel in actions.cancels))
+        self.assertFalse(any(placement.side == "SELL" for placement in actions.placements))
+        self.assertEqual(strategy.last_block_reason, "b_meanrev_waiting_for_opposite_cancel")
+
     def test_stop_z_blocks_new_entries_and_passively_reduces_small_inventory(self) -> None:
         strategy = self.make_strategy()
         strategy.sync_inventory_from_exchange(5)

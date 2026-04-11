@@ -828,6 +828,35 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(option_summary["open_qty_from_fills"], 4)
         self.assertEqual(option_summary["open_mark_value_from_fills"], 200.0)
 
+    def test_summarize_trace_events_uses_latest_portfolio_marks_for_final_mtm(self) -> None:
+        events = [
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "inventory": 5,
+                "mid": 10.0,
+                "cash": 100,
+            },
+            {
+                "event_type": "session_end",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "A",
+                "market_key": "A",
+                "inventory": 0,
+                "mid": 0.0,
+                "cash": 100,
+            },
+        ]
+
+        summary = summarize_trace_events(events)
+
+        self.assertEqual(summary["estimated_final_mtm_pnl"], 150.0)
+        self.assertEqual(summary["estimated_final_mtm_basis"], "portfolio_latest_marks")
+
     def test_summarize_trace_events_rolls_up_pnl_by_market_and_strategy(self) -> None:
         events = [
             {
@@ -1393,6 +1422,96 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(row["avg_exit_px"], 1020.0)
         self.assertIn("hold_2s", row["counterfactual_holds"])
         self.assertGreater(row["counterfactual_holds"]["hold_2s"]["estimated_pnl"], row["realized_episode_pnl"])
+
+    def test_a_news_episode_summary_ignores_later_signal_inventory(self) -> None:
+        events = [
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "A",
+                "market_key": "A",
+                "news_kind": "unstructured",
+                "relevant": True,
+                "content": "A's revolutionary battery breakthrough is widely praised.",
+                "news_sentiment_score": 2.5,
+                "news_sentiment_bucket": "strong",
+                "current_news_signal_id": "ayush_news_1",
+                "news_target_inventory": 80,
+                "raw_payload": {"kind": "unstructured", "new_data": {"asset": "A"}},
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_100,
+                "symbol": "A",
+                "market_key": "A",
+                "strategy_family": "a_news",
+                "action_class": "news_take",
+                "pnl_owner": "a_news",
+                "signal_id": "ayush_news_1",
+                "side": "BUY",
+                "fill_qty": 8,
+                "fill_price": 100,
+                "news_position": 8,
+                "mid": 100.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_400,
+                "symbol": "A",
+                "market_key": "A",
+                "news_position": 8,
+                "mid": 101.0,
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_900,
+                "symbol": "A",
+                "market_key": "A",
+                "strategy_family": "a_news",
+                "action_class": "news_unwind",
+                "pnl_owner": "a_news",
+                "signal_id": "ayush_news_1",
+                "side": "SELL",
+                "fill_qty": 8,
+                "fill_price": 103,
+                "news_position": 0,
+                "mid": 103.0,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 4_000,
+                "symbol": "A",
+                "market_key": "A",
+                "news_position": 20,
+                "mid": 95.0,
+            },
+            {
+                "event_type": "news_received",
+                "run_id": "run-1",
+                "monotonic_ms": 5_000,
+                "symbol": "A",
+                "market_key": "A",
+                "news_kind": "unstructured",
+                "relevant": True,
+                "content": "A expands revenue streams.",
+                "news_sentiment_score": 1.8,
+                "news_sentiment_bucket": "medium",
+                "current_news_signal_id": "ayush_news_2",
+                "news_target_inventory": 60,
+                "raw_payload": {"kind": "unstructured", "new_data": {"asset": "A"}},
+            },
+        ]
+
+        summary = summarize_trace_events(events)
+        row = summary["a_news_episode_summaries"][0]
+
+        self.assertEqual(row["signal_id"], "ayush_news_1")
+        self.assertEqual(row["peak_news_inventory"], 8)
 
     def test_b_shadow_underlying_mm_summary_is_observe_only(self) -> None:
         events = [
