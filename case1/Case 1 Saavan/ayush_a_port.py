@@ -16,7 +16,7 @@ from a_bot_strategy import (
     OverlayName,
     QuotePlan,
 )
-from a_bot_config import RiskConfig
+from a_bot_config import AConfig, RiskConfig
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +48,7 @@ class AyushPortStrategy:
     def __init__(
         self,
         *,
+        a_config: AConfig | None = None,
         risk: RiskConfig,
         restored_orders=(),
         recovered_multiplier: float | None = None,
@@ -58,6 +59,7 @@ class AyushPortStrategy:
         initial_fair_value: int | None = None,
         book_depth_levels: int = 10,
     ) -> None:
+        self.a_config = a_config or AConfig()
         self.risk = risk
         self._config = AyushStrategyConfig()
         self._strategy = AyushAStrategy(self._config)
@@ -88,6 +90,9 @@ class AyushPortStrategy:
         self.active_news_signal_id: str | None = None
         self.pending_news_signal_id: str | None = None
         self.orders: dict[str, ManagedOrder] = {}
+        self._last_shock_entry_price_vs_fair: int | None = None
+        self._last_shock_price_guard_blocked = False
+        self._shock_entry_guard_block_count = 0
 
         for order in restored_orders:
             restored = ManagedOrder(
@@ -304,6 +309,8 @@ class AyushPortStrategy:
         return envelope.decision, self._translate_decision(envelope.decision)
 
     def desired_order_for_decision(self, decision: Any) -> DesiredOrder | None:
+        self._last_shock_entry_price_vs_fair = None
+        self._last_shock_price_guard_blocked = False
         desired = getattr(decision, "desired_order", None)
         if desired is None:
             return None
@@ -312,6 +319,13 @@ class AyushPortStrategy:
             return None
         strategy_family, action_class, pnl_owner, overlay = self._order_identity(str(desired.intent or ""))
         signal_id = self._signal_id_for_order(strategy_family)
+        if (
+            strategy_family == "a_earnings"
+            and action_class == "shock_take"
+            and bool(desired.aggressive)
+            and self._should_block_earnings_shock_entry(side=str(desired.side), px=int(desired.px))
+        ):
+            return None
         return DesiredOrder(
             side=str(desired.side),
             px=int(desired.px),
@@ -330,6 +344,18 @@ class AyushPortStrategy:
             trade_group_id=signal_id,
             leg_role="single",
         )
+
+    def _should_block_earnings_shock_entry(self, *, side: str, px: int) -> bool:
+        fair_value = self.fair_value
+        if fair_value is None:
+            return False
+        adverse_ticks = int(px) - int(fair_value) if side == "BUY" else int(fair_value) - int(px)
+        self._last_shock_entry_price_vs_fair = adverse_ticks
+        if adverse_ticks <= int(self.a_config.earnings_shock_entry_guard_ticks):
+            return False
+        self._last_shock_price_guard_blocked = True
+        self._shock_entry_guard_block_count += 1
+        return True
 
     def current_orders(self) -> list[ManagedOrder]:
         return [order for order in self.orders.values() if order.remaining_qty > 0]
@@ -556,6 +582,10 @@ class AyushPortStrategy:
             "overshoot_trimmed_qty_total": state.get("overshoot_trimmed_qty_total"),
             "shock_decay_steps_applied": state.get("shock_decay_steps_applied"),
             "shock_decay_trimmed_qty_total": state.get("shock_decay_trimmed_qty_total"),
+            "a_shock_entry_guard_ticks": self.a_config.earnings_shock_entry_guard_ticks,
+            "a_shock_entry_price_vs_fair": self._last_shock_entry_price_vs_fair,
+            "a_shock_price_guard_blocked": self._last_shock_price_guard_blocked,
+            "a_shock_entry_block_count": self._shock_entry_guard_block_count,
         }
 
     def _translate_decision(self, decision: Any | None) -> QuotePlan:
@@ -589,6 +619,15 @@ class AyushPortStrategy:
             confirmation_state = str(self._latest_export_state.get("news_confirmation_state") or "inactive")
             if confirmation_state not in {"inactive", "active"}:
                 plan_mode = "NEWS_CONFIRMATION"
+        if desired is None and self._last_shock_price_guard_blocked:
+            return QuotePlan(
+                mode=plan_mode,
+                bid=None,
+                ask=None,
+                aggressive_actions=(),
+                observe_only=True,
+                reason="a_shock_price_guard_blocked",
+            )
         return QuotePlan(
             mode=plan_mode,
             bid=bid,

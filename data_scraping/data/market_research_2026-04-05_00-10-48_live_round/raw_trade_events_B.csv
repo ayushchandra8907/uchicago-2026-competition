@@ -1,2 +1,0 @@
-event_index,session_id,run_id,wall_time_iso,wall_time_ns,monotonic_ns,exchange_tick,round,day,symbol,trade_px,trade_qty,mid_at_trade,spread_at_trade,time_since_last_symbol_news,latest_known_eps_for_symbol
-28006,market_research_2026-04-05_00-10-48_live_round,5308b7fe59c84166831e81c63b50bde3,2026-04-05T05:11:47.435090+00:00,1775365907435090000,181617772722041,500,,,B,1002,52,1002.0,0.0,,

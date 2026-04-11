@@ -95,3 +95,92 @@ class ANewsSentimentParityTests(unittest.TestCase):
         self.assertEqual(result.direction, 1)
         self.assertIn("analysts commend", result.matched_bigrams)
         self.assertIn("product differentiation", result.matched_bigrams)
+
+    def test_battery_breakthrough_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "A's revolutionary battery breakthrough is widely praised by analysts."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue("battery breakthrough" in result.matched_bigrams or "widely praised" in result.matched_bigrams)
+
+    def test_revolutionary_battery_technology_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "A's new battery technology is praised as revolutionary."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("battery technology", "praised revolutionary")
+            )
+            or "battery" in result.matched_unigrams
+        )
+
+    def test_revolutionary_renewable_energy_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Widespread attention surrounds A's revolutionary renewable energy technology."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("renewable energy", "widespread attention", "renewable technology")
+            )
+        )
+
+    def test_intellectual_property_loss_phrase_scores_negative(self) -> None:
+        result = score_a_unstructured_headline(
+            "Loss of key intellectual property rights delivers a blow to A's core business."
+        )
+
+        self.assertLess(result.score, 0.0)
+        self.assertEqual(result.direction, -1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("intellectual property", "loss key", "delivers blow", "key ip")
+            )
+        )
+
+    def test_glowing_praise_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Swift execution of a strategic pivot draws glowing praise for A."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("glowing praise", "swift execution")
+            )
+        )
+
+    def test_data_centers_cloud_growth_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "A expands data centers, signaling strong cloud growth."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("data centers", "cloud growth")
+            )
+        )
+
+    def test_rising_liabilities_phrase_scores_negative(self) -> None:
+        result = score_a_unstructured_headline(
+            "Newly released financials from A reveal rising liabilities."
+        )
+
+        self.assertLess(result.score, 0.0)
+        self.assertEqual(result.direction, -1)
+        self.assertIn("rising liabilities", result.matched_bigrams)

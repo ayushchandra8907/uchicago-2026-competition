@@ -89,6 +89,7 @@ class AConfig:
     shock_window_ms: int = 3_000
     shock_take_fraction: float = 0.20
     shock_take_min_edge: int = 4
+    earnings_shock_entry_guard_ticks: int = 24
     news_emergency_dump_min_elapsed_ms: int = 250
     news_emergency_dump_ticks: int = 40
     news_emergency_dump_fraction: float = 0.20
@@ -161,8 +162,8 @@ class BConfig:
     mm_min_healthy_book_age_ms: int = 500
     mm_cancel_on_bad_book: bool = True
     mm_bad_fill_cooldown_ms: int = 750
-    meanrev_max_position: int = 16
-    meanrev_quote_size: int = 2
+    meanrev_max_position: int = 24
+    meanrev_quote_size: int = 4
     meanrev_ema_fast_ms: int = 30_000
     meanrev_ema_slow_ms: int = 180_000
     meanrev_vol_ewma_ms: int = 60_000
@@ -179,8 +180,8 @@ class BConfig:
     meanrev_entry_ticks: int = 10
     meanrev_full_entry_ticks: int = 15
     meanrev_exit_ticks: int = 3
-    meanrev_base_target: int = 6
-    meanrev_full_target: int = 16
+    meanrev_base_target: int = 8
+    meanrev_full_target: int = 24
     meanrev_extreme_entry_ticks: int = 20
     meanrev_risk_off_deviation_ticks: int = 35
     meanrev_turn_confirm_ms: int = 300
@@ -205,8 +206,8 @@ class BConfig:
     option_lottery_atm_max_position: int = 40
     option_lottery_total_premium_budget: int = 1_500
     option_lottery_wing_premium_budget: int = 600
-    option_lottery_c1050_premium_budget: int = 450
-    option_lottery_p950_premium_budget: int = 450
+    option_lottery_c1050_premium_budget: int = 0
+    option_lottery_p950_premium_budget: int = 0
     option_lottery_atm_total_premium_budget: int = 300
     option_lottery_near_strike_ticks: int = 80
     option_lottery_min_momentum_ticks: float = 1.0
@@ -215,6 +216,7 @@ class BConfig:
     option_lottery_profit_take_min_edge: int = 6
     option_lottery_profit_take_multiple: float = 2.0
     option_lottery_profit_take_quote_size: int = 20
+    option_lottery_stale_hold_ms: int = 45_000
     option_hedge_enabled: bool = True
     option_hedge_max_ask: int = 6
     option_hedge_min_underlying_inventory: int = 4
@@ -232,6 +234,19 @@ class BConfig:
 
 
 @dataclass(frozen=True)
+class MarketCConfig:
+    enabled: bool = True
+    trading_enabled: bool = True
+    symbol: str = "C"
+    live_earnings_enabled: bool = True
+    live_cpi_enabled: bool = False
+    live_macro_enabled: bool = False
+    mm_enabled: bool = False
+    min_eval_interval_ms: int = 100
+    pm_symbols: tuple[str, ...] = ("R_HIKE", "R_HOLD", "R_CUT")
+
+
+@dataclass(frozen=True)
 class ETFConfig:
     enabled: bool = True
     trading_enabled: bool = True
@@ -242,7 +257,7 @@ class ETFConfig:
     alpha_max: float = 1.0
     alpha_step: float = 0.05
     max_position: int = 100
-    quote_size: int = 16
+    quote_size: int = 24
     target_position_per_etf_tick: float = 1.0
     target_position_per_a_shock_inventory: float = 0.35
     min_a_fair_shift_ticks: int = 20
@@ -258,12 +273,16 @@ class ETFConfig:
     reprice_threshold_ticks: int = 2
     min_eval_interval_ms: int = 100
     unwind_reprice_threshold_ticks: int = 8
-    entry_retry_window_ms: int = 1_500
+    entry_retry_window_ms: int = 2_500
     entry_force_aggressive_ms: int = 250
     entry_retry_reprice_ms: int = 125
     churn_window_ms: int = 250
     churn_max_top_of_book_updates: int = 25
     churn_resume_stable_ms: int = 500
+    enable_c_earnings: bool = True
+    alpha_from_c_earnings: float = 0.35
+    min_c_fair_shift_ticks: int = 18
+    ac_conflict_policy: str = "suppress"
 
 
 @dataclass(frozen=True)
@@ -301,6 +320,7 @@ class BotConfig:
     exchange: ExchangeConfig
     market_a: AConfig
     market_b: BConfig
+    market_c: MarketCConfig
     etf: ETFConfig
     risk: RiskConfig
     paths: BotPaths
@@ -485,6 +505,7 @@ def load_bot_config(
             shock_window_ms=_optional_int("A_SHOCK_WINDOW_MS", 3_000) or 3_000,
             shock_take_fraction=_optional_float("A_SHOCK_TAKE_FRACTION", 0.20) or 0.20,
             shock_take_min_edge=_optional_int("A_SHOCK_TAKE_MIN_EDGE", 4) or 4,
+            earnings_shock_entry_guard_ticks=_optional_int("A_EARNINGS_SHOCK_ENTRY_GUARD_TICKS", 24) or 24,
             news_emergency_dump_min_elapsed_ms=_optional_int("A_NEWS_EMERGENCY_DUMP_MIN_ELAPSED_MS", 250) or 250,
             news_emergency_dump_ticks=_optional_int("A_NEWS_EMERGENCY_DUMP_TICKS", 40) or 40,
             news_emergency_dump_fraction=_optional_float("A_NEWS_EMERGENCY_DUMP_FRACTION", 0.20) or 0.20,
@@ -561,8 +582,8 @@ def load_bot_config(
             mm_min_healthy_book_age_ms=_optional_int("B_MM_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
             mm_cancel_on_bad_book=_optional_bool("B_MM_CANCEL_ON_BAD_BOOK", True),
             mm_bad_fill_cooldown_ms=_optional_int("B_MM_BAD_FILL_COOLDOWN_MS", 750) or 750,
-            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 16) or 16,
-            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 2) or 2,
+            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 24) or 24,
+            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 4) or 4,
             meanrev_ema_fast_ms=_optional_int("B_MEANREV_EMA_FAST_MS", 30_000) or 30_000,
             meanrev_ema_slow_ms=_optional_int("B_MEANREV_EMA_SLOW_MS", 180_000) or 180_000,
             meanrev_vol_ewma_ms=_optional_int("B_MEANREV_VOL_EWMA_MS", 60_000) or 60_000,
@@ -579,8 +600,8 @@ def load_bot_config(
             meanrev_entry_ticks=_optional_int("B_MEANREV_ENTRY_TICKS", 10) or 10,
             meanrev_full_entry_ticks=_optional_int("B_MEANREV_FULL_ENTRY_TICKS", 15) or 15,
             meanrev_exit_ticks=_optional_int("B_MEANREV_EXIT_TICKS", 3) or 3,
-            meanrev_base_target=_optional_int("B_MEANREV_BASE_TARGET", 6) or 6,
-            meanrev_full_target=_optional_int("B_MEANREV_FULL_TARGET", 16) or 16,
+            meanrev_base_target=_optional_int("B_MEANREV_BASE_TARGET", 8) or 8,
+            meanrev_full_target=_optional_int("B_MEANREV_FULL_TARGET", 24) or 24,
             meanrev_extreme_entry_ticks=_optional_int("B_MEANREV_EXTREME_ENTRY_TICKS", 20) or 20,
             meanrev_risk_off_deviation_ticks=_optional_int("B_MEANREV_RISK_OFF_DEVIATION_TICKS", 35) or 35,
             meanrev_turn_confirm_ms=_optional_int("B_MEANREV_TURN_CONFIRM_MS", 300) or 300,
@@ -605,8 +626,8 @@ def load_bot_config(
             option_lottery_atm_max_position=_optional_int("B_OPTION_LOTTERY_ATM_MAX_POSITION", 40) or 40,
             option_lottery_total_premium_budget=_optional_int("B_OPTION_LOTTERY_TOTAL_PREMIUM_BUDGET", 1_500) or 1_500,
             option_lottery_wing_premium_budget=_optional_int("B_OPTION_LOTTERY_WING_PREMIUM_BUDGET", 600) or 600,
-            option_lottery_c1050_premium_budget=_optional_int("B_OPTION_C1050_PREMIUM_BUDGET", 450) or 450,
-            option_lottery_p950_premium_budget=_optional_int("B_OPTION_P950_PREMIUM_BUDGET", 450) or 450,
+            option_lottery_c1050_premium_budget=_optional_int("B_OPTION_C1050_PREMIUM_BUDGET", 0),
+            option_lottery_p950_premium_budget=_optional_int("B_OPTION_P950_PREMIUM_BUDGET", 0),
             option_lottery_atm_total_premium_budget=_optional_int("B_OPTION_LOTTERY_ATM_TOTAL_PREMIUM_BUDGET", 300) or 300,
             option_lottery_near_strike_ticks=_optional_int("B_OPTION_LOTTERY_NEAR_STRIKE_TICKS", 80) or 80,
             option_lottery_min_momentum_ticks=_optional_float("B_OPTION_LOTTERY_MIN_MOMENTUM_TICKS", 1.0) or 1.0,
@@ -615,11 +636,22 @@ def load_bot_config(
             option_lottery_profit_take_min_edge=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_MIN_EDGE", 6) or 6,
             option_lottery_profit_take_multiple=_optional_float("B_OPTION_LOTTERY_PROFIT_TAKE_MULTIPLE", 2.0) or 2.0,
             option_lottery_profit_take_quote_size=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_QUOTE_SIZE", 20) or 20,
+            option_lottery_stale_hold_ms=_optional_int("B_OPTION_LOTTERY_STALE_HOLD_MS", 45_000) or 45_000,
             option_hedge_enabled=_optional_bool("B_OPTION_HEDGE_ENABLED", True),
             option_hedge_max_ask=_optional_int("B_OPTION_HEDGE_MAX_ASK", 6) or 6,
             option_hedge_min_underlying_inventory=_optional_int("B_OPTION_HEDGE_MIN_UNDERLYING_INVENTORY", 4) or 4,
             option_hedge_target_ratio=_optional_float("B_OPTION_HEDGE_TARGET_RATIO", 0.5) or 0.5,
             option_hedge_premium_budget=_optional_int("B_OPTION_HEDGE_PREMIUM_BUDGET", 300) or 300,
+        ),
+        market_c=MarketCConfig(
+            enabled=_optional_bool("C_ENABLED", True),
+            trading_enabled=_optional_bool("C_TRADING_ENABLED", True),
+            symbol=str(os.getenv("C_SYMBOL", "C") or "C").strip(),
+            live_earnings_enabled=_optional_bool("C_LIVE_EARNINGS_ENABLED", True),
+            live_cpi_enabled=_optional_bool("C_LIVE_CPI_ENABLED", False),
+            live_macro_enabled=_optional_bool("C_LIVE_MACRO_ENABLED", False),
+            mm_enabled=_optional_bool("C_MM_ENABLED", False),
+            min_eval_interval_ms=_optional_int("C_MIN_EVAL_INTERVAL_MS", 100) or 100,
         ),
         etf=ETFConfig(
             enabled=_optional_bool("ETF_ENABLED", True),
@@ -634,7 +666,7 @@ def load_bot_config(
             alpha_max=_optional_float("ETF_ALPHA_MAX", 1.0) or 1.0,
             alpha_step=_optional_float("ETF_ALPHA_STEP", 0.05) or 0.05,
             max_position=_optional_int("ETF_MAX_POSITION", 100) or 100,
-            quote_size=_optional_int("ETF_QUOTE_SIZE", 16) or 16,
+            quote_size=_optional_int("ETF_QUOTE_SIZE", 24) or 24,
             target_position_per_etf_tick=_optional_float("ETF_TARGET_POSITION_PER_TICK", 1.0) or 1.0,
             target_position_per_a_shock_inventory=(
                 _optional_float("ETF_TARGET_POSITION_PER_A_SHOCK_INVENTORY", 0.35) or 0.35
@@ -652,12 +684,16 @@ def load_bot_config(
             reprice_threshold_ticks=_optional_int("ETF_REPRICE_THRESHOLD_TICKS", 2) or 2,
             min_eval_interval_ms=_optional_int("ETF_MIN_EVAL_INTERVAL_MS", 100) or 100,
             unwind_reprice_threshold_ticks=_optional_int("ETF_UNWIND_REPRICE_THRESHOLD_TICKS", 8) or 8,
-            entry_retry_window_ms=_optional_int("ETF_ENTRY_RETRY_WINDOW_MS", 1_500) or 1_500,
+            entry_retry_window_ms=_optional_int("ETF_ENTRY_RETRY_WINDOW_MS", 2_500) or 2_500,
             entry_force_aggressive_ms=_optional_int("ETF_ENTRY_FORCE_AGGRESSIVE_MS", 250) or 250,
             entry_retry_reprice_ms=_optional_int("ETF_ENTRY_RETRY_REPRICE_MS", 125) or 125,
             churn_window_ms=_optional_int("ETF_CHURN_WINDOW_MS", 250) or 250,
             churn_max_top_of_book_updates=_optional_int("ETF_CHURN_MAX_TOP_OF_BOOK_UPDATES", 25) or 25,
             churn_resume_stable_ms=_optional_int("ETF_CHURN_RESUME_STABLE_MS", 500) or 500,
+            enable_c_earnings=_optional_bool("ETF_ENABLE_C_EARNINGS", True),
+            alpha_from_c_earnings=_optional_float("ETF_ALPHA_FROM_C_EARNINGS", 0.35) or 0.35,
+            min_c_fair_shift_ticks=_optional_int("ETF_MIN_C_FAIR_SHIFT_TICKS", 18) or 18,
+            ac_conflict_policy=str(os.getenv("ETF_AC_CONFLICT_POLICY", "suppress") or "suppress").strip().lower(),
         ),
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,

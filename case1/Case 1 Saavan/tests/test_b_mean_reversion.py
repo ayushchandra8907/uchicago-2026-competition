@@ -140,9 +140,53 @@ class BMeanReversionStrategyTests(unittest.TestCase):
         plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
 
         self.assertFalse(plan.observe_only)
-        self.assertIsNotNone(plan.ask)
         self.assertEqual(plan.mode, "B_MEANREV_EXIT")
-        self.assertEqual(plan.ask.action_class, "mean_reversion_exit")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "SELL")
+        self.assertTrue(plan.aggressive_actions[0].aggressive)
+        self.assertEqual(plan.aggressive_actions[0].action_class, "mean_reversion_exit")
+
+    def test_exit_z_triggers_aggressive_exit_even_outside_tick_band(self) -> None:
+        strategy = self.make_strategy()
+        strategy.sync_inventory_from_exchange(-4)
+        self.seed_signal(strategy, mid=1002.0)
+        strategy.last_sigma = 8.0
+        strategy.ewma_var = 64.0
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+
+        self.assertEqual(plan.mode, "B_MEANREV_EXIT")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "BUY")
+        self.assertTrue(plan.aggressive_actions[0].aggressive)
+        self.assertEqual(plan.aggressive_actions[0].action_class, "mean_reversion_exit")
+
+    def test_low_z_blocks_non_extreme_entry_even_when_ticks_are_large_enough(self) -> None:
+        strategy = self.make_strategy()
+        self.seed_signal(strategy, mid=1010.0)
+        strategy.last_sigma = 16.0
+        strategy.ewma_var = 256.0
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "B mean-reversion waiting for z-score entry")
+        self.assertEqual(strategy.last_block_reason, "b_meanrev_waiting_for_z_entry")
+
+    def test_high_tick_low_z_signal_downshifts_to_base_target(self) -> None:
+        strategy = self.make_strategy()
+        self.seed_signal(strategy, mid=1015.0)
+        strategy.last_sigma = 8.0
+        strategy.ewma_var = 64.0
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+
+        self.assertEqual(strategy.last_target_inventory, -6)
+        self.assertEqual(len(plan.aggressive_actions), 0)
+        self.assertIsNotNone(plan.ask)
+        self.assertFalse(plan.ask.aggressive)
+        self.assertEqual(plan.ask.side, "SELL")
+        self.assertEqual(plan.ask.action_class, "mean_reversion_entry")
 
     def test_waits_for_turn_confirmation_for_normal_fade(self) -> None:
         strategy = self.make_strategy()
@@ -198,6 +242,28 @@ class BMeanReversionStrategyTests(unittest.TestCase):
         strategy.on_book_update_at("B", FakeOrderBook(bids={1002: 10}, asks={1001: 10}), now_ms=1_100)
 
         self.assertTrue(strategy.should_force_bad_book_cancel())
+
+    def test_single_intent_actions_wait_for_opposite_cancel(self) -> None:
+        strategy = self.make_strategy()
+        strategy.order_manager.note_submitted(
+            order_id="b-buy-1",
+            side="BUY",
+            px=998,
+            qty=2,
+            now_ms=900,
+            aggressive=False,
+            intent="b_mean_reversion",
+            mode_at_submit="B_MEANREV_EXIT",
+            action_class="mean_reversion_exit",
+        )
+        self.seed_signal(strategy, mid=1015.0)
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+        actions = strategy.build_actions(plan, 1_000)
+
+        self.assertTrue(any(cancel.order_id == "b-buy-1" for cancel in actions.cancels))
+        self.assertFalse(any(placement.side == "SELL" for placement in actions.placements))
+        self.assertEqual(strategy.last_block_reason, "b_meanrev_waiting_for_opposite_cancel")
 
     def test_stop_z_blocks_new_entries_and_passively_reduces_small_inventory(self) -> None:
         strategy = self.make_strategy()

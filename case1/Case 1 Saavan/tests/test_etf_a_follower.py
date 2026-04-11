@@ -11,7 +11,7 @@ if str(BOT_DIR) not in sys.path:
 
 from a_bot_config import ETFConfig, RiskConfig
 from a_bot_strategy import NewsReaction
-from etf_a_follower import ETFAFollowerStrategy
+from etf_a_follower import ETFAFollowerStrategy, ETFShockProjection
 
 
 class FakeOrderBook:
@@ -144,6 +144,29 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(plan.mode, "ETF_A_HOLD")
         self.assertEqual(len(plan.aggressive_actions), 0)
 
+    def test_reaches_target_price_after_min_hold_then_unwinds(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        signal = strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        self.assertIsNotNone(signal)
+        strategy.sync_inventory_from_exchange(24, now_ms=1_200)
+        strategy.on_book_update_at("ETF", FakeOrderBook(bids={1023: 10}, asks={1027: 10}), now_ms=4_500)
+
+        plan = strategy.compute_quotes(now_ms=4_500, a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": 1})
+
+        self.assertEqual(plan.mode, "ETF_UNWIND")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "SELL")
+        self.assertEqual(plan.reason, "etf_target_price_reached")
+
     def test_fill_after_position_update_does_not_double_count_inventory(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
         strategy.on_a_news_reaction(
@@ -194,8 +217,84 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(len(first.aggressive_actions), 1)
         self.assertEqual(len(second.aggressive_actions), 1)
         self.assertTrue(second.aggressive_actions[0].aggressive)
-        self.assertEqual(expired.reason, "etf_entry_retry_window_expired")
+        self.assertEqual(expired.reason, "entry_retry_window_expired")
         self.assertIsNone(strategy.active_signal)
+
+    def test_partial_entry_does_not_force_unwind_just_because_churn_guard_is_active(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        strategy.sync_inventory_from_exchange(8, now_ms=1_200)
+        strategy._churn_guard_reason = "crossed_or_locked_etf_book"
+        strategy._stable_book_since_ms = None
+
+        plan = strategy.compute_quotes(
+            now_ms=1_250,
+            a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": 1},
+        )
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.mode, "ETF_CHURN_GUARD")
+        self.assertEqual(plan.reason, "crossed_or_locked_etf_book")
+        self.assertIsNotNone(strategy.active_signal)
+        self.assertEqual(strategy.inventory, 8)
+
+    def test_c_projection_creates_c_origin_signal(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+
+        signal = strategy.on_shock_projection(
+            ETFShockProjection(
+                source_market="C",
+                source_kind="structured_earnings",
+                source_signal_id="c_earnings_1",
+                fair_shift_ticks=100.0,
+                alpha=0.25,
+                source_target_inventory=120,
+                source_combo="C_only",
+                source_direction=1,
+            ),
+            now_ms=1_100,
+        )
+        assert signal is not None
+        strategy.activate_signal(signal)
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.source_market, "C")
+        self.assertEqual(signal.source_combo, "C_only")
+        self.assertEqual(signal.target_inventory, 50)
+        state = strategy.trace_state(1_100)
+        self.assertEqual(state["etf_source_market"], "C")
+        self.assertEqual(state["etf_source_combo"], "C_only")
+
+    def test_preview_projection_reports_target_inventory(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+
+        preview = strategy.preview_projection(
+            ETFShockProjection(
+                source_market="C",
+                source_kind="structured_earnings",
+                source_signal_id="c_earnings_2",
+                fair_shift_ticks=120.0,
+                alpha=0.25,
+                source_target_inventory=200,
+                source_combo="A_C_aligned",
+                source_direction=1,
+            )
+        )
+
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview["direction"], 1)
+        self.assertEqual(preview["target_inventory"], 50)
+        self.assertEqual(preview["target_from_source_position"], 70)
 
     def test_cancel_response_does_not_clear_unfilled_signal(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
@@ -336,6 +435,36 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(plan.reason, "etf_quote_churn_guard")
         self.assertIsNotNone(strategy.active_signal)
 
+    def test_churn_guard_does_not_block_reduce_only_unwind(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        strategy.sync_inventory_from_exchange(-16, now_ms=1_120)
+        for offset in range(26):
+            strategy.on_book_update_at(
+                "ETF",
+                FakeOrderBook(
+                    bids={998 + offset: 10},
+                    asks={1002 + offset: 10},
+                ),
+                now_ms=1_200 + offset,
+            )
+
+        plan = strategy.compute_quotes(now_ms=1_230, a_state={"mode": "AYUSH_IDLE", "shock_direction": 0})
+
+        self.assertEqual(plan.mode, "ETF_UNWIND")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "BUY")
+        self.assertEqual(strategy.trace_state(1_230)["block_reason"], "a_shock_lifecycle_inactive")
+
     def test_churn_guard_clears_after_stable_book_period(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
         strategy.on_a_news_reaction(
@@ -358,6 +487,51 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(still_blocked.reason, "crossed_or_locked_etf_book")
         self.assertEqual(len(resumed.aggressive_actions), 1)
         self.assertTrue(resumed.aggressive_actions[0].aggressive)
+
+    def test_opposite_signal_flattens_before_handoff(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        first = strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        self.assertIsNotNone(first)
+        strategy.sync_inventory_from_exchange(20, now_ms=1_200)
+
+        second = strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=0.9,
+                old_fair_value=1100,
+                new_fair_value=1000,
+            ),
+            now_ms=1_300,
+        )
+
+        self.assertIsNotNone(second)
+        self.assertEqual(strategy.active_signal.signal_id, first.signal_id)
+        self.assertEqual(strategy.pending_signal.signal_id, second.signal_id)
+
+        flatten_plan = strategy.compute_quotes(now_ms=1_301, a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": 1})
+        self.assertEqual(flatten_plan.mode, "ETF_UNWIND")
+        self.assertEqual(len(flatten_plan.aggressive_actions), 1)
+        self.assertEqual(flatten_plan.aggressive_actions[0].side, "SELL")
+
+        strategy.sync_inventory_from_exchange(0, now_ms=1_400)
+        next_plan = strategy.compute_quotes(now_ms=1_401, a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": -1})
+
+        self.assertIsNotNone(strategy.active_signal)
+        self.assertEqual(strategy.active_signal.signal_id, second.signal_id)
+        self.assertIsNone(strategy.pending_signal)
+        self.assertEqual(next_plan.mode, "ETF_A_SHOCK")
+        self.assertEqual(len(next_plan.aggressive_actions), 1)
+        self.assertEqual(next_plan.aggressive_actions[0].side, "SELL")
 
     def test_retry_window_reports_guard_reason_if_guard_persists(self) -> None:
         strategy = self.make_strategy(alpha=0.25)

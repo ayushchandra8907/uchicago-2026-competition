@@ -17,6 +17,7 @@ try:
     from a_bot_config import load_bot_config
     from b_mean_reversion import BMeanReversionStrategy
     from b_underlying_mm_v2 import BUnderlyingMMv2
+    from etf_a_follower import ETFShockProjection
     from testing1 import MarketABot
 except (ModuleNotFoundError, SystemExit):
     MarketABot = None
@@ -152,6 +153,7 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         bot.b_strategy = _FakeBStrategy()
         bot.b_option_strategy = None
         bot.etf_strategy = None
+        bot.c_strategy = None
         bot.order_books = {"B": object(), "B_C_1000": object()}
         bot.tracer = None
         bot._now_ms = lambda: 1_000
@@ -189,6 +191,7 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         bot.etf_strategy = SimpleNamespace(
             on_a_news_reaction=lambda reaction, now_ms: SimpleNamespace(signal_id="etf_a_1"),
         )
+        bot.c_strategy = None
         bot.tracer = None
         bot._now_ms = lambda: 1_000
         calls: list[str] = []
@@ -253,3 +256,74 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
                     os.environ[key] = old_value
 
         self.assertIsInstance(bot.b_strategy, BUnderlyingMMv2)
+
+    async def test_c_enabled_constructs_c_strategy(self) -> None:
+        env_keys = {
+            "UTC_HOST": "practice.uchicago.exchange:3333",
+            "UTC_USERNAME": "user",
+            "UTC_PASSWORD": "pass",
+            "TRACE_ENABLED": "0",
+            "C_ENABLED": "1",
+            "C_TRADING_ENABLED": "1",
+            "C_LIVE_EARNINGS_ENABLED": "1",
+        }
+        old_values = {key: os.environ.get(key) for key in env_keys}
+        try:
+            os.environ.update(env_keys)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config = load_bot_config(Path(temp_dir))
+                bot = MarketABot(config)
+        finally:
+            for key, old_value in old_values.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+        self.assertIsNotNone(bot.c_strategy)
+        self.assertTrue(bot.config.market_c.enabled)
+        self.assertEqual(tuple(bot.config.market_c.pm_symbols), ("R_HIKE", "R_HOLD", "R_CUT"))
+
+    async def test_c_etf_projection_suppresses_conflicting_a_signal(self) -> None:
+        bot = MarketABot.__new__(MarketABot)
+        bot.config = SimpleNamespace(
+            etf=SimpleNamespace(
+                enable_c_earnings=True,
+                alpha_from_c_earnings=0.25,
+                min_c_fair_shift_ticks=60,
+                ac_conflict_policy="suppress",
+                max_position=100,
+            ),
+            market_c=SimpleNamespace(symbol="C", pm_symbols=("R_HIKE", "R_HOLD", "R_CUT")),
+        )
+        bot._etf_trading_enabled = True
+        bot.etf_strategy = SimpleNamespace(
+            preview_projection=lambda projection: {"direction": 1, "target_inventory": 40},
+            on_shock_projection=lambda projection, now_ms: None,
+        )
+        bot.c_strategy = SimpleNamespace(
+            active_etf_projection=lambda: {
+                "source_market": "C",
+                "source_kind": "structured_earnings",
+                "source_signal_id": "c_earnings_1",
+                "fair_shift_ticks": 120.0,
+                "source_target_inventory": 120,
+                "source_direction": 1,
+            }
+        )
+        bot.tracer = None
+        bot._current_cash = lambda: None
+        bot._trace_state_for_symbol = lambda symbol, now_ms: {"mode": "POST_EARNINGS_SHOCK", "shock_direction": -1, "symbol": symbol}
+        bot._evaluate_and_sync_etf = _FakeAsync()
+
+        await bot._maybe_emit_c_etf_projection("C earnings signal", now_ms=1_000)
+
+        self.assertEqual(bot._evaluate_and_sync_etf.await_count, 0)
+
+
+class _FakeAsync:
+    def __init__(self) -> None:
+        self.await_count = 0
+
+    async def __call__(self, *args, **kwargs) -> None:
+        self.await_count += 1

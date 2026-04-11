@@ -10,20 +10,40 @@ from a_bot_strategy import BookSnapshot, DesiredOrder, NewsReaction, OrderManage
 
 
 @dataclass(frozen=True)
+class ETFShockProjection:
+    source_market: str
+    source_kind: str
+    source_signal_id: str | None
+    fair_shift_ticks: float
+    alpha: float
+    source_target_inventory: int | None = None
+    source_combo: str = "A_only"
+    target_inventory_override: int | None = None
+    source_direction: int | None = None
+
+
+@dataclass(frozen=True)
 class ETFASignal:
     signal_id: str
+    source_market: str
     source_signal_id: str | None
+    source_combo: str
     source_kind: str
     started_ms: int
     alpha: float
+    source_fair_shift: float
     a_fair_shift: float
     projected_etf_shift: float
     base_mid: float
     target_fair: float
     target_inventory: int
     source_target_inventory: int | None
-    target_from_a_position: int | None
+    target_from_source_position: int | None
     source_direction: int
+
+    @property
+    def target_from_a_position(self) -> int | None:
+        return self.target_from_source_position
 
 
 @dataclass
@@ -56,6 +76,7 @@ class ETFAFollowerStrategy:
         self.last_trade_ms: int | None = None
         self.mode = "ETF_OBSERVE_ONLY"
         self.active_signal: ETFASignal | None = None
+        self.pending_signal: ETFASignal | None = None
         self._signal_seq = 0
         self.last_block_reason: str | None = None
         self.unwind_reason: str | None = None
@@ -152,71 +173,163 @@ class ETFAFollowerStrategy:
         if abs(a_fair_shift) < max(0, int(self.config.min_a_fair_shift_ticks)):
             self.last_block_reason = "a_fair_shift_too_small"
             return None
-        if self.book.mid is None:
-            self.last_block_reason = "missing_etf_book_for_signal"
-            return None
-
-        chosen_alpha = self._bounded_alpha(self.config.alpha_from_a if alpha is None else alpha)
-        projected_shift = chosen_alpha * a_fair_shift
-        if abs(projected_shift) < max(0, int(self.config.min_projected_edge_ticks)):
-            self.last_block_reason = "projected_etf_shift_too_small"
-            return None
-
-        direction = 1 if projected_shift > 0 else -1
-        target_inventory = int(round(abs(projected_shift) * float(self.config.target_position_per_etf_tick)))
         source_target = (
             reaction.shock_target_inventory
             if reaction.shock_target_inventory is not None
             else (reaction.news_target_inventory or reaction.pending_news_target_inventory)
         )
-        target_from_a_position: int | None = None
-        if source_target is not None and int(source_target) * direction > 0:
-            target_from_a_position = int(
-                round(abs(int(source_target)) * float(self.config.target_position_per_a_shock_inventory))
-            )
-            target_inventory = max(target_inventory, target_from_a_position)
-        major_shock = (
-            abs(a_fair_shift) >= int(self.config.major_a_shock_fair_shift_ticks)
-            or (source_target is not None and abs(int(source_target)) >= int(self.config.major_a_shock_target_inventory))
-        )
-        if major_shock:
-            target_inventory = max(target_inventory, int(self.config.min_target_position_for_major_a_shock))
-        target_inventory = max(1, min(int(self.config.max_position), target_inventory))
-        target_inventory *= direction
-
-        self._signal_seq += 1
-        signal = ETFASignal(
-            signal_id=f"etf_a_{self._signal_seq}",
-            source_signal_id=source_signal_id,
+        projection = ETFShockProjection(
+            source_market="A",
             source_kind=source_kind,
-            started_ms=int(now_ms),
-            alpha=chosen_alpha,
-            a_fair_shift=a_fair_shift,
-            projected_etf_shift=projected_shift,
-            base_mid=float(self.book.mid),
-            target_fair=float(self.book.mid) + projected_shift,
-            target_inventory=target_inventory,
+            source_signal_id=source_signal_id,
+            fair_shift_ticks=a_fair_shift,
+            alpha=self.config.alpha_from_a if alpha is None else alpha,
             source_target_inventory=source_target,
-            target_from_a_position=target_from_a_position,
-            source_direction=direction,
+            source_combo="A_only",
+            source_direction=reaction.shock_direction or None,
         )
+        signal = self.on_shock_projection(projection, now_ms=now_ms)
+        if signal is None:
+            return None
+        return self.activate_signal(signal)
+
+    def activate_signal(self, signal: ETFASignal) -> ETFASignal:
+        active = self.active_signal
+        if (
+            active is not None
+            and active.source_direction != signal.source_direction
+            and (self.inventory != 0 or self._has_live_orders())
+        ):
+            active_diag = self.entry_diagnostics.setdefault(active.signal_id, ETFEntryDiagnostics())
+            if active_diag.terminal_reason is None:
+                active_diag.terminal_reason = "handoff_flatten"
+            self.pending_signal = signal
+            self.mode = "ETF_HANDOFF_FLATTEN"
+            self.last_block_reason = "etf_signal_handoff_pending"
+            self.unwind_reason = "handoff_flatten"
+            return signal
+        self.pending_signal = None
         self.active_signal = signal
-        self.entry_diagnostics[signal.signal_id] = ETFEntryDiagnostics()
         self.mode = "ETF_A_SHOCK"
         self.last_block_reason = None
         self.unwind_reason = None
         return signal
 
-    def compute_quotes(self, *, now_ms: int, a_state: dict[str, Any] | None = None) -> QuotePlan:
+    def on_shock_projection(self, projection: ETFShockProjection, *, now_ms: int) -> ETFASignal | None:
+        if not self.config.enabled or not self.config.trading_enabled:
+            return None
+        preview = self.preview_projection(projection)
+        if preview is None:
+            return None
+        fair_shift = float(preview["fair_shift"])
+        chosen_alpha = float(preview["alpha"])
+        projected_shift = float(preview["projected_shift"])
+        direction = int(preview["direction"])
+        target_inventory = int(preview["target_inventory"])
+        target_from_source_position = preview["target_from_source_position"]
+
+        self._signal_seq += 1
+        signal_id = f"etf_{str(projection.source_market).lower()}_{self._signal_seq}"
+        signal = ETFASignal(
+            signal_id=signal_id,
+            source_market=str(projection.source_market),
+            source_signal_id=projection.source_signal_id,
+            source_combo=str(projection.source_combo or "A_only"),
+            source_kind=str(projection.source_kind),
+            started_ms=int(now_ms),
+            alpha=chosen_alpha,
+            source_fair_shift=fair_shift,
+            a_fair_shift=fair_shift if str(projection.source_market).upper() == "A" else 0.0,
+            projected_etf_shift=projected_shift,
+            base_mid=float(self.book.mid),
+            target_fair=float(self.book.mid) + projected_shift,
+            target_inventory=target_inventory,
+            source_target_inventory=projection.source_target_inventory,
+            target_from_source_position=target_from_source_position,
+            source_direction=direction,
+        )
+        self.entry_diagnostics[signal.signal_id] = ETFEntryDiagnostics()
+        return signal
+
+    def preview_projection(self, projection: ETFShockProjection) -> dict[str, Any] | None:
+        if self.book.mid is None:
+            self.last_block_reason = "missing_etf_book_for_signal"
+            return None
+        fair_shift = float(projection.fair_shift_ticks)
+        chosen_alpha = self._bounded_alpha(float(projection.alpha))
+        projected_shift = chosen_alpha * fair_shift
+        if abs(projected_shift) < max(0, int(self.config.min_projected_edge_ticks)):
+            self.last_block_reason = "projected_etf_shift_too_small"
+            return None
+
+        direction = int(projection.source_direction or (1 if projected_shift > 0 else -1))
+        target_inventory = (
+            int(projection.target_inventory_override)
+            if projection.target_inventory_override is not None
+            else int(round(abs(projected_shift) * float(self.config.target_position_per_etf_tick)))
+        )
+        target_from_source_position: int | None = None
+        if projection.source_target_inventory is not None and int(projection.source_target_inventory) * direction > 0:
+            target_from_source_position = int(
+                round(abs(int(projection.source_target_inventory)) * float(self.config.target_position_per_a_shock_inventory))
+            )
+            target_inventory = max(target_inventory, target_from_source_position)
+        major_shock = (
+            abs(fair_shift) >= int(self.config.major_a_shock_fair_shift_ticks)
+            or (
+                projection.source_target_inventory is not None
+                and abs(int(projection.source_target_inventory)) >= int(self.config.major_a_shock_target_inventory)
+            )
+        )
+        if major_shock:
+            target_inventory = max(target_inventory, int(self.config.min_target_position_for_major_a_shock))
+        target_inventory = max(1, min(int(self.config.max_position), int(target_inventory))) * direction
+        return {
+            "fair_shift": fair_shift,
+            "alpha": chosen_alpha,
+            "projected_shift": projected_shift,
+            "direction": direction,
+            "target_inventory": int(target_inventory),
+            "target_from_source_position": target_from_source_position,
+        }
+
+    def compute_quotes(
+        self,
+        *,
+        now_ms: int,
+        a_state: dict[str, Any] | None = None,
+        c_state: dict[str, Any] | None = None,
+    ) -> QuotePlan:
+        if self.pending_signal is not None:
+            pending_diag = self.entry_diagnostics.setdefault(self.pending_signal.signal_id, ETFEntryDiagnostics())
+            pending_elapsed_ms = int(now_ms) - int(self.pending_signal.started_ms)
+            if pending_diag.first_fill_ms is None and pending_elapsed_ms >= int(self.config.entry_retry_window_ms):
+                pending_diag.terminal_reason = "entry_retry_window_expired"
+                self.pending_signal = None
+            elif self.inventory == 0 and not self._has_live_orders():
+                self.active_signal = self.pending_signal
+                self.pending_signal = None
+                self.mode = "ETF_A_SHOCK"
+                self.last_block_reason = None
+                self.unwind_reason = None
+            elif self.inventory == 0 and self._has_live_orders():
+                self.mode = "ETF_HANDOFF_FLATTEN"
+                self.last_block_reason = "handoff_flatten"
+                return QuotePlan("ETF_HANDOFF_FLATTEN", None, None, (), False, "waiting_for_etf_order_cancel_before_handoff")
+            else:
+                self.mode = "ETF_HANDOFF_FLATTEN"
+                self.last_block_reason = "handoff_flatten"
+                self.unwind_reason = "handoff_flatten"
+                return self._unwind_plan(now_ms, reason="handoff_flatten", allow_only_if_flat=False)
         signal = self.active_signal
         if signal is None:
             self.mode = "ETF_OBSERVE_ONLY"
             return QuotePlan(self.mode, None, None, (), True, "waiting_for_a_shock_signal")
         diag = self.entry_diagnostics.setdefault(signal.signal_id, ETFEntryDiagnostics())
         elapsed_ms = int(now_ms) - int(signal.started_ms)
-        active_guard_reason = self._active_entry_guard_reason(now_ms)
         if diag.first_fill_ms is None and self.inventory == 0 and elapsed_ms >= int(self.config.entry_retry_window_ms):
-            diag.terminal_reason = active_guard_reason or "etf_entry_retry_window_expired"
+            active_guard_reason = self._active_entry_guard_reason(now_ms)
+            diag.terminal_reason = active_guard_reason or "entry_retry_window_expired"
             self.last_block_reason = diag.terminal_reason
             self.active_signal = None
             self.mode = "ETF_OBSERVE_ONLY"
@@ -225,26 +338,32 @@ class ETFAFollowerStrategy:
             self.mode = "ETF_CHURN_GUARD"
             self.last_block_reason = "missing_etf_book"
             return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, "missing_etf_book")
-        if active_guard_reason is not None:
-            self.mode = "ETF_CHURN_GUARD"
-            self.last_block_reason = active_guard_reason
-            return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
-        if int(self.book.spread) < max(1, int(self.config.min_book_spread_ticks)):
-            self.last_block_reason = "etf_book_too_tight_or_crossed"
-            return self._unwind_plan(now_ms, reason="etf_book_too_tight_or_crossed", allow_only_if_flat=False)
 
         if self.mode == "ETF_A_SHOCK" and self._target_reached(signal):
             diag.terminal_reason = "etf_target_reached"
             self.mode = "ETF_A_HOLD"
 
         if self.mode in {"ETF_A_SHOCK", "ETF_A_HOLD"}:
-            should_unwind, unwind_reason = self._should_unwind(signal, elapsed_ms, a_state)
+            should_unwind, unwind_reason = self._should_unwind(signal, elapsed_ms, a_state, c_state)
             if should_unwind:
                 self.mode = "ETF_UNWIND"
                 self.unwind_reason = unwind_reason
 
         if self.mode == "ETF_UNWIND":
             return self._unwind_plan(now_ms, reason=self.unwind_reason or "unwinding_etf_a_follower")
+
+        active_guard_reason = self._active_entry_guard_reason(now_ms)
+        if active_guard_reason is not None:
+            if self.inventory != 0:
+                self.mode = "ETF_CHURN_GUARD"
+                self.last_block_reason = "entry_blocked_by_churn_guard"
+                return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
+            self.mode = "ETF_CHURN_GUARD"
+            self.last_block_reason = "entry_blocked_by_churn_guard"
+            return QuotePlan("ETF_CHURN_GUARD", None, None, (), True, active_guard_reason)
+        if int(self.book.spread) < max(1, int(self.config.min_book_spread_ticks)):
+            self.last_block_reason = "etf_book_too_tight_or_crossed"
+            return self._unwind_plan(now_ms, reason="etf_book_too_tight_or_crossed", allow_only_if_flat=False)
 
         if self.mode == "ETF_A_HOLD":
             if abs(signal.target_inventory - int(self.inventory)) >= max(1, int(self.config.quote_size)):
@@ -288,16 +407,20 @@ class ETFAFollowerStrategy:
             "last_trade_qty": self.last_trade_qty,
             "last_trade_ms": self.last_trade_ms,
             "etf_signal_id": None if signal is None else signal.signal_id,
+            "etf_pending_signal_id": None if self.pending_signal is None else self.pending_signal.signal_id,
             "etf_alpha_from_a": None if signal is None else signal.alpha,
+            "etf_source_market": None if signal is None else signal.source_market,
+            "etf_source_combo": None if signal is None else signal.source_combo,
             "etf_source_signal_id": None if signal is None else signal.source_signal_id,
             "etf_source_signal_kind": None if signal is None else signal.source_kind,
+            "etf_source_fair_shift": None if signal is None else signal.source_fair_shift,
             "etf_a_fair_shift": None if signal is None else signal.a_fair_shift,
             "etf_projected_shift": None if signal is None else signal.projected_etf_shift,
             "etf_base_mid": None if signal is None else signal.base_mid,
             "etf_target_fair": None if signal is None else signal.target_fair,
             "etf_target_inventory": None if signal is None else signal.target_inventory,
             "etf_source_target_inventory": None if signal is None else signal.source_target_inventory,
-            "etf_target_from_a_position": None if signal is None else signal.target_from_a_position,
+            "etf_target_from_a_position": None if signal is None else signal.target_from_source_position,
             "etf_source_direction": None if signal is None else signal.source_direction,
             "etf_unwind_reason": self.unwind_reason,
             "etf_entry_order_attempt_count": None if diag is None else diag.order_attempt_count,
@@ -314,6 +437,7 @@ class ETFAFollowerStrategy:
             "etf_missed_entry_terminal_reason": None if diag is None else diag.terminal_reason,
             "etf_churn_guard_reason": self._churn_guard_reason,
             "etf_churn_guard_active": self._active_entry_guard_reason(now_ms) is not None,
+            "etf_handoff_pending": self.pending_signal is not None,
             "etf_book_change_count_250ms": len(self._top_of_book_change_ms),
             "etf_stable_book_age_ms": (
                 None if self._stable_book_since_ms is None else max(0, int(now_ms) - int(self._stable_book_since_ms))
@@ -324,16 +448,19 @@ class ETFAFollowerStrategy:
     def signal_payload(self, signal: ETFASignal) -> dict[str, Any]:
         return {
             "signal_id": signal.signal_id,
+            "source_market": signal.source_market,
+            "source_combo": signal.source_combo,
             "source_signal_id": signal.source_signal_id,
             "source_kind": signal.source_kind,
             "alpha": signal.alpha,
+            "source_fair_shift": signal.source_fair_shift,
             "a_fair_shift": signal.a_fair_shift,
             "projected_etf_shift": signal.projected_etf_shift,
             "base_mid": signal.base_mid,
             "target_fair": signal.target_fair,
             "target_inventory": signal.target_inventory,
             "source_target_inventory": signal.source_target_inventory,
-            "target_from_a_position": signal.target_from_a_position,
+            "target_from_a_position": signal.target_from_source_position,
             "source_direction": signal.source_direction,
             "alpha_max": self.config.alpha_max,
             "alpha_step": self.config.alpha_step,
@@ -375,23 +502,29 @@ class ETFAFollowerStrategy:
                 diag.terminal_reason = reason
             self.active_signal = None
             self.mode = "ETF_OBSERVE_ONLY"
+            self.last_block_reason = "etf_a_follower_flat"
             return QuotePlan(self.mode, None, None, (), True, "etf_a_follower_flat")
         live_buy = self.order_manager.live_order("BUY")
         live_sell = self.order_manager.live_order("SELL")
         if self.inventory > 0 and live_buy is not None and not live_buy.cancel_pending:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "waiting_for_buy_cancel_before_sell_unwind")
+            self.last_block_reason = "unwind_waiting_for_cancel"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_cancel")
         if self.inventory < 0 and live_sell is not None and not live_sell.cancel_pending:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "waiting_for_sell_cancel_before_buy_unwind")
+            self.last_block_reason = "unwind_waiting_for_cancel"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_cancel")
         if self.book.best_bid is None or self.book.best_ask is None:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "missing_etf_book_for_unwind")
+            self.last_block_reason = "unwind_waiting_for_fill"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_fill")
         if allow_only_if_flat and self.book.spread is not None and int(self.book.spread) <= 0:
-            return QuotePlan("ETF_UNWIND", None, None, (), True, "waiting_for_uncrossed_etf_unwind_book")
+            self.last_block_reason = "unwind_waiting_for_fill"
+            return QuotePlan("ETF_UNWIND", None, None, (), True, "unwind_waiting_for_fill")
         side = "SELL" if self.inventory > 0 else "BUY"
         px = self.book.best_bid.px if side == "SELL" else self.book.best_ask.px
         qty = min(abs(int(self.inventory)), max(1, int(self.config.quote_size)))
         signal_id = self.active_signal.signal_id if self.active_signal is not None else f"etf_unwind_{int(now_ms)}"
         order = self._desired(side, px, qty, reason=reason, signal_id=signal_id, action_class="etf_shock_unwind")
         self.mode = "ETF_UNWIND"
+        self.last_block_reason = reason
         return QuotePlan("ETF_UNWIND", None, None, (order,), False, reason)
 
     def _target_reached(self, signal: ETFASignal) -> bool:
@@ -412,20 +545,60 @@ class ETFAFollowerStrategy:
         signal: ETFASignal,
         elapsed_ms: int,
         a_state: dict[str, Any] | None,
+        c_state: dict[str, Any] | None,
     ) -> tuple[bool, str]:
         if elapsed_ms >= int(self.config.max_hold_ms):
             return True, "etf_max_hold_elapsed"
+        if self.inventory != 0 and elapsed_ms >= int(self.config.min_hold_ms) and self._target_price_reached(signal):
+            return True, "etf_target_price_reached"
+
+        if signal.source_market == "A":
+            a_snapshot = a_state or {}
+            a_mode = str(a_snapshot.get("mode") or "")
+            a_active = a_mode in {"POST_EARNINGS_SHOCK", "POST_NEWS_SHOCK"}
+            a_direction = int(a_snapshot.get("shock_direction") or 0)
+            if a_active and a_direction and a_direction != signal.source_direction:
+                return True, "a_shock_direction_flipped"
+            if "mode" in a_snapshot and not a_active:
+                if self.inventory == 0:
+                    return True, "a_signal_invalidated_before_entry"
+                return True, "a_shock_lifecycle_inactive"
+            if elapsed_ms < int(self.config.min_hold_ms):
+                return False, ""
+            return False, ""
+
+        if signal.source_market == "C":
+            c_snapshot = c_state or {}
+            c_mode = str(c_snapshot.get("mode") or "")
+            c_active = c_mode in {"C_EARNINGS_SHOCK", "C_EARNINGS_UNWIND"}
+            c_direction = int(c_snapshot.get("c_shock_target_inventory") or 0)
+            if c_direction:
+                c_direction = 1 if c_direction > 0 else -1
+            if c_active and c_direction and c_direction != signal.source_direction:
+                return True, "c_shock_direction_flipped"
+            if "mode" in c_snapshot and not c_active:
+                if self.inventory == 0:
+                    return True, "c_signal_invalidated_before_entry"
+                return True, "c_shock_lifecycle_inactive"
+            if elapsed_ms < int(self.config.min_hold_ms):
+                return False, ""
+            return False, ""
 
         a_mode = str((a_state or {}).get("mode") or "")
         a_active = a_mode in {"POST_EARNINGS_SHOCK", "POST_NEWS_SHOCK"}
         a_direction = int((a_state or {}).get("shock_direction") or 0)
-        if a_active and a_direction and a_direction != signal.source_direction:
-            return True, "a_shock_direction_flipped"
-
+        c_mode = str((c_state or {}).get("mode") or "")
+        c_active = c_mode in {"C_EARNINGS_SHOCK", "C_EARNINGS_UNWIND"}
+        c_direction = int((c_state or {}).get("c_shock_target_inventory") or 0)
+        c_direction = 1 if c_direction > 0 else -1 if c_direction < 0 else 0
+        if a_active and c_active and a_direction and c_direction and a_direction != c_direction:
+            return True, "a_c_shock_conflict"
         if elapsed_ms < int(self.config.min_hold_ms):
             return False, ""
-        if not a_active:
-            return True, "a_shock_lifecycle_inactive_after_min_hold"
+        if not a_active and not c_active:
+            if self.inventory == 0:
+                return True, "source_signal_invalidated_before_entry"
+            return True, "source_shock_lifecycle_inactive_after_min_hold"
         return False, ""
 
     def _bounded_alpha(self, value: float | None) -> float:
@@ -512,3 +685,9 @@ class ETFAFollowerStrategy:
         if stable_age < int(self.config.churn_resume_stable_ms):
             return self._churn_guard_reason
         return None
+
+    def _has_live_orders(self) -> bool:
+        return any(
+            order is not None and not order.cancel_pending
+            for order in (self.order_manager.live_order("BUY"), self.order_manager.live_order("SELL"))
+        )

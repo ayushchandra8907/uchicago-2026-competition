@@ -1,1 +1,0 @@
-event_index,session_id,run_id,wall_time_iso,wall_time_ns,monotonic_ns,exchange_tick,round,day,symbol,trade_px,trade_qty,mid_at_trade,spread_at_trade,time_since_last_symbol_news,latest_known_eps_for_symbol

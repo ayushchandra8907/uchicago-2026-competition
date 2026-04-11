@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 
@@ -9,7 +10,7 @@ BOT_DIR = Path(__file__).resolve().parents[1]
 if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
-from a_bot_config import RiskConfig
+from a_bot_config import AConfig, RiskConfig
 from ayush_a_port import AyushPortStrategy
 
 
@@ -22,6 +23,7 @@ class FakeOrderBook:
 class AyushPortStrategyTests(unittest.TestCase):
     def make_strategy(self, *, initial_fair_value: int | None = None) -> AyushPortStrategy:
         return AyushPortStrategy(
+            a_config=AConfig(),
             risk=RiskConfig(
                 reprice_cooldown_ms=0,
                 passive_reprice_threshold_ticks=2,
@@ -184,6 +186,66 @@ class AyushPortStrategyTests(unittest.TestCase):
         self.assertEqual(shock_plan.mode, "POST_NEWS_SHOCK")
         self.assertEqual(len(shock_plan.aggressive_actions), 1)
         self.assertEqual(shock_plan.aggressive_actions[0].side, "BUY")
+
+    def test_earnings_shock_buy_above_fair_guard_is_blocked(self) -> None:
+        strategy = AyushPortStrategy(
+            a_config=AConfig(earnings_shock_entry_guard_ticks=24),
+            risk=RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=2, passive_quote_ttl_ms=3_000),
+            initial_fair_value=1_000,
+            book_depth_levels=5,
+        )
+        strategy._strategy.fair_value = 1_000
+
+        plan = strategy._translate_decision(
+            SimpleNamespace(
+                mode="SHOCK",
+                observe_only=False,
+                reason="shock",
+                desired_order=SimpleNamespace(
+                    side="BUY",
+                    px=1_040,
+                    qty=12,
+                    aggressive=True,
+                    reason="shock buy",
+                    intent="post_earnings_shock_take",
+                ),
+            )
+        )
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "a_shock_price_guard_blocked")
+        self.assertEqual(strategy.trace_state(0)["a_shock_entry_price_vs_fair"], 40)
+        self.assertTrue(strategy.trace_state(0)["a_shock_price_guard_blocked"])
+
+    def test_earnings_shock_sell_below_fair_guard_is_blocked(self) -> None:
+        strategy = AyushPortStrategy(
+            a_config=AConfig(earnings_shock_entry_guard_ticks=24),
+            risk=RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=2, passive_quote_ttl_ms=3_000),
+            initial_fair_value=1_000,
+            book_depth_levels=5,
+        )
+        strategy._strategy.fair_value = 1_000
+
+        plan = strategy._translate_decision(
+            SimpleNamespace(
+                mode="SHOCK",
+                observe_only=False,
+                reason="shock",
+                desired_order=SimpleNamespace(
+                    side="SELL",
+                    px=960,
+                    qty=12,
+                    aggressive=True,
+                    reason="shock sell",
+                    intent="post_earnings_shock_take",
+                ),
+            )
+        )
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "a_shock_price_guard_blocked")
+        self.assertEqual(strategy.trace_state(0)["a_shock_entry_price_vs_fair"], 40)
+        self.assertEqual(strategy.trace_state(0)["a_shock_entry_block_count"], 1)
 
 
 if __name__ == "__main__":

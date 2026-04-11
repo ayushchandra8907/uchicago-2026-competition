@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from a_bot_config import BConfig, RiskConfig
-from a_bot_strategy import BookSnapshot, DesiredOrder, OrderManager, QuotePlan
+from a_bot_strategy import BookSnapshot, CancelCommand, DesiredOrder, OrderManager, QuotePlan, SyncActions
 
 
 @dataclass(frozen=True)
@@ -115,6 +115,40 @@ class BMeanReversionStrategy:
 
     def on_rejection(self, order_id: str) -> Any | None:
         return self.order_manager.handle_rejection(order_id)
+
+    def build_actions(self, plan: QuotePlan, now_ms: int) -> SyncActions:
+        actions = self.order_manager.build_actions(plan, now_ms)
+        desired_side: str | None = None
+        if plan.aggressive_actions:
+            desired_side = str(plan.aggressive_actions[0].side)
+        elif plan.bid is not None:
+            desired_side = "BUY"
+        elif plan.ask is not None:
+            desired_side = "SELL"
+        if desired_side not in {"BUY", "SELL"}:
+            return actions
+
+        opposite_side = "SELL" if desired_side == "BUY" else "BUY"
+        opposite_live = self.order_manager.live_order(opposite_side)  # type: ignore[arg-type]
+        if opposite_live is None:
+            return actions
+
+        cancels = list(actions.cancels)
+        if (
+            not opposite_live.cancel_pending
+            and all(cancel.order_id != opposite_live.order_id for cancel in cancels)
+        ):
+            cancels.append(
+                CancelCommand(
+                    order_id=opposite_live.order_id,
+                    side=opposite_side,  # type: ignore[arg-type]
+                    reason="single-intent B mean-reversion handoff",
+                )
+            )
+
+        placements = [placement for placement in actions.placements if placement.side != desired_side]
+        self.last_block_reason = "b_meanrev_waiting_for_opposite_cancel"
+        return SyncActions(cancels=tuple(cancels), placements=tuple(placements))
 
     def compute_quotes(self, *, now_ms: int, residual_payload: dict[str, Any] | None) -> QuotePlan:
         self.last_block_reason = None
@@ -290,8 +324,17 @@ class BMeanReversionStrategy:
             self.last_block_reason = "b_meanrev_max_hold_elapsed"
             return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion max hold exit", bool(self.config.meanrev_aggressive_exit)
 
-        if abs_deviation <= float(self.config.meanrev_exit_ticks) and self.inventory != 0:
-            return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean reverted inside exit band", False
+        if self.inventory != 0 and (
+            abs_deviation <= float(self.config.meanrev_exit_ticks)
+            or abs_z <= float(self.config.meanrev_exit_z)
+        ):
+            return (
+                0,
+                "B_MEANREV_EXIT",
+                "mean_reversion_exit",
+                "B mean reverted inside exit band",
+                bool(self.config.meanrev_aggressive_exit),
+            )
 
         residual_block = self._residual_entry_block(deviation, residual_payload)
         if residual_block is not None:
@@ -311,6 +354,12 @@ class BMeanReversionStrategy:
                 return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion signal below entry; reducing", False
             return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion waiting for z-score entry", False
 
+        if abs_deviation < float(self.config.meanrev_extreme_entry_ticks) and abs_z < float(self.config.meanrev_entry_z):
+            self.last_block_reason = "b_meanrev_waiting_for_z_entry"
+            if self.inventory != 0:
+                return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion z-score below entry; reducing", False
+            return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion waiting for z-score entry", False
+
         if (
             self.inventory == 0
             and abs_deviation < float(self.config.meanrev_extreme_entry_ticks)
@@ -326,17 +375,20 @@ class BMeanReversionStrategy:
                 return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion entry cooldown", False
 
         direction = -1 if float(deviation or 0.0) > 0 else 1
-        size = (
-            int(self.config.meanrev_full_target)
-            if abs_deviation >= float(self.config.meanrev_full_entry_ticks)
-            else int(self.config.meanrev_base_target)
+        full_signal = (
+            abs_deviation >= float(self.config.meanrev_extreme_entry_ticks)
+            or (
+                abs_deviation >= float(self.config.meanrev_full_entry_ticks)
+                and abs_z >= float(self.config.meanrev_entry_z2)
+            )
         )
+        size = int(self.config.meanrev_full_target) if full_signal else int(self.config.meanrev_base_target)
         target = direction * max(0, min(int(self.config.meanrev_max_position), size))
         if abs_deviation >= float(self.config.meanrev_extreme_entry_ticks):
             aggressive = True
             entry_style = "extreme"
             reason = "B mean-reversion extreme tick-deviation entry"
-        elif abs_deviation >= float(self.config.meanrev_full_entry_ticks):
+        elif full_signal:
             aggressive = self.inventory == 0
             entry_style = "full"
             reason = "B mean-reversion full tick-deviation entry"
