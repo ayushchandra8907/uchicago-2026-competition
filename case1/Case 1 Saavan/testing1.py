@@ -206,6 +206,7 @@ class MarketABot(XChangeClient):
         self._connected_once = False
         self._awaiting_reconnect_success = False
         self._reconnect_attempt_count = 0
+        self._passive_only_mode = str(os.getenv("BOT_PASSIVE_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
         if replay_state.live_orders:
             restored_ids = ", ".join(order.order_id for order in replay_state.live_orders)
@@ -229,6 +230,8 @@ class MarketABot(XChangeClient):
             LOGGER.info("A valuation will learn a round-specific multiplier from structured earnings.")
         if self.a_trap_overlay is not None:
             LOGGER.info("A earnings trap overlay enabled for structured earnings shock experiments.")
+        if self._passive_only_mode:
+            LOGGER.warning("Global passive-only guard enabled: all strategies will submit non-marketable limit orders only.")
         if self.tracer is not None:
             LOGGER.info("Analysis mode enabled; writing trace outputs to %s", self.tracer.run_dir)
         if self.tracer is not None:
@@ -1595,6 +1598,9 @@ class MarketABot(XChangeClient):
                 LOGGER.info("Cancelling %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only("A", placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order("A", placement.qty, side, placement.px)
                 managed_order = self.strategy.order_manager.note_submitted(
@@ -1753,6 +1759,9 @@ class MarketABot(XChangeClient):
             LOGGER.info("Cancelling Ayush A %s order %s because %s", order.side, order.order_id, cancel_reason)
 
     async def _submit_ayush_order(self, desired, *, now_ms: int) -> None:
+        desired = self._sanitize_desired_for_passive_only("A", desired)
+        if desired is None:
+            return
         side = Side.BUY if desired.side == "BUY" else Side.SELL
         order_id = await self.place_order("A", desired.qty, side, desired.px)
         managed_order = self.strategy.note_submitted(order_id=order_id, desired=desired, now_ms=now_ms)
@@ -1798,6 +1807,9 @@ class MarketABot(XChangeClient):
             LOGGER.info("Cancelling A trap %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
         for placement in actions.placements:
+            placement = self._sanitize_placement_for_passive_only("A", placement)
+            if placement is None:
+                continue
             side = Side.BUY if placement.side == "BUY" else Side.SELL
             order_id = await self.place_order("A", placement.qty, side, placement.px)
             managed_order = self.a_trap_overlay.order_manager.note_submitted(
@@ -1884,6 +1896,9 @@ class MarketABot(XChangeClient):
             if not self._c_trading_enabled:
                 return
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only(self.config.market_c.symbol, placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order(self.config.market_c.symbol, placement.qty, side, placement.px)
                 managed_order = self.c_strategy.order_manager.note_submitted(
@@ -2100,6 +2115,9 @@ class MarketABot(XChangeClient):
                 LOGGER.info("Cancelling ETF %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only(self.config.etf.symbol, placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order(self.config.etf.symbol, placement.qty, side, placement.px)
                 managed_order = self.etf_strategy.order_manager.note_submitted(
@@ -2190,6 +2208,9 @@ class MarketABot(XChangeClient):
                 LOGGER.info("Cancelling B %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only(self.config.market_b.underlying_symbol, placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order(self.config.market_b.underlying_symbol, placement.qty, side, placement.px)
                 managed_order = self.b_strategy.order_manager.note_submitted(
@@ -2288,6 +2309,9 @@ class MarketABot(XChangeClient):
                     LOGGER.info("Cancelling %s %s order %s because %s", symbol, cancel.side, cancel.order_id, cancel.reason)
 
                 for placement in actions.placements:
+                    placement = self._sanitize_placement_for_passive_only(symbol, placement)
+                    if placement is None:
+                        continue
                     side = Side.BUY if placement.side == "BUY" else Side.SELL
                     order_id = await self.place_order(symbol, placement.qty, side, placement.px)
                     managed_order = self.b_option_strategy.note_submitted(
@@ -2368,6 +2392,79 @@ class MarketABot(XChangeClient):
         if exchange_inventory == strategy_inventory_before_fill + signed_qty:
             return exchange_inventory, strategy_inventory_before_fill
         return strategy_inventory_before_fill + signed_qty, strategy_inventory_before_fill
+
+    def _sanitize_desired_for_passive_only(self, symbol: str, desired):
+        if desired is None or not self._passive_only_mode:
+            return desired
+        safe_px, block_reason = self._passive_only_price(symbol, desired.side, desired.px)
+        if safe_px is None:
+            LOGGER.warning(
+                "Passive-only guard skipped %s %s order because %s.",
+                symbol,
+                desired.side,
+                block_reason,
+            )
+            return None
+        if bool(getattr(desired, "aggressive", False)) or int(desired.px) != int(safe_px):
+            LOGGER.warning(
+                "Passive-only guard adjusted %s %s order from px=%s aggressive=%s to px=%s.",
+                symbol,
+                desired.side,
+                desired.px,
+                bool(getattr(desired, "aggressive", False)),
+                safe_px,
+            )
+        return replace(desired, px=int(safe_px), aggressive=False)
+
+    def _sanitize_placement_for_passive_only(self, symbol: str, placement):
+        if placement is None or not self._passive_only_mode:
+            return placement
+        safe_px, block_reason = self._passive_only_price(symbol, placement.side, placement.px)
+        if safe_px is None:
+            LOGGER.warning(
+                "Passive-only guard skipped %s %s order because %s.",
+                symbol,
+                placement.side,
+                block_reason,
+            )
+            return None
+        if bool(getattr(placement, "aggressive", False)) or int(placement.px) != int(safe_px):
+            LOGGER.warning(
+                "Passive-only guard adjusted %s %s order from px=%s aggressive=%s to px=%s.",
+                symbol,
+                placement.side,
+                placement.px,
+                bool(getattr(placement, "aggressive", False)),
+                safe_px,
+            )
+        return replace(placement, px=int(safe_px), aggressive=False)
+
+    def _passive_only_price(self, symbol: str, side: str, requested_px: int) -> tuple[int | None, str | None]:
+        if not self._passive_only_mode:
+            return int(requested_px), None
+        book = self.order_books.get(symbol)
+        bids = getattr(book, "bids", {}) if book is not None else {}
+        asks = getattr(book, "asks", {}) if book is not None else {}
+        best_bid = max((int(px) for px, qty in bids.items() if int(qty) > 0), default=None)
+        best_ask = min((int(px) for px, qty in asks.items() if int(qty) > 0), default=None)
+        requested_px = int(requested_px)
+
+        if side == "BUY":
+            if best_bid is None:
+                return None, "missing_best_bid_for_passive_only_guard"
+            safe_px = min(requested_px, int(best_bid))
+            if best_ask is not None:
+                safe_px = min(safe_px, int(best_ask) - 1)
+            if safe_px <= 0:
+                return None, "nonpositive_passive_only_price"
+            return int(safe_px), None
+
+        if best_ask is None:
+            return None, "missing_best_ask_for_passive_only_guard"
+        safe_px = max(requested_px, int(best_ask))
+        if best_bid is not None:
+            safe_px = max(safe_px, int(best_bid) + 1)
+        return int(safe_px), None
 
     def _sync_a_inventory_from_exchange(self, inventory: int, *, now_ms: int) -> None:
         if self._ayush_port_mode:

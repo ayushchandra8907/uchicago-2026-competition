@@ -63,6 +63,7 @@ class CompetitionModeTests(unittest.TestCase):
         self.assertEqual(env["UTC_USERNAME"], "uiuc")
         self.assertEqual(env["UTC_PASSWORD"], "mesa-lynx-octopus")
         self.assertEqual(env["TRACE_ENABLED"], "0")
+        self.assertEqual(env["BOT_PASSIVE_ONLY"], "1")
         self.assertEqual(env["ETF_ENABLE_C_EARNINGS"], "0")
         self.assertEqual(env["A_EARNINGS_TRAP_ENABLED"], "1")
         self.assertEqual(env["A_EARNINGS_TRAP_MIN_FAIR_SHIFT_TICKS"], "60")
@@ -74,6 +75,7 @@ class CompetitionModeTests(unittest.TestCase):
         run_competition.apply_competition_env_defaults(env)
 
         self.assertEqual(env["UTC_HOST"], "uchicago.exchange:3333")
+        self.assertNotIn("BOT_PASSIVE_ONLY", env)
         self.assertNotIn("ETF_ENABLE_C_EARNINGS", env)
         self.assertNotIn("A_EARNINGS_TRAP_ENABLED", env)
 

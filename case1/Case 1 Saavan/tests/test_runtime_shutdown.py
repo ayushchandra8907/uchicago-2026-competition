@@ -16,6 +16,7 @@ if str(BOT_DIR) not in sys.path:
 try:
     from a_bot_config import AConfig, RiskConfig, load_bot_config
     from a_earnings_trap_overlay import AEarningsTrapOverlay
+    from a_bot_strategy import PlaceCommand
     from b_mean_reversion import BMeanReversionStrategy
     from b_underlying_mm_v2 import BUnderlyingMMv2
     from etf_a_follower import ETFShockProjection
@@ -385,6 +386,64 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(overlay.order_manager.orders["trap-1"].remaining_qty, 15)
         self.assertEqual(journal_events, [("fill", 5), ("inventory", 55)])
         self.assertEqual(eval_reasons, ["trap fill"])
+
+    async def test_passive_only_guard_demotes_aggressive_buy_to_best_bid(self) -> None:
+        bot = MarketABot.__new__(MarketABot)
+        bot._passive_only_mode = True
+        bot.order_books = {"A": SimpleNamespace(bids={1000: 5}, asks={99999: 1})}
+
+        placement = PlaceCommand(
+            side="BUY",
+            px=99999,
+            qty=10,
+            overlay="earnings",
+            aggressive=True,
+            reason="test",
+            intent="test",
+            mode_at_submit="POST_EARNINGS_SHOCK",
+            evaluation_reason="test",
+            market_key="A",
+            strategy_family="a_earnings",
+            action_class="shock_take",
+            pnl_owner="a_earnings",
+            signal_id="sig",
+            trade_group_id="sig",
+            leg_role="single",
+        )
+
+        sanitized = bot._sanitize_placement_for_passive_only("A", placement)
+
+        self.assertIsNotNone(sanitized)
+        self.assertEqual(sanitized.px, 1000)
+        self.assertFalse(sanitized.aggressive)
+
+    async def test_passive_only_guard_skips_buy_without_best_bid(self) -> None:
+        bot = MarketABot.__new__(MarketABot)
+        bot._passive_only_mode = True
+        bot.order_books = {"A": SimpleNamespace(bids={}, asks={99999: 1})}
+
+        placement = PlaceCommand(
+            side="BUY",
+            px=99999,
+            qty=10,
+            overlay="earnings",
+            aggressive=True,
+            reason="test",
+            intent="test",
+            mode_at_submit="POST_EARNINGS_SHOCK",
+            evaluation_reason="test",
+            market_key="A",
+            strategy_family="a_earnings",
+            action_class="shock_take",
+            pnl_owner="a_earnings",
+            signal_id="sig",
+            trade_group_id="sig",
+            leg_role="single",
+        )
+
+        sanitized = bot._sanitize_placement_for_passive_only("A", placement)
+
+        self.assertIsNone(sanitized)
 
 
 class _FakeAsync:
