@@ -1513,6 +1513,150 @@ class TraceTests(unittest.TestCase):
         self.assertEqual(row["signal_id"], "ayush_news_1")
         self.assertEqual(row["peak_news_inventory"], 8)
 
+    def test_etf_episode_summary_tracks_handoff_unwind_and_pending_reason(self) -> None:
+        events = [
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 900,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 3000.0,
+                "inventory": 0,
+            },
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "a_shock_projection",
+                "signal_id": "etf_a_1",
+                "etf_signal_id": "etf_a_1",
+                "payload": {
+                    "source_kind": "structured_earnings",
+                    "alpha": 0.6,
+                    "a_fair_shift": -120.0,
+                    "base_mid": 3000.0,
+                    "target_fair": 2928.0,
+                    "target_inventory": -60,
+                },
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_010,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "signal_id": "etf_a_1",
+                "action_class": "etf_shock_take",
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_020,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "etf_shock_take",
+                "signal_id": "etf_a_1",
+                "side": "SELL",
+                "fill_qty": 16,
+                "fill_price": 2995,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_030,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 2990.0,
+                "inventory": -16,
+                "etf_signal_id": "etf_a_1",
+            },
+            {
+                "event_type": "derived_signal",
+                "run_id": "run-1",
+                "monotonic_ms": 1_100,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "a_shock_projection",
+                "signal_id": "etf_a_2",
+                "etf_signal_id": "etf_a_1",
+                "block_reason": "etf_signal_handoff_pending",
+                "etf_missed_entry_terminal_reason": "handoff_flatten",
+                "payload": {
+                    "source_kind": "structured_earnings",
+                    "alpha": 0.6,
+                    "a_fair_shift": 140.0,
+                    "base_mid": 2990.0,
+                    "target_fair": 3074.0,
+                    "target_inventory": 70,
+                },
+            },
+            {
+                "event_type": "order_submitted",
+                "run_id": "run-1",
+                "monotonic_ms": 1_110,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "signal_id": "etf_a_1",
+                "action_class": "etf_shock_unwind",
+                "reason": "handoff_flatten",
+            },
+            {
+                "event_type": "order_filled",
+                "run_id": "run-1",
+                "monotonic_ms": 1_120,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "strategy_family": "etf_a_follower",
+                "action_class": "etf_shock_unwind",
+                "signal_id": "etf_a_1",
+                "side": "BUY",
+                "fill_qty": 16,
+                "fill_price": 3005,
+            },
+            {
+                "event_type": "session_state_snapshot",
+                "run_id": "run-1",
+                "monotonic_ms": 1_130,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 3002.0,
+                "inventory": 0,
+            },
+            {
+                "event_type": "session_end",
+                "run_id": "run-1",
+                "monotonic_ms": 2_000,
+                "symbol": "ETF",
+                "market_key": "ETF",
+                "mid": 3002.0,
+                "inventory": 0,
+            },
+        ]
+
+        summary = summarize_trace_events(events)
+        first_row, second_row = summary["etf_episode_summaries"]
+
+        self.assertEqual(first_row["signal_id"], "etf_a_1")
+        self.assertEqual(first_row["entry_qty"], 16)
+        self.assertEqual(first_row["unwind_qty"], 16)
+        self.assertEqual(first_row["peak_inventory"], -16)
+        self.assertEqual(first_row["avg_exit"], 3005.0)
+
+        self.assertEqual(second_row["signal_id"], "etf_a_2")
+        self.assertEqual(second_row["entry_qty"], 0)
+        self.assertEqual(second_row["peak_inventory"], 0)
+        self.assertEqual(second_row["first_block_reason"], "etf_signal_handoff_pending")
+        self.assertEqual(second_row["missed_entry_terminal_reason"], "handoff_flatten")
+        self.assertEqual(summary["etf_missed_entry_summary"]["by_reason"], {"handoff_flatten": 1})
+
     def test_b_shadow_underlying_mm_summary_is_observe_only(self) -> None:
         events = [
             {

@@ -843,25 +843,28 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
         if not signal_id:
             continue
         start_ms = int(signal_event.get("monotonic_ms", 0))
-        end_ms = int(signal_events[index + 1].get("monotonic_ms", session_end_ms)) if index + 1 < len(signal_events) else session_end_ms
-        episode_fills = [
-            event
-            for event in fill_events
-            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
-            and str(event.get("signal_id") or "") == signal_id
+        next_signal_ms = int(signal_events[index + 1].get("monotonic_ms", session_end_ms)) if index + 1 < len(signal_events) else session_end_ms
+
+        def _matches_signal_identity(event: dict[str, Any]) -> bool:
+            return any(
+                str(event.get(key) or "") == signal_id
+                for key in ("signal_id", "etf_signal_id", "etf_pending_signal_id")
+            )
+
+        episode_fills = [event for event in fill_events if _matches_signal_identity(event)]
+        episode_submits = [event for event in submit_events if _matches_signal_identity(event)]
+        episode_entry_submits = [
+            event for event in episode_submits if str(event.get("action_class") or "") == "etf_shock_take"
         ]
-        episode_submits = [
+        episode_decisions = [event for event in decision_events if _matches_signal_identity(event)]
+        episode_inventory_events = [
             event
-            for event in submit_events
-            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
-            and str(event.get("signal_id") or "") == signal_id
+            for event in inventory_events
+            if any(str(event.get(key) or "") == signal_id for key in ("etf_signal_id", "etf_pending_signal_id"))
         ]
-        episode_decisions = [
-            event
-            for event in decision_events
-            if start_ms <= int(event.get("monotonic_ms", 0)) <= end_ms
-            and (not event.get("etf_signal_id") or str(event.get("etf_signal_id") or "") == signal_id)
-        ]
+        episode_signal_events = [signal_event, *episode_submits, *episode_fills, *episode_decisions, *episode_inventory_events]
+        end_ms = max((int(event.get("monotonic_ms", start_ms)) for event in episode_signal_events), default=start_ms)
+        end_ms = max(start_ms, min(session_end_ms, max(end_ms, next_signal_ms if episode_fills or episode_submits else start_ms)))
         signed_qty = 0
         cash_pnl = 0.0
         entry_qty = 0
@@ -900,12 +903,10 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
         final_mark = _mark_at_or_after(etf_series, end_ms) or _mark_near(etf_series, end_ms)
         episode_pnl = cash_pnl + (signed_qty * float(final_mark or 0.0))
         peak_inventory = 0
-        for event in inventory_events:
-            event_ms = int(event.get("monotonic_ms", 0))
-            if start_ms <= event_ms <= end_ms:
-                inventory = int(event.get("inventory") or 0)
-                if abs(inventory) > abs(peak_inventory):
-                    peak_inventory = inventory
+        for event in episode_inventory_events:
+            inventory = int(event.get("inventory") or 0)
+            if abs(inventory) > abs(peak_inventory):
+                peak_inventory = inventory
         unwind_reason = None
         for submit in episode_submits:
             if str(submit.get("action_class") or "") == "etf_shock_unwind":
@@ -913,12 +914,12 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
                 break
         first_block_reason = None
         terminal_reason = None
-        for decision in episode_decisions:
+        for decision in [signal_event, *episode_decisions]:
             block_reason = decision.get("block_reason") or decision.get("reason")
             if block_reason:
                 first_block_reason = str(block_reason)
                 break
-        for decision in reversed(episode_decisions):
+        for decision in reversed([signal_event, *episode_decisions]):
             terminal = decision.get("etf_missed_entry_terminal_reason")
             if terminal:
                 terminal_reason = str(terminal)
@@ -948,9 +949,9 @@ def build_etf_episode_summaries(events: list[dict[str, Any]]) -> list[dict[str, 
                     if not payload.get("target_inventory")
                     else round(entry_qty / max(1, abs(int(payload.get("target_inventory") or 0))), 4)
                 ),
-                "entry_attempt_count": len(episode_submits),
+                "entry_attempt_count": len(episode_entry_submits),
                 "first_order_attempt_latency_ms": (
-                    None if not episode_submits else int(episode_submits[0].get("monotonic_ms", 0)) - start_ms
+                    None if not episode_entry_submits else int(episode_entry_submits[0].get("monotonic_ms", 0)) - start_ms
                 ),
                 "first_fill_latency_ms": None if first_entry_ms is None else int(first_entry_ms) - start_ms,
                 "missed_entry_terminal_reason": terminal_reason,
