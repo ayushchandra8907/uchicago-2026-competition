@@ -17,6 +17,7 @@ for path in (BOT_DIR, CALEB_DIR):
         sys.path.insert(0, str(path))
 
 import run_competition
+import run_competition_upgraded
 import run_pm_guard
 from testing1 import MarketABot
 
@@ -47,6 +48,33 @@ class CompetitionModeTests(unittest.TestCase):
 
         self.assertEqual(command[0], "/tmp/test-python")
         self.assertTrue(command[1].endswith("case1/caleb_work/run_pm_guard.py"))
+
+    def test_upgraded_wrapper_adds_a_only_etf_and_trap_defaults(self) -> None:
+        env = {
+            "UTC_HOST": "host",
+            "UTC_USERNAME": "user",
+            "UTC_PASSWORD": "pass",
+        }
+
+        run_competition_upgraded.apply_upgraded_env_defaults(env)
+
+        self.assertEqual(env["TRACE_ENABLED"], "0")
+        self.assertEqual(env["ETF_ENABLE_C_EARNINGS"], "0")
+        self.assertEqual(env["A_EARNINGS_TRAP_ENABLED"], "1")
+        self.assertEqual(env["A_EARNINGS_TRAP_MIN_FAIR_SHIFT_TICKS"], "60")
+        self.assertEqual(env["A_EARNINGS_TRAP_MAX_LIFETIME_MS"], "1500")
+
+    def test_stable_competition_wrapper_remains_without_upgraded_overrides(self) -> None:
+        env = {
+            "UTC_HOST": "host",
+            "UTC_USERNAME": "user",
+            "UTC_PASSWORD": "pass",
+        }
+
+        run_competition.apply_competition_env_defaults(env)
+
+        self.assertNotIn("ETF_ENABLE_C_EARNINGS", env)
+        self.assertNotIn("A_EARNINGS_TRAP_ENABLED", env)
 
     def test_disconnect_alert_suppressed_for_clean_auto_stop(self) -> None:
         bot = MarketABot.__new__(MarketABot)

@@ -14,7 +14,8 @@ if str(BOT_DIR) not in sys.path:
     sys.path.insert(0, str(BOT_DIR))
 
 try:
-    from a_bot_config import load_bot_config
+    from a_bot_config import AConfig, RiskConfig, load_bot_config
+    from a_earnings_trap_overlay import AEarningsTrapOverlay
     from b_mean_reversion import BMeanReversionStrategy
     from b_underlying_mm_v2 import BUnderlyingMMv2
     from etf_a_follower import ETFShockProjection
@@ -319,6 +320,71 @@ class RuntimeShutdownTests(unittest.IsolatedAsyncioTestCase):
         await bot._maybe_emit_c_etf_projection("C earnings signal", now_ms=1_000)
 
         self.assertEqual(bot._evaluate_and_sync_etf.await_count, 0)
+
+    async def test_a_trap_fill_routes_through_overlay_manager(self) -> None:
+        bot = MarketABot.__new__(MarketABot)
+        overlay = AEarningsTrapOverlay(
+            AConfig(earnings_trap_enabled=True),
+            RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=1, passive_quote_ttl_ms=250),
+        )
+        overlay.order_manager.note_submitted(
+            order_id="trap-1",
+            side="SELL",
+            px=1110,
+            qty=20,
+            now_ms=1_000,
+            overlay="earnings",
+            aggressive=False,
+            intent="a_earnings_trap",
+            mode_at_submit="POST_EARNINGS_SHOCK",
+            evaluation_reason="earnings trap overlay",
+            market_key="A",
+            strategy_family="a_earnings_trap",
+            action_class="trap_quote",
+            pnl_owner="a_earnings_trap",
+            signal_id="a_eps_1_trap",
+            trade_group_id="a_eps_1_trap",
+            leg_role="single",
+        )
+
+        sync_calls: list[int] = []
+        journal_events: list[tuple[str, int]] = []
+
+        strategy = SimpleNamespace(
+            inventory=60,
+            trace_state=lambda now_ms: {"symbol": "A", "mode": "POST_EARNINGS_SHOCK"},
+            sync_inventory_from_exchange=lambda inventory: (sync_calls.append(inventory), setattr(strategy, "inventory", inventory)),
+        )
+
+        bot.strategy = strategy
+        bot.a_trap_overlay = overlay
+        bot.etf_strategy = None
+        bot.b_option_strategy = None
+        bot.b_strategy = None
+        bot.c_strategy = None
+        bot.tracer = None
+        bot._ayush_port_mode = False
+        bot.positions = {"cash": 0}
+        bot._last_position_update_by_symbol = {}
+        bot._now_ms = lambda: 1_005
+        bot.journal = SimpleNamespace(
+            record_fill=lambda order_id, qty, price: journal_events.append(("fill", qty)),
+            record_inventory=lambda inventory, cash=None: journal_events.append(("inventory", inventory)),
+        )
+        eval_reasons: list[str] = []
+
+        async def fake_eval(reason: str) -> None:
+            eval_reasons.append(reason)
+
+        bot._evaluate_and_sync = fake_eval
+
+        await bot.bot_handle_order_fill("trap-1", 5, 1110)
+
+        self.assertEqual(sync_calls, [55])
+        self.assertEqual(strategy.inventory, 55)
+        self.assertEqual(overlay.order_manager.orders["trap-1"].remaining_qty, 15)
+        self.assertEqual(journal_events, [("fill", 5), ("inventory", 55)])
+        self.assertEqual(eval_reasons, ["trap fill"])
 
 
 class _FakeAsync:

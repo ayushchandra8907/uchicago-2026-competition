@@ -14,6 +14,7 @@ from typing import Optional
 import grpc
 
 from a_bot_config import BotConfig, ConfigError, load_bot_config
+from a_earnings_trap_overlay import AEarningsTrapOverlay
 from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import MarketAStrategy
 from a_bot_trace import TraceRecorder
@@ -180,6 +181,15 @@ class MarketABot(XChangeClient):
                 recovered_earnings_value=recovered_earnings_value,
                 book_depth_levels=max(10, config.trace.trace_book_depth_levels),
             )
+        self.a_trap_overlay = (
+            AEarningsTrapOverlay(
+                config.market_a,
+                config.risk,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
+            if bool(config.market_a.earnings_trap_enabled)
+            else None
+        )
         self.tracer = TraceRecorder.create_if_enabled(config.trace, session_prefix="a_bot_run", symbol="A")
         self._quote_lock = asyncio.Lock()
         self._position_snapshot_seen = asyncio.Event()
@@ -217,6 +227,8 @@ class MarketABot(XChangeClient):
             LOGGER.info("Seeding A multiplier from config: %.4f", config.market_a.initial_multiplier)
         else:
             LOGGER.info("A valuation will learn a round-specific multiplier from structured earnings.")
+        if self.a_trap_overlay is not None:
+            LOGGER.info("A earnings trap overlay enabled for structured earnings shock experiments.")
         if self.tracer is not None:
             LOGGER.info("Analysis mode enabled; writing trace outputs to %s", self.tracer.run_dir)
         if self.tracer is not None:
@@ -590,6 +602,24 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync_c("cancel response", force=True)
             return
 
+        if self.a_trap_overlay is not None and order_id in self.a_trap_overlay.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.a_trap_overlay.on_cancel_response(order_id, success)
+            self.journal.record_cancel_response(order_id, success, error)
+            if self.tracer is not None:
+                self.tracer.record_cancel_response(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    success=success,
+                    error=error,
+                    side=None if order is None else order.side,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync("trap cancel response")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_cancel_response(order_id, success)
@@ -749,6 +779,34 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync_c("fill", force=True)
             return
 
+        if self.a_trap_overlay is not None and order_id in self.a_trap_overlay.order_manager.orders:
+            now_ms = self._now_ms()
+            existing_order = self.a_trap_overlay.order_manager.orders.get(order_id)
+            side = "BUY" if existing_order is None else existing_order.side
+            strategy_inventory = int(self.strategy.inventory)
+            authoritative_inventory, _pre_fill_inventory = self._authoritative_inventory_after_fill(
+                "A",
+                side,
+                qty,
+                strategy_inventory,
+            )
+            order = self.a_trap_overlay.on_fill(order_id, qty, price)
+            self.journal.record_fill(order_id, qty, price)
+            self._sync_a_inventory_from_exchange(authoritative_inventory, now_ms=now_ms)
+            self.journal.record_inventory(int(self.strategy.inventory), cash=int(self.positions.get("cash", 0)))
+            if self.tracer is not None:
+                self.tracer.record_fill(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order=None if order is None else self._order_to_dict(order),
+                    order_id=order_id,
+                    qty=qty,
+                    price=price,
+                )
+            await self._evaluate_and_sync("trap fill")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_fill(order_id, qty, price)
@@ -845,6 +903,23 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync_c("rejection", force=True)
             return
 
+        if self.a_trap_overlay is not None and order_id in self.a_trap_overlay.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.a_trap_overlay.on_rejection(order_id)
+            self.journal.record_rejection(order_id, reason)
+            LOGGER.warning("A trap order %s rejected: %s", order_id, reason)
+            if self.tracer is not None:
+                self.tracer.record_rejection(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    reason=reason,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync("trap rejection")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_rejection(order_id)
@@ -934,6 +1009,8 @@ class MarketABot(XChangeClient):
         if symbol == "A":
             now_ms = self._now_ms()
             self.strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
+            if self.a_trap_overlay is not None:
+                self.a_trap_overlay.on_book_update_at(symbol, self.order_books[symbol], now_ms)
             if self.tracer is not None:
                 self.tracer.record_book_update(
                     now_ms=now_ms,
@@ -1556,6 +1633,7 @@ class MarketABot(XChangeClient):
                     placement.px,
                     placement.reason,
                 )
+            await self._sync_a_earnings_trap_overlay(reason, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.maybe_record_periodic_snapshot(
                     now_ms=now_ms,
@@ -1611,6 +1689,7 @@ class MarketABot(XChangeClient):
             else:
                 self._last_observe_only_reason = None
             await self._apply_ayush_decision(decision, now_ms=now_ms)
+            await self._sync_a_earnings_trap_overlay(reason, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.maybe_record_periodic_snapshot(
                     now_ms=now_ms,
@@ -1694,6 +1773,70 @@ class MarketABot(XChangeClient):
             desired.px,
             desired.reason,
         )
+
+    async def _sync_a_earnings_trap_overlay(self, reason: str, *, now_ms: int) -> None:
+        if self.a_trap_overlay is None:
+            return
+        plan = self.a_trap_overlay.compute_quotes(now_ms, self.strategy.trace_state(now_ms))
+        actions = self.a_trap_overlay.order_manager.build_actions(plan, now_ms)
+
+        for cancel in actions.cancels:
+            order = self.a_trap_overlay.order_manager.mark_cancel_requested(cancel.order_id, now_ms)
+            self.journal.record_cancel_requested(cancel.order_id)
+            if self.tracer is not None:
+                self.tracer.record_cancel_requested(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=cancel.order_id,
+                    side=cancel.side,
+                    cancel_reason=cancel.reason,
+                    mode_at_cancel=self.strategy.mode,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self.cancel_order(cancel.order_id)
+            LOGGER.info("Cancelling A trap %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
+
+        for placement in actions.placements:
+            side = Side.BUY if placement.side == "BUY" else Side.SELL
+            order_id = await self.place_order("A", placement.qty, side, placement.px)
+            managed_order = self.a_trap_overlay.order_manager.note_submitted(
+                order_id=order_id,
+                side=placement.side,
+                px=placement.px,
+                qty=placement.qty,
+                now_ms=now_ms,
+                overlay=placement.overlay,
+                aggressive=placement.aggressive,
+                intent=placement.intent,
+                mode_at_submit=placement.mode_at_submit,
+                evaluation_reason=placement.evaluation_reason,
+                market_key=placement.market_key,
+                strategy_family=placement.strategy_family,
+                action_class=placement.action_class,
+                pnl_owner=placement.pnl_owner,
+                signal_id=placement.signal_id,
+                trade_group_id=placement.trade_group_id,
+                leg_role=placement.leg_role,
+            )
+            self.a_trap_overlay.on_order_submitted(managed_order.signal_id)
+            self.journal.record_order_submitted(managed_order)
+            if self.tracer is not None:
+                self.tracer.record_order_submitted(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order=self._order_to_dict(managed_order),
+                )
+            LOGGER.info(
+                "Placed A trap %s order %s: qty=%s px=%s reason=%s trigger=%s",
+                placement.side,
+                order_id,
+                placement.qty,
+                placement.px,
+                placement.reason,
+                reason,
+            )
 
     async def _evaluate_and_sync_c(self, reason: str, *, force: bool = False) -> None:
         if (
@@ -2225,6 +2368,12 @@ class MarketABot(XChangeClient):
         if exchange_inventory == strategy_inventory_before_fill + signed_qty:
             return exchange_inventory, strategy_inventory_before_fill
         return strategy_inventory_before_fill + signed_qty, strategy_inventory_before_fill
+
+    def _sync_a_inventory_from_exchange(self, inventory: int, *, now_ms: int) -> None:
+        if self._ayush_port_mode:
+            self.strategy.sync_inventory_from_exchange(int(inventory), now_ms=now_ms)
+            return
+        self.strategy.sync_inventory_from_exchange(int(inventory))
 
     def _current_cash(self) -> int | None:
         return int(self.positions.get("cash", 0)) if self._position_snapshot_seen.is_set() else None
