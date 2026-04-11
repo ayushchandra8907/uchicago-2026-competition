@@ -69,250 +69,167 @@ def fed_event(content: str, *, now_ms: int = 1_000) -> NewsEvent:
 
 
 class CStrategyTests(unittest.TestCase):
-    def test_trading_phase_baseline_shorts_high_and_longs_low(self):
+    def test_book_updates_do_not_create_positions(self):
         strategy = CStrategy(MarketCStrategyConfig())
-        strategy.last_tradeable_macro_ms = 0
-        strategy.on_book(
+        decision = strategy.on_book(
             snapshot(books={"R_HIKE": (98, 102), "R_HOLD": (398, 402), "R_CUT": (898, 902)})
         )
-        self.assertGreater(strategy.baseline_targets_by_symbol["R_HIKE"], 0)
-        self.assertEqual(strategy.baseline_targets_by_symbol["R_HOLD"], 0)
-        self.assertLess(strategy.baseline_targets_by_symbol["R_CUT"], 0)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertEqual(strategy.macro_pair_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertTrue(decision.observe_only)
 
-    def test_trading_phase_zeroes_center_contracts(self):
+    def test_hawkish_cpi_flattens_all_rate_positions_for_major_release(self):
         strategy = CStrategy(MarketCStrategyConfig())
-        strategy.last_tradeable_macro_ms = 0
-        strategy.on_book(
-            snapshot(books={"R_HIKE": (358, 362), "R_HOLD": (418, 422), "R_CUT": (698, 702)})
+        decision = strategy.on_news(
+            snapshot(
+                inventories={"R_HIKE": 80, "R_HOLD": 25, "R_CUT": -60},
+                books={"R_HIKE": (418, 422), "R_HOLD": (398, 402), "R_CUT": (378, 382)},
+            ),
+            cpi_event(actual=0.0023, forecast=0.0018),
         )
-        self.assertEqual(strategy.baseline_targets_by_symbol["R_HIKE"], 0)
-        self.assertEqual(strategy.baseline_targets_by_symbol["R_HOLD"], 0)
-        self.assertLess(strategy.baseline_targets_by_symbol["R_CUT"], 0)
-
-    def test_hawkish_cpi_builds_hike_cut_macro_pair(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        decision = strategy.on_news(snapshot(), cpi_event(actual=0.0023, forecast=0.0018))
-        self.assertGreater(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-        self.assertLess(strategy.macro_pair_targets_by_symbol["R_CUT"], 0)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_HOLD"], 0)
-        self.assertEqual(strategy.rate_macro_pair_symbols, ["R_HIKE", "R_CUT"])
-        self.assertEqual(decision.mode, "SHOCK")
-        self.assertIsNotNone(decision.desired_order)
-        self.assertEqual(decision.desired_order.symbol, "R_HIKE")
-        self.assertEqual(decision.desired_order.side, "BUY")
-
-    def test_dovish_cpi_builds_cut_hike_macro_pair(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        decision = strategy.on_news(snapshot(), cpi_event(actual=0.0010, forecast=0.0018))
-        self.assertGreater(strategy.macro_pair_targets_by_symbol["R_CUT"], 0)
-        self.assertLess(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_HOLD"], 0)
-        self.assertEqual(strategy.rate_macro_pair_symbols, ["R_CUT", "R_HIKE"])
-        self.assertEqual(decision.mode, "SHOCK")
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HIKE"], 0)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HOLD"], 0)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_CUT"], 0)
+        self.assertEqual(set(strategy.rate_macro_pair_symbols or []), {"R_HIKE", "R_HOLD", "R_CUT"})
+        self.assertTrue(strategy.rate_global_flatten_signal)
+        self.assertEqual(decision.mode, "UNWIND")
         self.assertIsNotNone(decision.desired_order)
         self.assertEqual(decision.desired_order.symbol, "R_HIKE")
         self.assertEqual(decision.desired_order.side, "SELL")
+        self.assertEqual(decision.desired_order.intent, "prediction_market_unwind_macro")
 
-    def test_hold_positive_fedspeak_longs_hold_and_shorts_richer_tail(self):
+    def test_dovish_cpi_with_no_inventory_does_not_open_trade(self):
         strategy = CStrategy(MarketCStrategyConfig())
         decision = strategy.on_news(
-            snapshot(books={"R_HIKE": (618, 622), "R_HOLD": (398, 402), "R_CUT": (218, 222)}),
+            snapshot(books={"R_HIKE": (418, 422), "R_HOLD": (398, 402), "R_CUT": (378, 382)}),
+            cpi_event(actual=0.0010, forecast=0.0018),
+        )
+        self.assertEqual(strategy.trading_phase_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertTrue(decision.observe_only)
+        self.assertEqual(set(strategy.rate_macro_pair_symbols or []), {"R_HIKE", "R_HOLD", "R_CUT"})
+        self.assertTrue(strategy.rate_global_flatten_signal)
+
+    def test_hold_fedspeak_that_is_not_major_keeps_positions_unchanged(self):
+        strategy = CStrategy(MarketCStrategyConfig())
+        decision = strategy.on_news(
+            snapshot(
+                inventories={"R_HIKE": 10, "R_HOLD": 55, "R_CUT": -5},
+                books={"R_HIKE": (318, 322), "R_HOLD": (398, 402), "R_CUT": (218, 222)},
+            ),
             fed_event("Fed chair reiterates data dependence; no clear signal on next move."),
         )
-        self.assertGreater(strategy.macro_pair_targets_by_symbol["R_HOLD"], 0)
-        self.assertLess(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_CUT"], 0)
-        self.assertEqual(strategy.rate_macro_pair_symbols, ["R_HOLD", "R_HIKE"])
-        self.assertEqual(decision.mode, "SHOCK")
-        self.assertIsNotNone(decision.desired_order)
-        self.assertEqual(decision.desired_order.symbol, "R_HIKE")
-        self.assertEqual(decision.desired_order.side, "SELL")
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HOLD"], 55)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HIKE"], 10)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_CUT"], -5)
+        self.assertIsNone(strategy.rate_macro_pair_symbols)
+        self.assertFalse(strategy.rate_global_flatten_signal)
+        self.assertTrue(decision.observe_only)
 
-    def test_macro_pair_overshoot_trim_reduces_target(self):
+    def test_low_relevance_fedspeak_does_nothing(self):
         strategy = CStrategy(MarketCStrategyConfig())
-        strategy.on_news(snapshot(), cpi_event(actual=0.0031, forecast=0.0018))
-        decision = strategy.on_book(
-            snapshot(
-                now_ms=2_000,
-                books={"R_HIKE": (508, 512), "R_HOLD": (398, 402), "R_CUT": (398, 402)},
-                inventories={"R_HIKE": 120, "R_CUT": -120},
-            )
-        )
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_HIKE"], 60)
-        self.assertEqual(decision.mode, "SHOCK")
-        self.assertIsNotNone(decision.desired_order)
-        self.assertEqual(decision.desired_order.symbol, "R_HIKE")
-        self.assertEqual(decision.desired_order.side, "SELL")
-
-    def test_macro_pair_equilibrium_flatten_fires(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.on_news(snapshot(), cpi_event(actual=0.00205, forecast=0.0018))
-        strategy.on_book(
-            snapshot(
-                now_ms=1_500,
-                books={"R_HIKE": (424, 426), "R_HOLD": (398, 402), "R_CUT": (374, 376)},
-                inventories={"R_HIKE": 40, "R_CUT": -40},
-            )
-        )
-        strategy.on_book(
-            snapshot(
-                now_ms=1_900,
-                books={"R_HIKE": (424, 426), "R_HOLD": (398, 402), "R_CUT": (374, 376)},
-                inventories={"R_HIKE": 40, "R_CUT": -40},
-            )
-        )
-        decision = strategy.on_book(
-            snapshot(
-                now_ms=2_200,
-                books={"R_HIKE": (424, 426), "R_HOLD": (398, 402), "R_CUT": (374, 376)},
-                inventories={"R_HIKE": 40, "R_CUT": -40},
-            )
-        )
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_CUT"], 0)
-        self.assertEqual(decision.mode, "UNWIND")
-        self.assertIsNotNone(decision.desired_order)
-        self.assertEqual(decision.desired_order.symbol, "R_HIKE")
-        self.assertEqual(decision.desired_order.side, "SELL")
-
-    def test_macro_leg_reversal_flatten_fires(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.on_news(snapshot(), cpi_event(actual=0.0031, forecast=0.0018))
-        strategy.on_book(
-            snapshot(
-                now_ms=2_000,
-                books={"R_HIKE": (448, 452), "R_HOLD": (398, 402), "R_CUT": (398, 402)},
-                inventories={"R_HIKE": 120, "R_CUT": -120},
-            )
-        )
-        decision = strategy.on_book(
-            snapshot(
-                now_ms=2_500,
-                books={"R_HIKE": (438, 442), "R_HOLD": (398, 402), "R_CUT": (398, 402)},
-                inventories={"R_HIKE": 120, "R_CUT": -120},
-            )
-        )
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-        self.assertIsNotNone(decision.desired_order)
-        self.assertEqual(decision.desired_order.symbol, "R_HIKE")
-        self.assertEqual(decision.desired_order.side, "SELL")
-
-    def test_new_macro_event_replaces_old_pair_after_flatten(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.on_news(snapshot(), cpi_event(actual=0.0031, forecast=0.0018))
         decision = strategy.on_news(
-            snapshot(
-                now_ms=2_000,
-                inventories={"R_HIKE": 120, "R_CUT": -120},
-            ),
-            fed_event("Fed chair highlights cooling labor market and easing inflation pressures.", now_ms=2_000),
+            snapshot(inventories={"R_HIKE": 40}),
+            fed_event("Markets react to broad geopolitical uncertainty."),
         )
-        self.assertIsNotNone(strategy.pending_macro_signal)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol["R_CUT"], 0)
-        self.assertEqual(decision.mode, "UNWIND")
-        self.assertIsNotNone(decision.desired_order)
-        self.assertEqual(decision.desired_order.side, "SELL")
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HIKE"], 40)
+        self.assertIsNone(strategy.rate_macro_pair_symbols)
+        self.assertFalse(strategy.rate_global_flatten_signal)
+        self.assertTrue(decision.observe_only)
 
-        strategy.on_book(snapshot(now_ms=2_100))
-        self.assertIsNone(strategy.pending_macro_signal)
-        self.assertGreater(strategy.macro_pair_targets_by_symbol["R_CUT"], 0)
-        self.assertLess(strategy.macro_pair_targets_by_symbol["R_HIKE"], 0)
-
-    def test_probe_phase_uses_small_probe_by_default(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.session_started_ms = 0
-        strategy.on_timer(
-            snapshot(
-                now_ms=730_000,
-                books={"R_HIKE": (298, 302), "R_HOLD": (448, 452), "R_CUT": (248, 252)},
-            )
-        )
-        self.assertEqual(strategy.probe_targets_by_symbol["R_HOLD"], 20)
-        self.assertEqual(strategy.probe_targets_by_symbol["R_HIKE"], -20)
-        self.assertEqual(strategy.probe_targets_by_symbol["R_CUT"], -20)
-
-    def test_probe_phase_scales_when_leader_is_clear(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.session_started_ms = 0
-        strategy.on_timer(
-            snapshot(
-                now_ms=730_000,
-                books={"R_HIKE": (60, 64), "R_HOLD": (918, 922), "R_CUT": (4, 8)},
-            )
-        )
-        self.assertEqual(strategy.probe_targets_by_symbol["R_HOLD"], 80)
-        self.assertEqual(strategy.probe_targets_by_symbol["R_HIKE"], -80)
-        self.assertEqual(strategy.probe_targets_by_symbol["R_CUT"], -80)
-
-    def test_endgame_has_exactly_one_positive_contract(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.session_started_ms = 0
-        strategy.on_timer(
-            snapshot(
-                now_ms=800_000,
-                books={"R_HIKE": (780, 784), "R_HOLD": (180, 184), "R_CUT": (40, 44)},
-            )
-        )
-        positives = [symbol for symbol, qty in strategy.endgame_targets_by_symbol.items() if qty > 0]
-        negatives = [symbol for symbol, qty in strategy.endgame_targets_by_symbol.items() if qty < 0]
-        self.assertEqual(positives, ["R_HIKE"])
-        self.assertEqual(len(negatives), 2)
-        self.assertEqual(strategy.endgame_targets_by_symbol["R_HIKE"], 200)
-        self.assertEqual(strategy.endgame_targets_by_symbol["R_HOLD"], -200)
-        self.assertEqual(strategy.endgame_targets_by_symbol["R_CUT"], -200)
-
-    def test_trading_phase_logic_is_disabled_once_probe_phase_starts(self):
-        strategy = CStrategy(MarketCStrategyConfig())
-        strategy.session_started_ms = 0
-        strategy.on_news(snapshot(), cpi_event(actual=0.0031, forecast=0.0018))
-        strategy.on_timer(
-            snapshot(
-                now_ms=730_000,
-                books={"R_HIKE": (298, 302), "R_HOLD": (448, 452), "R_CUT": (248, 252)},
-            )
-        )
-        self.assertEqual(strategy.baseline_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.macro_pair_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.trading_phase_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-
-    def test_positions_flatten_ten_seconds_after_tradeable_fedspeak(self):
+    def test_unaffected_inventory_is_preserved_during_flatten_window(self):
         strategy = CStrategy(MarketCStrategyConfig())
         strategy.on_news(
-            snapshot(now_ms=1_000, books={"R_HIKE": (618, 622), "R_HOLD": (398, 402), "R_CUT": (218, 222)}),
-            fed_event("Fed chair reiterates data dependence; no clear signal on next move.", now_ms=1_000),
+            snapshot(
+                now_ms=1_000,
+                inventories={"R_HIKE": 70, "R_HOLD": -30, "R_CUT": 45},
+                books={"R_HIKE": (418, 422), "R_HOLD": (398, 402), "R_CUT": (378, 382)},
+            ),
+            cpi_event(actual=0.0023, forecast=0.0018, now_ms=1_000),
         )
         decision = strategy.on_timer(
             snapshot(
-                now_ms=11_500,
-                books={"R_HIKE": (608, 612), "R_HOLD": (408, 412), "R_CUT": (218, 222)},
-                inventories={"R_HOLD": 80, "R_HIKE": -80},
+                now_ms=2_000,
+                inventories={"R_HIKE": 0, "R_HOLD": -30, "R_CUT": 45},
+                books={"R_HIKE": (438, 442), "R_HOLD": (398, 402), "R_CUT": (358, 362)},
             )
         )
-        self.assertEqual(strategy.baseline_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.macro_pair_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.trading_phase_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.rate_no_trade_reason, "macro_signal_stale_flatten")
-        self.assertEqual(strategy.last_signal_source, "macro_signal_timeout")
-        self.assertEqual(decision.mode, "UNWIND")
-        self.assertIsNotNone(decision.desired_order)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HIKE"], 0)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HOLD"], 0)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_CUT"], 0)
+        self.assertEqual(decision.desired_order.symbol, "R_CUT")
+        self.assertEqual(decision.desired_order.side, "SELL")
 
-    def test_generic_unstructured_news_is_ignored_for_c_trading(self):
+    def test_flatten_window_expires_and_bot_stops_zeroing_contracts(self):
         strategy = CStrategy(MarketCStrategyConfig())
-        generic_news = NewsEvent(
-            now_ms=1_000,
-            tick=1,
-            kind="unstructured",
-            symbol=None,
-            content="Markets react to broad geopolitical uncertainty.",
-            news_type="WorldNews",
-            raw_payload={"kind": "unstructured", "new_data": {"type": "WorldNews", "content": "Markets react to broad geopolitical uncertainty."}},
+        strategy.on_news(
+            snapshot(
+                now_ms=1_000,
+                inventories={"R_HIKE": 80},
+                books={"R_HIKE": (418, 422), "R_HOLD": (398, 402), "R_CUT": (378, 382)},
+            ),
+            cpi_event(actual=0.0023, forecast=0.0018, now_ms=1_000),
         )
-        decision = strategy.on_news(snapshot(), generic_news)
-        self.assertEqual(strategy.macro_pair_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.trading_phase_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
-        self.assertEqual(strategy.rate_no_trade_reason, "irrelevant_macro_news")
+        decision = strategy.on_timer(
+            snapshot(
+                now_ms=12_500,
+                inventories={"R_HIKE": 80},
+                books={"R_HIKE": (438, 442), "R_HOLD": (398, 402), "R_CUT": (358, 362)},
+            )
+        )
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HIKE"], 80)
+        self.assertIsNone(strategy.rate_macro_pair_symbols)
         self.assertTrue(decision.observe_only)
+
+    def test_probe_and_endgame_do_not_create_positions_in_flatten_only_mode(self):
+        strategy = CStrategy(MarketCStrategyConfig())
+        strategy.session_started_ms = 0
+
+        probe_decision = strategy.on_timer(
+            snapshot(
+                now_ms=730_000,
+                inventories={"R_HOLD": 20},
+                books={"R_HIKE": (298, 302), "R_HOLD": (448, 452), "R_CUT": (248, 252)},
+            )
+        )
+        self.assertEqual(strategy.probe_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertEqual(strategy.endgame_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HOLD"], 20)
+        self.assertTrue(probe_decision.observe_only)
+
+        endgame_decision = strategy.on_timer(
+            snapshot(
+                now_ms=850_000,
+                inventories={"R_HIKE": -15},
+                books={"R_HIKE": (780, 784), "R_HOLD": (180, 184), "R_CUT": (40, 44)},
+            )
+        )
+        self.assertEqual(strategy.probe_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertEqual(strategy.endgame_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertEqual(strategy.trading_phase_targets_by_symbol["R_HIKE"], -15)
+        self.assertTrue(endgame_decision.observe_only)
+
+    def test_strong_fedspeak_arms_global_flatten_signal(self):
+        strategy = CStrategy(MarketCStrategyConfig())
+        decision = strategy.on_news(
+            snapshot(
+                inventories={"R_HIKE": 10, "R_HOLD": -20, "R_CUT": 15},
+                books={"R_HIKE": (468, 472), "R_HOLD": (388, 392), "R_CUT": (138, 142)},
+            ),
+            fed_event("Softening data raises expectations of policy easing."),
+        )
+        self.assertTrue(strategy.rate_global_flatten_signal)
+        self.assertEqual(strategy.trading_phase_targets_by_symbol, {"R_HIKE": 0, "R_HOLD": 0, "R_CUT": 0})
+        self.assertEqual(decision.mode, "UNWIND")
+
+    def test_probability_state_is_still_exported(self):
+        strategy = CStrategy(MarketCStrategyConfig())
+        strategy.on_news(
+            snapshot(books={"R_HIKE": (418, 422), "R_HOLD": (398, 402), "R_CUT": (378, 382)}),
+            cpi_event(actual=0.0023, forecast=0.0018),
+        )
+        state = strategy.probability_state()
+        self.assertAlmostEqual(sum(state.posterior_probs.values()), 1.0, places=6)
+        self.assertAlmostEqual(sum(state.terminal_probs.values()), 1.0, places=6)
 
     def test_trace_driven_softening_data_scores_direct_contract_deltas(self):
         result = score_fed_speak_headline("Softening data raises expectations of policy easing.")

@@ -49,7 +49,35 @@ class MarketCStrategyConfig:
     news_strong_logit_shift: float = 1.05
     news_extreme_logit_shift: float = 1.40
     news_score_delta_divisor: float = 2.5
+    flatten_only_mode: bool = True
+    flatten_all_positions_on_major_macro: bool = True
+    flatten_signal_min_abs_delta: float = 0.35
+    flatten_major_cpi_min_bucket: str = "medium"
+    flatten_major_fedspeak_min_bucket: str = "strong"
+    flatten_major_fedspeak_min_relevance: float = 1.25
+    flatten_major_min_pair_edge_ticks: int = 25
     posterior_floor_probability: float = 1e-4
+    posterior_temperature: float = 1.0
+    memory_half_life_ms: int = 90_000
+    memory_weight: float = 0.75
+    memory_max_abs_logit: float = 2.0
+    cpi_memory_kappa: float = 1.0
+    fedspeak_memory_kappa_strong: float = 0.20
+    fedspeak_memory_kappa_medium: float = 0.10
+    fedspeak_memory_kappa_light: float = 0.0
+    dominant_regime_probability_threshold: float = 0.55
+    dominant_regime_gap_threshold: float = 0.12
+    contrary_signal_half_life_ms: int = 30_000
+    contrary_signal_required_count: float = 2.0
+    reversal_min_relevance: float = 1.25
+    reversal_extra_delta: float = 0.45
+    reversal_extra_edge_ticks: int = 10
+    reversal_market_gap_threshold: float = 0.05
+    late_consensus_anchor_gap: float = 0.07
+    terminal_confident_probability: float = 0.58
+    terminal_confident_gap: float = 0.10
+    terminal_reduced_long_target: int = 120
+    terminal_reduced_short_target: int = -120
     flatten_near_zero_threshold: int = 0
     macro_signal_timeout_ms: int = 10_000
     round_duration_ms: int = 900_000
@@ -61,7 +89,7 @@ class MarketCStrategyConfig:
     baseline_center_price: int = 400
     baseline_neutral_low_price: int = 320
     baseline_neutral_high_price: int = 480
-    baseline_target_cap: int = 60
+    baseline_target_cap: int = 0
     baseline_full_size_distance_ticks: int = 320
     trading_macro_target_cap: int = 120
     macro_pair_min_delta: float = 0.35
@@ -201,6 +229,16 @@ class StrategyConfig:
     min_order_live_ms: int = 75
     replace_qty_tolerance: int = 1
     replace_price_tolerance_ticks: int = 0
+    maker_min_spread_ticks: int = 6
+    maker_trade_window_ms: int = 1_200
+    maker_min_recent_trade_count: int = 4
+    maker_flow_trigger: int = 3
+    maker_quote_qty: int = 12
+    maker_inventory_soft_limit: int = 36
+    maker_inventory_hard_limit: int = 80
+    maker_aggressive_flatten_inventory: int = 80
+    maker_aggressive_flatten_spread_ticks: int = 2
+    maker_fair_value_offset_ticks: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -225,6 +263,7 @@ class BotConfig:
     logger: LoggerConfig
     paths: BotPaths
     c_strategy: MarketCStrategyConfig = field(default_factory=MarketCStrategyConfig)
+    c_mm_strategy: StrategyConfig = field(default_factory=lambda: StrategyConfig(symbol="C"))
 
 
 def _optional_int(name: str, default: int) -> int:
@@ -392,10 +431,36 @@ def load_bot_config(base_dir: str | Path) -> BotConfig:
         midrun_checkpoint_enabled=_optional_bool("A_V3_MIDRUN_CHECKPOINT_ENABLED", True),
         midrun_checkpoint_ms=_optional_int("A_V3_MIDRUN_CHECKPOINT_MS", 450_000),
     )
+    c_mm_strategy = StrategyConfig(
+        symbol="C",
+        position_cap=_optional_int("C_MM_POSITION_CAP", 80),
+        max_exchange_order_qty=_optional_int("C_MM_MAX_EXCHANGE_ORDER_QTY", 40),
+        max_open_orders=_optional_int("C_MM_MAX_OPEN_ORDERS", 50),
+        max_outstanding_volume=_optional_int("C_MM_MAX_OUTSTANDING_VOLUME", 120),
+        max_absolute_position=_optional_int("C_MM_MAX_ABSOLUTE_POSITION", 80),
+        order_slice_target_qty=_optional_int("C_MM_ORDER_SLICE_TARGET_QTY", 12),
+        order_slice_min_qty=_optional_int("C_MM_ORDER_SLICE_MIN_QTY", 7),
+        order_slice_max_qty=_optional_int("C_MM_ORDER_SLICE_MAX_QTY", 15),
+        timer_interval_ms=_optional_int("C_MM_TIMER_INTERVAL_MS", 60),
+        min_order_live_ms=_optional_int("C_MM_MIN_ORDER_LIVE_MS", 120),
+        replace_qty_tolerance=_optional_int("C_MM_REPLACE_QTY_TOLERANCE", 1),
+        replace_price_tolerance_ticks=_optional_int("C_MM_REPLACE_PRICE_TOLERANCE_TICKS", 0),
+        maker_min_spread_ticks=_optional_int("C_MM_MIN_SPREAD_TICKS", 6),
+        maker_trade_window_ms=_optional_int("C_MM_TRADE_WINDOW_MS", 1_200),
+        maker_min_recent_trade_count=_optional_int("C_MM_MIN_RECENT_TRADE_COUNT", 4),
+        maker_flow_trigger=_optional_int("C_MM_FLOW_TRIGGER", 3),
+        maker_quote_qty=_optional_int("C_MM_QUOTE_QTY", 12),
+        maker_inventory_soft_limit=_optional_int("C_MM_INVENTORY_SOFT_LIMIT", 36),
+        maker_inventory_hard_limit=_optional_int("C_MM_INVENTORY_HARD_LIMIT", 80),
+        maker_aggressive_flatten_inventory=_optional_int("C_MM_AGGRESSIVE_FLATTEN_INVENTORY", 80),
+        maker_aggressive_flatten_spread_ticks=_optional_int("C_MM_AGGRESSIVE_FLATTEN_SPREAD_TICKS", 2),
+        maker_fair_value_offset_ticks=_optional_float("C_MM_FAIR_VALUE_OFFSET_TICKS", 0.0),
+    )
     return BotConfig(
         exchange=exchange,
         strategy=strategy,
         c_strategy=MarketCStrategyConfig(),
+        c_mm_strategy=c_mm_strategy,
         logger=logger,
         paths=BotPaths(base_dir=base_path),
     )

@@ -262,7 +262,6 @@ class AyushPortStrategy:
             new_fair_value=new_fair,
             base_fair_value=self._int_or_none(state.get("base_fair_value")),
             news_fair_value=self._int_or_none(state.get("news_fair_value")),
-            news_target_inventory=self._active_news_target_inventory(state),
             pending_news_target_inventory=self._int_or_none(state.get("pending_news_target_inventory")),
             news_confirmation_state=self._str_or_none(state.get("news_confirmation_state")),
             active_news_signal_id=self.active_news_signal_id or self.pending_news_signal_id,
@@ -275,6 +274,7 @@ class AyushPortStrategy:
             resolved_news_text=resolved_text,
             resolved_news_text_source=resolved_source,
             shock_direction=int(state.get("shock_direction") or 0),
+            shock_target_inventory=self._int_or_none(state.get("shock_target_inventory")),
             shock_threshold=None,
             tick=news_event.tick,
         )
@@ -535,7 +535,6 @@ class AyushPortStrategy:
             "news_sentiment_score": state.get("news_sentiment_score"),
             "news_sentiment_bucket": state.get("news_sentiment_bucket"),
             "news_confirmation_state": state.get("news_confirmation_state"),
-            "news_target_inventory": self._active_news_target_inventory(state),
             "pending_news_target_inventory": state.get("pending_news_target_inventory"),
             "pe_frozen": state.get("pe_frozen"),
             "pending_news": state.get("pending_news"),
@@ -796,16 +795,6 @@ class AyushPortStrategy:
     @staticmethod
     def _str_or_none(value: Any) -> str | None:
         return None if value is None else str(value)
-
-    @staticmethod
-    def _active_news_target_inventory(state: dict[str, Any]) -> int | None:
-        if str(state.get("active_signal_kind") or "") == "unstructured":
-            target = state.get("original_shock_target_inventory")
-            if target is None:
-                target = state.get("shock_target_inventory")
-            return None if target is None else int(target)
-        target = state.get("pending_news_target_inventory")
-        return None if target is None else int(target)
 
     @staticmethod
     def _now_ms() -> int:

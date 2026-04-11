@@ -44,3 +44,77 @@ class ANewsSentimentParityTests(unittest.TestCase):
                 self.assertEqual(ours.unknown_candidate_phrases, ayush.unknown_candidate_phrases)
                 self.assertEqual(ours.unknown_candidate_unigrams, ayush.unknown_candidate_unigrams)
                 self.assertEqual(ours.unknown_candidate_bigrams, ayush.unknown_candidate_bigrams)
+
+    def test_restored_scorer_matches_ayush_for_recent_review_headlines(self) -> None:
+        headlines = [
+            "International markets continue to drag down A's financials.",
+            "An innovative virtual reality platform is successfully launched by A.",
+            "Significant expansion is reported by A in its subscription-based revenue streams.",
+        ]
+
+        for headline in headlines:
+            with self.subTest(headline=headline):
+                ours = score_a_unstructured_headline(headline)
+                ayush = ayush_score_a_unstructured_headline(headline)
+                self.assertEqual(ours.score, ayush.score)
+                self.assertEqual(ours.bucket, ayush.bucket)
+                self.assertEqual(ours.direction, ayush.direction)
+
+    def test_new_positive_phrase_family_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Revenue growth surges in a previously underperforming division at A."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("growth surges", "previously underperforming", "underperforming division")
+            )
+        )
+
+    def test_automation_cost_reduction_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Through advanced automation, A successfully reduces costs across its operations."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertIn("advanced automation", result.matched_bigrams)
+        self.assertTrue(
+            "successfully reduces" in result.matched_bigrams or "reduces costs" in result.matched_bigrams
+        )
+
+    def test_analyst_commendation_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "Analysts commend A for successful product differentiation in a competitive market."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertIn("analysts commend", result.matched_bigrams)
+        self.assertIn("product differentiation", result.matched_bigrams)
+
+    def test_battery_breakthrough_phrase_scores_positive(self) -> None:
+        result = score_a_unstructured_headline(
+            "A's revolutionary battery breakthrough is widely praised by analysts."
+        )
+
+        self.assertGreater(result.score, 0.0)
+        self.assertEqual(result.direction, 1)
+        self.assertTrue("battery breakthrough" in result.matched_bigrams or "widely praised" in result.matched_bigrams)
+
+    def test_intellectual_property_loss_phrase_scores_negative(self) -> None:
+        result = score_a_unstructured_headline(
+            "Loss of key intellectual property rights delivers a blow to A's core business."
+        )
+
+        self.assertLess(result.score, 0.0)
+        self.assertEqual(result.direction, -1)
+        self.assertTrue(
+            any(
+                term in result.matched_bigrams
+                for term in ("intellectual property", "loss key", "delivers blow", "key ip")
+            )
+        )

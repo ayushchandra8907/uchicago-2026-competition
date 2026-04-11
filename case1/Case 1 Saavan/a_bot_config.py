@@ -136,20 +136,91 @@ class BConfig:
     enabled: bool = True
     trading_enabled: bool = True
     observe_only: bool = False
+    allow_trading_with_ayush_port: bool = True
+    mm_v2_enabled: bool = True
+    meanrev_enabled: bool = True
     signal_snapshot_interval_ms: int = 250
     signal_change_threshold_ticks: int = 1
     quote_size: int = 1
-    max_position: int = 8
+    max_position: int = 4
     base_half_spread_ticks: int = 2
     inventory_skew_ticks_per_unit: float = 0.5
-    passive_reduce_start: int = 4
-    passive_reduce_full: int = 8
+    passive_reduce_start: int = 3
+    passive_reduce_full: int = 4
     min_book_spread: int = 6
     max_synthetic_dispersion: int = 4
+    mm_v2_book_weight: float = 0.70
+    mm_v2_synth_weight: float = 0.30
+    mm_v2_min_half_spread_ticks: int = 1
+    mm_v2_inside_improve_ticks: int = 1
+    mm_v2_dispersion_widen_factor: float = 0.50
+    mm_v2_reduce_size_bonus: int = 1
+    mm_min_eval_interval_ms: int = 150
+    mm_reprice_threshold_ticks: int = 3
+    mm_min_valid_spread_ticks: int = 3
+    mm_min_healthy_book_age_ms: int = 500
+    mm_cancel_on_bad_book: bool = True
+    mm_bad_fill_cooldown_ms: int = 750
+    meanrev_max_position: int = 16
+    meanrev_quote_size: int = 2
+    meanrev_ema_fast_ms: int = 30_000
+    meanrev_ema_slow_ms: int = 180_000
+    meanrev_vol_ewma_ms: int = 60_000
+    meanrev_sigma_floor: float = 4.0
+    meanrev_entry_z: float = 1.25
+    meanrev_entry_z2: float = 2.25
+    meanrev_exit_z: float = 0.35
+    meanrev_stop_z: float = 5.0
+    meanrev_min_spread_ticks: int = 3
+    meanrev_max_hold_ms: int = 120_000
+    meanrev_cooldown_ms: int = 1_500
+    meanrev_aggressive_entry_z: float = 2.75
+    meanrev_aggressive_exit: bool = True
+    meanrev_entry_ticks: int = 10
+    meanrev_full_entry_ticks: int = 15
+    meanrev_exit_ticks: int = 3
+    meanrev_base_target: int = 6
+    meanrev_full_target: int = 16
+    meanrev_extreme_entry_ticks: int = 20
+    meanrev_risk_off_deviation_ticks: int = 35
+    meanrev_turn_confirm_ms: int = 300
+    meanrev_min_healthy_book_age_ms: int = 500
+    meanrev_bad_fill_cooldown_ms: int = 1_000
     basis_entry_threshold_ticks: float = 1.25
     basis_strong_threshold_ticks: float = 2.5
     imbalance_confirmation_threshold: float = 0.15
     far_side_widen_ticks: int = 4
+    parity_enabled: bool = False
+    parity_shadow_enabled: bool = True
+    parity_edge_threshold_ticks: int = 8
+    parity_trade_size: int = 1
+    parity_max_exposure: int = 3
+    parity_max_quote_age_ms: int = 1_000
+    option_lottery_enabled: bool = True
+    option_lottery_max_ask: int = 3
+    option_lottery_floor_ask: int = 0
+    option_lottery_quote_size: int = 1
+    option_lottery_max_position_per_symbol: int = 20
+    option_lottery_wing_max_position: int = 200
+    option_lottery_atm_max_position: int = 40
+    option_lottery_total_premium_budget: int = 1_500
+    option_lottery_wing_premium_budget: int = 600
+    option_lottery_c1050_premium_budget: int = 450
+    option_lottery_p950_premium_budget: int = 450
+    option_lottery_atm_total_premium_budget: int = 300
+    option_lottery_near_strike_ticks: int = 80
+    option_lottery_min_momentum_ticks: float = 1.0
+    option_lottery_rebuy_cooldown_ms: int = 1_000
+    option_lottery_profit_take_enabled: bool = True
+    option_lottery_profit_take_min_edge: int = 6
+    option_lottery_profit_take_multiple: float = 2.0
+    option_lottery_profit_take_quote_size: int = 20
+    option_lottery_stale_hold_ms: int = 45_000
+    option_hedge_enabled: bool = True
+    option_hedge_max_ask: int = 6
+    option_hedge_min_underlying_inventory: int = 4
+    option_hedge_target_ratio: float = 0.5
+    option_hedge_premium_budget: int = 300
     underlying_symbol: str = "B"
     option_symbols: tuple[str, ...] = (
         "B_C_950",
@@ -159,6 +230,41 @@ class BConfig:
         "B_C_1050",
         "B_P_1050",
     )
+
+
+@dataclass(frozen=True)
+class ETFConfig:
+    enabled: bool = True
+    trading_enabled: bool = True
+    symbol: str = "ETF"
+    alpha_from_a: float = 0.60
+    alpha_from_a_earnings: float | None = None
+    alpha_from_a_news: float | None = None
+    alpha_max: float = 1.0
+    alpha_step: float = 0.05
+    max_position: int = 100
+    quote_size: int = 16
+    target_position_per_etf_tick: float = 1.0
+    target_position_per_a_shock_inventory: float = 0.35
+    min_a_fair_shift_ticks: int = 20
+    min_projected_edge_ticks: int = 3
+    exit_band_ticks: int = 2
+    min_hold_ms: int = 3_000
+    max_hold_ms: int = 12_500
+    major_a_shock_fair_shift_ticks: int = 60
+    major_a_shock_target_inventory: int = 150
+    min_target_position_for_major_a_shock: int = 60
+    min_book_spread_ticks: int = 1
+    reprice_cooldown_ms: int = 100
+    reprice_threshold_ticks: int = 2
+    min_eval_interval_ms: int = 100
+    unwind_reprice_threshold_ticks: int = 8
+    entry_retry_window_ms: int = 1_500
+    entry_force_aggressive_ms: int = 250
+    entry_retry_reprice_ms: int = 125
+    churn_window_ms: int = 250
+    churn_max_top_of_book_updates: int = 25
+    churn_resume_stable_ms: int = 500
 
 
 @dataclass(frozen=True)
@@ -183,10 +289,12 @@ class BotPaths:
 class TraceConfig:
     trace_enabled: bool = False
     trace_root: Path | None = None
-    trace_snapshot_interval_ms: int = 500
-    trace_book_depth_levels: int = 10
+    trace_snapshot_interval_ms: int = 2_000
+    trace_book_depth_levels: int = 1
     trace_markout_windows_ms: tuple[int, ...] = (250, 1_000, 5_000)
     trace_write_summary_on_shutdown: bool = True
+    trace_record_book_updates: bool = False
+    trace_record_observe_only_decisions: bool = False
 
 
 @dataclass(frozen=True)
@@ -194,6 +302,7 @@ class BotConfig:
     exchange: ExchangeConfig
     market_a: AConfig
     market_b: BConfig
+    etf: ETFConfig
     risk: RiskConfig
     paths: BotPaths
     trace: TraceConfig
@@ -422,16 +531,135 @@ def load_bot_config(
             enabled=_optional_bool("B_ENABLED", True),
             trading_enabled=_optional_bool("B_TRADING_ENABLED", True),
             observe_only=_optional_bool("B_OBSERVE_ONLY", False),
+            allow_trading_with_ayush_port=_optional_bool("B_ALLOW_TRADING_WITH_AYUSH_PORT", True),
+            mm_v2_enabled=_optional_bool("B_MM_V2_ENABLED", True),
+            meanrev_enabled=_optional_bool("B_MEANREV_ENABLED", True),
             signal_snapshot_interval_ms=_optional_int("B_SIGNAL_SNAPSHOT_INTERVAL_MS", 250) or 250,
             signal_change_threshold_ticks=_optional_int("B_SIGNAL_CHANGE_THRESHOLD_TICKS", 1) or 1,
-            quote_size=_optional_int("B_QUOTE_SIZE", 1) or 1,
-            max_position=_optional_int("B_MAX_POSITION", 8) or 8,
+            quote_size=_optional_int(
+                "B_MM_V2_QUOTE_SIZE",
+                _optional_int("B_QUOTE_SIZE", 1) or 1,
+            ) or 1,
+            max_position=_optional_int(
+                "B_MM_V2_MAX_POSITION",
+                _optional_int("B_MAX_POSITION", 4) or 4,
+            ) or 4,
             base_half_spread_ticks=_optional_int("B_BASE_HALF_SPREAD_TICKS", 2) or 2,
             inventory_skew_ticks_per_unit=_optional_float("B_INVENTORY_SKEW_TICKS_PER_UNIT", 0.5) or 0.5,
-            passive_reduce_start=_optional_int("B_PASSIVE_REDUCE_START", 4) or 4,
-            passive_reduce_full=_optional_int("B_PASSIVE_REDUCE_FULL", 8) or 8,
+            passive_reduce_start=_optional_int("B_PASSIVE_REDUCE_START", 3) or 3,
+            passive_reduce_full=_optional_int("B_PASSIVE_REDUCE_FULL", 4) or 4,
             min_book_spread=_optional_int("B_MIN_BOOK_SPREAD", 6) or 6,
             max_synthetic_dispersion=_optional_int("B_MAX_SYNTHETIC_DISPERSION", 4) or 4,
+            mm_v2_book_weight=_optional_float("B_MM_V2_BOOK_WEIGHT", 0.70) or 0.70,
+            mm_v2_synth_weight=_optional_float("B_MM_V2_SYNTH_WEIGHT", 0.30) or 0.30,
+            mm_v2_min_half_spread_ticks=_optional_int("B_MM_V2_MIN_HALF_SPREAD_TICKS", 1) or 1,
+            mm_v2_inside_improve_ticks=_optional_int("B_MM_V2_INSIDE_IMPROVE_TICKS", 1) or 1,
+            mm_v2_dispersion_widen_factor=_optional_float("B_MM_V2_DISPERSION_WIDEN_FACTOR", 0.50) or 0.50,
+            mm_v2_reduce_size_bonus=_optional_int("B_MM_V2_REDUCE_SIZE_BONUS", 1) or 1,
+            mm_min_eval_interval_ms=_optional_int("B_MM_MIN_EVAL_INTERVAL_MS", 150) or 150,
+            mm_reprice_threshold_ticks=_optional_int("B_MM_REPRICE_THRESHOLD_TICKS", 3) or 3,
+            mm_min_valid_spread_ticks=_optional_int("B_MM_MIN_VALID_SPREAD_TICKS", 3) or 3,
+            mm_min_healthy_book_age_ms=_optional_int("B_MM_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
+            mm_cancel_on_bad_book=_optional_bool("B_MM_CANCEL_ON_BAD_BOOK", True),
+            mm_bad_fill_cooldown_ms=_optional_int("B_MM_BAD_FILL_COOLDOWN_MS", 750) or 750,
+            meanrev_max_position=_optional_int("B_MEANREV_MAX_POSITION", 16) or 16,
+            meanrev_quote_size=_optional_int("B_MEANREV_QUOTE_SIZE", 2) or 2,
+            meanrev_ema_fast_ms=_optional_int("B_MEANREV_EMA_FAST_MS", 30_000) or 30_000,
+            meanrev_ema_slow_ms=_optional_int("B_MEANREV_EMA_SLOW_MS", 180_000) or 180_000,
+            meanrev_vol_ewma_ms=_optional_int("B_MEANREV_VOL_EWMA_MS", 60_000) or 60_000,
+            meanrev_sigma_floor=_optional_float("B_MEANREV_SIGMA_FLOOR", 4.0) or 4.0,
+            meanrev_entry_z=_optional_float("B_MEANREV_ENTRY_Z", 1.25) or 1.25,
+            meanrev_entry_z2=_optional_float("B_MEANREV_ENTRY_Z2", 2.25) or 2.25,
+            meanrev_exit_z=_optional_float("B_MEANREV_EXIT_Z", 0.35) or 0.35,
+            meanrev_stop_z=_optional_float("B_MEANREV_STOP_Z", 5.0) or 5.0,
+            meanrev_min_spread_ticks=_optional_int("B_MEANREV_MIN_SPREAD_TICKS", 3) or 3,
+            meanrev_max_hold_ms=_optional_int("B_MEANREV_MAX_HOLD_MS", 120_000) or 120_000,
+            meanrev_cooldown_ms=_optional_int("B_MEANREV_COOLDOWN_MS", 1_500) or 1_500,
+            meanrev_aggressive_entry_z=_optional_float("B_MEANREV_AGGRESSIVE_ENTRY_Z", 2.75) or 2.75,
+            meanrev_aggressive_exit=_optional_bool("B_MEANREV_AGGRESSIVE_EXIT", True),
+            meanrev_entry_ticks=_optional_int("B_MEANREV_ENTRY_TICKS", 10) or 10,
+            meanrev_full_entry_ticks=_optional_int("B_MEANREV_FULL_ENTRY_TICKS", 15) or 15,
+            meanrev_exit_ticks=_optional_int("B_MEANREV_EXIT_TICKS", 3) or 3,
+            meanrev_base_target=_optional_int("B_MEANREV_BASE_TARGET", 6) or 6,
+            meanrev_full_target=_optional_int("B_MEANREV_FULL_TARGET", 16) or 16,
+            meanrev_extreme_entry_ticks=_optional_int("B_MEANREV_EXTREME_ENTRY_TICKS", 20) or 20,
+            meanrev_risk_off_deviation_ticks=_optional_int("B_MEANREV_RISK_OFF_DEVIATION_TICKS", 35) or 35,
+            meanrev_turn_confirm_ms=_optional_int("B_MEANREV_TURN_CONFIRM_MS", 300) or 300,
+            meanrev_min_healthy_book_age_ms=_optional_int("B_MEANREV_MIN_HEALTHY_BOOK_AGE_MS", 500) or 500,
+            meanrev_bad_fill_cooldown_ms=_optional_int("B_MEANREV_BAD_FILL_COOLDOWN_MS", 1_000) or 1_000,
+            basis_entry_threshold_ticks=_optional_float("B_BASIS_ENTRY_THRESHOLD_TICKS", 1.25) or 1.25,
+            basis_strong_threshold_ticks=_optional_float("B_BASIS_STRONG_THRESHOLD_TICKS", 2.5) or 2.5,
+            imbalance_confirmation_threshold=_optional_float("B_IMBALANCE_CONFIRMATION_THRESHOLD", 0.15) or 0.15,
+            far_side_widen_ticks=_optional_int("B_FAR_SIDE_WIDEN_TICKS", 4) or 4,
+            parity_enabled=_optional_bool("B_PARITY_ENABLED", False),
+            parity_shadow_enabled=_optional_bool("B_PARITY_SHADOW_ENABLED", True),
+            parity_edge_threshold_ticks=_optional_int("B_PARITY_EDGE_THRESHOLD_TICKS", 8) or 8,
+            parity_trade_size=_optional_int("B_PARITY_TRADE_SIZE", 1) or 1,
+            parity_max_exposure=_optional_int("B_PARITY_MAX_EXPOSURE", 3) or 3,
+            parity_max_quote_age_ms=_optional_int("B_PARITY_MAX_QUOTE_AGE_MS", 1_000) or 1_000,
+            option_lottery_enabled=_optional_bool("B_OPTION_LOTTERY_ENABLED", True),
+            option_lottery_max_ask=_optional_int("B_OPTION_LOTTERY_MAX_ASK", 3) or 3,
+            option_lottery_floor_ask=_optional_int("B_OPTION_LOTTERY_FLOOR_ASK", 0) or 0,
+            option_lottery_quote_size=_optional_int("B_OPTION_LOTTERY_QUOTE_SIZE", 1) or 1,
+            option_lottery_max_position_per_symbol=_optional_int("B_OPTION_LOTTERY_MAX_POSITION_PER_SYMBOL", 20) or 20,
+            option_lottery_wing_max_position=_optional_int("B_OPTION_LOTTERY_WING_MAX_POSITION", 200) or 200,
+            option_lottery_atm_max_position=_optional_int("B_OPTION_LOTTERY_ATM_MAX_POSITION", 40) or 40,
+            option_lottery_total_premium_budget=_optional_int("B_OPTION_LOTTERY_TOTAL_PREMIUM_BUDGET", 1_500) or 1_500,
+            option_lottery_wing_premium_budget=_optional_int("B_OPTION_LOTTERY_WING_PREMIUM_BUDGET", 600) or 600,
+            option_lottery_c1050_premium_budget=_optional_int("B_OPTION_C1050_PREMIUM_BUDGET", 450) or 450,
+            option_lottery_p950_premium_budget=_optional_int("B_OPTION_P950_PREMIUM_BUDGET", 450) or 450,
+            option_lottery_atm_total_premium_budget=_optional_int("B_OPTION_LOTTERY_ATM_TOTAL_PREMIUM_BUDGET", 300) or 300,
+            option_lottery_near_strike_ticks=_optional_int("B_OPTION_LOTTERY_NEAR_STRIKE_TICKS", 80) or 80,
+            option_lottery_min_momentum_ticks=_optional_float("B_OPTION_LOTTERY_MIN_MOMENTUM_TICKS", 1.0) or 1.0,
+            option_lottery_rebuy_cooldown_ms=_optional_int("B_OPTION_LOTTERY_REBUY_COOLDOWN_MS", 1_000) or 1_000,
+            option_lottery_profit_take_enabled=_optional_bool("B_OPTION_LOTTERY_PROFIT_TAKE_ENABLED", True),
+            option_lottery_profit_take_min_edge=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_MIN_EDGE", 6) or 6,
+            option_lottery_profit_take_multiple=_optional_float("B_OPTION_LOTTERY_PROFIT_TAKE_MULTIPLE", 2.0) or 2.0,
+            option_lottery_profit_take_quote_size=_optional_int("B_OPTION_LOTTERY_PROFIT_TAKE_QUOTE_SIZE", 20) or 20,
+            option_lottery_stale_hold_ms=_optional_int("B_OPTION_LOTTERY_STALE_HOLD_MS", 45_000) or 45_000,
+            option_hedge_enabled=_optional_bool("B_OPTION_HEDGE_ENABLED", True),
+            option_hedge_max_ask=_optional_int("B_OPTION_HEDGE_MAX_ASK", 6) or 6,
+            option_hedge_min_underlying_inventory=_optional_int("B_OPTION_HEDGE_MIN_UNDERLYING_INVENTORY", 4) or 4,
+            option_hedge_target_ratio=_optional_float("B_OPTION_HEDGE_TARGET_RATIO", 0.5) or 0.5,
+            option_hedge_premium_budget=_optional_int("B_OPTION_HEDGE_PREMIUM_BUDGET", 300) or 300,
+        ),
+        etf=ETFConfig(
+            enabled=_optional_bool("ETF_ENABLED", True),
+            trading_enabled=_optional_bool("ETF_TRADING_ENABLED", True),
+            symbol=str(os.getenv("ETF_SYMBOL", "ETF") or "ETF").strip(),
+            alpha_from_a=min(
+                _optional_float("ETF_ALPHA_MAX", 1.0) or 1.0,
+                max(0.0, _optional_float("ETF_ALPHA_FROM_A", 0.60) or 0.60),
+            ),
+            alpha_from_a_earnings=_optional_float("ETF_ALPHA_FROM_A_EARNINGS", None),
+            alpha_from_a_news=_optional_float("ETF_ALPHA_FROM_A_NEWS", None),
+            alpha_max=_optional_float("ETF_ALPHA_MAX", 1.0) or 1.0,
+            alpha_step=_optional_float("ETF_ALPHA_STEP", 0.05) or 0.05,
+            max_position=_optional_int("ETF_MAX_POSITION", 100) or 100,
+            quote_size=_optional_int("ETF_QUOTE_SIZE", 16) or 16,
+            target_position_per_etf_tick=_optional_float("ETF_TARGET_POSITION_PER_TICK", 1.0) or 1.0,
+            target_position_per_a_shock_inventory=(
+                _optional_float("ETF_TARGET_POSITION_PER_A_SHOCK_INVENTORY", 0.35) or 0.35
+            ),
+            min_a_fair_shift_ticks=_optional_int("ETF_MIN_A_FAIR_SHIFT_TICKS", 20) or 20,
+            min_projected_edge_ticks=_optional_int("ETF_MIN_PROJECTED_EDGE_TICKS", 3) or 3,
+            exit_band_ticks=_optional_int("ETF_EXIT_BAND_TICKS", 2) or 2,
+            min_hold_ms=_optional_int("ETF_MIN_HOLD_MS", 3_000) or 3_000,
+            max_hold_ms=_optional_int("ETF_MAX_HOLD_MS", 12_500) or 12_500,
+            major_a_shock_fair_shift_ticks=_optional_int("ETF_MAJOR_A_SHOCK_FAIR_SHIFT_TICKS", 60) or 60,
+            major_a_shock_target_inventory=_optional_int("ETF_MAJOR_A_SHOCK_TARGET_INVENTORY", 150) or 150,
+            min_target_position_for_major_a_shock=_optional_int("ETF_MIN_TARGET_POSITION_FOR_MAJOR_A_SHOCK", 60) or 60,
+            min_book_spread_ticks=_optional_int("ETF_MIN_BOOK_SPREAD_TICKS", 1) or 1,
+            reprice_cooldown_ms=_optional_int("ETF_REPRICE_COOLDOWN_MS", 100) or 100,
+            reprice_threshold_ticks=_optional_int("ETF_REPRICE_THRESHOLD_TICKS", 2) or 2,
+            min_eval_interval_ms=_optional_int("ETF_MIN_EVAL_INTERVAL_MS", 100) or 100,
+            unwind_reprice_threshold_ticks=_optional_int("ETF_UNWIND_REPRICE_THRESHOLD_TICKS", 8) or 8,
+            entry_retry_window_ms=_optional_int("ETF_ENTRY_RETRY_WINDOW_MS", 1_500) or 1_500,
+            entry_force_aggressive_ms=_optional_int("ETF_ENTRY_FORCE_AGGRESSIVE_MS", 250) or 250,
+            entry_retry_reprice_ms=_optional_int("ETF_ENTRY_RETRY_REPRICE_MS", 125) or 125,
+            churn_window_ms=_optional_int("ETF_CHURN_WINDOW_MS", 250) or 250,
+            churn_max_top_of_book_updates=_optional_int("ETF_CHURN_MAX_TOP_OF_BOOK_UPDATES", 25) or 25,
+            churn_resume_stable_ms=_optional_int("ETF_CHURN_RESUME_STABLE_MS", 500) or 500,
         ),
         risk=RiskConfig(
             reprice_cooldown_ms=_optional_int("A_REPRICE_COOLDOWN_MS", 250) or 250,
@@ -445,10 +673,12 @@ def load_bot_config(
         trace=TraceConfig(
             trace_enabled=_optional_bool("TRACE_ENABLED", False),
             trace_root=trace_root,
-            trace_snapshot_interval_ms=_optional_int("TRACE_SNAPSHOT_INTERVAL_MS", 500) or 500,
-            trace_book_depth_levels=_optional_int("TRACE_BOOK_DEPTH_LEVELS", 10) or 10,
+            trace_snapshot_interval_ms=_optional_int("TRACE_SNAPSHOT_INTERVAL_MS", 2_000) or 2_000,
+            trace_book_depth_levels=_optional_int("TRACE_BOOK_DEPTH_LEVELS", 1) or 1,
             trace_markout_windows_ms=_optional_int_tuple("TRACE_MARKOUT_WINDOWS_MS", (250, 1_000, 5_000)),
             trace_write_summary_on_shutdown=_optional_bool("TRACE_WRITE_SUMMARY_ON_SHUTDOWN", True),
+            trace_record_book_updates=_optional_bool("TRACE_RECORD_BOOK_UPDATES", False),
+            trace_record_observe_only_decisions=_optional_bool("TRACE_RECORD_OBSERVE_ONLY_DECISIONS", False),
         ),
         a_strategy_mode=str(os.getenv("A_STRATEGY_MODE", "ayush_port") or "ayush_port").strip().lower(),
         auto_stop_after_round_complete=_optional_bool("AUTO_STOP_AFTER_ROUND_COMPLETE", True),

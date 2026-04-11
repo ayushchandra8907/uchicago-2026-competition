@@ -10,8 +10,9 @@ from pathlib import Path
 from .analyze_run import write_run_outputs
 from .config import BotConfig, ConfigError, MarketCStrategyConfig, StrategyConfig, load_bot_config
 from .core.logger import RunLogger, load_trace_events
-from .core.types import BookSnapshot, Decision, ManagedOrder, NewsEvent, StrategySnapshot
+from .core.types import BookSnapshot, Decision, DesiredOrder, ManagedOrder, NewsEvent, StrategySnapshot
 from .market_A_strategy import AStrategy
+from .market_C_maker_strategy import CMarketMakerStrategy
 from .market_C_strategy import CStrategy
 
 try:
@@ -25,7 +26,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 A_TRADING_ENABLE = False
 C_TRADING_ENABLE = True
-ACTIVE_STRATEGY = "C"
+ACTIVE_STRATEGY = "CM"
+GLOBAL_MACRO_FLATTEN_INTENT = "global_macro_risk_off_flatten"
 
 
 def _inspect_message_body(msg) -> tuple[str | None, bool]:
@@ -53,12 +55,20 @@ class BotRunner(XChangeClient):
         self.config = config
         self.active_strategy = str(active_strategy or "A").upper()
         if self.active_strategy == "A":
-            tracked_symbols = (config.strategy.symbol,)
+            strategy_symbols = (config.strategy.symbol,)
+            tracked_symbols = strategy_symbols
             self.strategy = AStrategy(config.strategy)
             self._primary_symbol = config.strategy.symbol
             session_prefix = "marketA_v3"
+        elif self.active_strategy == "CM":
+            strategy_symbols = (config.c_mm_strategy.symbol,)
+            tracked_symbols = strategy_symbols
+            self.strategy = CMarketMakerStrategy(config.c_mm_strategy)
+            self._primary_symbol = config.c_mm_strategy.symbol
+            session_prefix = "marketCmm_v1"
         elif self.active_strategy == "C":
-            tracked_symbols = config.c_strategy.tracked_symbols
+            strategy_symbols = config.c_strategy.tracked_symbols
+            tracked_symbols = (config.strategy.symbol, *config.c_strategy.tracked_symbols)
             self.strategy = CStrategy(config.c_strategy)
             self._primary_symbol = config.c_strategy.fed_hold
             session_prefix = "marketC_v1"
@@ -67,6 +77,8 @@ class BotRunner(XChangeClient):
 
         self._tracked_symbols = tuple(tracked_symbols)
         self._tracked_symbol_set = set(self._tracked_symbols)
+        self._strategy_symbols = tuple(strategy_symbols)
+        self._strategy_symbol_set = set(self._strategy_symbols)
 
         super().__init__(
             config.exchange.host,
@@ -97,6 +109,10 @@ class BotRunner(XChangeClient):
         self._midrun_checkpoint_task: asyncio.Task | None = None
         self._connected_once = False
         self._stop_after_c_market_resolved = False
+        self._global_macro_flatten_until_ms: int | None = None
+        self._global_macro_flatten_reason: str | None = None
+        self._global_macro_flatten_context_id: str | None = None
+        self._global_macro_flatten_source: str | None = None
         self.a_trading_enable = a_trading_enable
         self.c_trading_enable = c_trading_enable
 
@@ -279,6 +295,8 @@ class BotRunner(XChangeClient):
         event_symbol = news_event.symbol if news_event.symbol in self._tracked_symbol_set else None
         decision = self.strategy.on_news(self._snapshot(event_symbol=event_symbol), news_event)
         strategy_state = self.strategy.export_state()
+        if self._should_arm_global_macro_flatten(strategy_state):
+            self._arm_global_macro_flatten(now_ms, strategy_state)
         rate_contract_snapshot = self._rate_contract_snapshot() if self.active_strategy == "C" else None
         if self.logger is not None:
             self.logger.record_event(
@@ -309,12 +327,22 @@ class BotRunner(XChangeClient):
                 posterior_hike=strategy_state.get("posterior_hike"),
                 posterior_hold=strategy_state.get("posterior_hold"),
                 posterior_cut=strategy_state.get("posterior_cut"),
+                terminal_hike=strategy_state.get("terminal_hike"),
+                terminal_hold=strategy_state.get("terminal_hold"),
+                terminal_cut=strategy_state.get("terminal_cut"),
                 fair_value_hike=strategy_state.get("fair_value_hike"),
                 fair_value_hold=strategy_state.get("fair_value_hold"),
                 fair_value_cut=strategy_state.get("fair_value_cut"),
                 prior_hike=strategy_state.get("prior_hike"),
                 prior_hold=strategy_state.get("prior_hold"),
                 prior_cut=strategy_state.get("prior_cut"),
+                market_prior_hike=strategy_state.get("market_prior_hike"),
+                market_prior_hold=strategy_state.get("market_prior_hold"),
+                market_prior_cut=strategy_state.get("market_prior_cut"),
+                memory_logit_hike=strategy_state.get("memory_logit_hike"),
+                memory_logit_hold=strategy_state.get("memory_logit_hold"),
+                memory_logit_cut=strategy_state.get("memory_logit_cut"),
+                dominant_regime=strategy_state.get("dominant_regime"),
                 expected_rate_delta_bp=strategy_state.get("expected_rate_delta_bp"),
                 rate_macro_event_id=strategy_state.get("rate_macro_event_id"),
                 rate_signal_source=strategy_state.get("rate_signal_source"),
@@ -325,6 +353,9 @@ class BotRunner(XChangeClient):
                 rate_target_inventory=strategy_state.get("rate_target_inventory"),
                 rate_chosen_edge_ticks=strategy_state.get("rate_chosen_edge_ticks"),
                 rate_no_arb_gap_ticks=strategy_state.get("rate_no_arb_gap_ticks"),
+                rate_dominant_regime=strategy_state.get("rate_dominant_regime"),
+                rate_contrary_signal_score=strategy_state.get("rate_contrary_signal_score"),
+                rate_regime_break_score=strategy_state.get("rate_regime_break_score"),
                 rate_long_edge_hike=strategy_state.get("rate_long_edge_hike"),
                 rate_long_edge_hold=strategy_state.get("rate_long_edge_hold"),
                 rate_long_edge_cut=strategy_state.get("rate_long_edge_cut"),
@@ -374,6 +405,11 @@ class BotRunner(XChangeClient):
                 rate_reversion_last_event_reason=strategy_state.get("rate_reversion_last_event_reason"),
                 rate_reversion_last_entry_px=strategy_state.get("rate_reversion_last_entry_px"),
                 rate_reversion_last_exit_px=strategy_state.get("rate_reversion_last_exit_px"),
+                rate_global_flatten_signal=strategy_state.get("rate_global_flatten_signal"),
+                rate_global_flatten_reason=strategy_state.get("rate_global_flatten_reason"),
+                global_macro_flatten_active=self._global_macro_flatten_active(now_ms),
+                global_macro_flatten_until_ms=self._global_macro_flatten_until_ms,
+                global_macro_flatten_reason=self._global_macro_flatten_reason,
                 rate_contract_snapshot_t0=rate_contract_snapshot,
                 inventory=self._inventory(event_symbol or self._primary_symbol),
                 cash=self._cash(),
@@ -566,6 +602,10 @@ class BotRunner(XChangeClient):
         focus_symbol = self._decision_focus_symbol(decision, event_symbol=event_symbol)
         snapshot = self._snapshot(event_symbol=event_symbol, focus_symbol=focus_symbol)
         strategy_state = self.strategy.export_state()
+        if self._global_macro_flatten_active(snapshot.now_ms, snapshot=snapshot):
+            decision = self._global_flatten_decision(snapshot, event_symbol=event_symbol, current_decision=decision)
+            focus_symbol = self._decision_focus_symbol(decision, event_symbol=event_symbol)
+            snapshot = self._snapshot(event_symbol=event_symbol, focus_symbol=focus_symbol)
         current_edge_ticks = None
         if decision.fair_value is not None and snapshot.book.mid is not None:
             current_edge_ticks = float(decision.fair_value) - float(snapshot.book.mid)
@@ -622,12 +662,22 @@ class BotRunner(XChangeClient):
                     "posterior_hike": strategy_state.get("posterior_hike"),
                     "posterior_hold": strategy_state.get("posterior_hold"),
                     "posterior_cut": strategy_state.get("posterior_cut"),
+                    "terminal_hike": strategy_state.get("terminal_hike"),
+                    "terminal_hold": strategy_state.get("terminal_hold"),
+                    "terminal_cut": strategy_state.get("terminal_cut"),
                     "fair_value_hike": strategy_state.get("fair_value_hike"),
                     "fair_value_hold": strategy_state.get("fair_value_hold"),
                     "fair_value_cut": strategy_state.get("fair_value_cut"),
                     "prior_hike": strategy_state.get("prior_hike"),
                     "prior_hold": strategy_state.get("prior_hold"),
                     "prior_cut": strategy_state.get("prior_cut"),
+                    "market_prior_hike": strategy_state.get("market_prior_hike"),
+                    "market_prior_hold": strategy_state.get("market_prior_hold"),
+                    "market_prior_cut": strategy_state.get("market_prior_cut"),
+                    "memory_logit_hike": strategy_state.get("memory_logit_hike"),
+                    "memory_logit_hold": strategy_state.get("memory_logit_hold"),
+                    "memory_logit_cut": strategy_state.get("memory_logit_cut"),
+                    "dominant_regime": strategy_state.get("dominant_regime"),
                     "expected_rate_delta_bp": strategy_state.get("expected_rate_delta_bp"),
                     "rate_macro_event_id": strategy_state.get("rate_macro_event_id"),
                     "rate_signal_source": strategy_state.get("rate_signal_source"),
@@ -638,6 +688,9 @@ class BotRunner(XChangeClient):
                     "rate_target_inventory": strategy_state.get("rate_target_inventory"),
                     "rate_chosen_edge_ticks": strategy_state.get("rate_chosen_edge_ticks"),
                     "rate_no_arb_gap_ticks": strategy_state.get("rate_no_arb_gap_ticks"),
+                    "rate_dominant_regime": strategy_state.get("rate_dominant_regime"),
+                    "rate_contrary_signal_score": strategy_state.get("rate_contrary_signal_score"),
+                    "rate_regime_break_score": strategy_state.get("rate_regime_break_score"),
                     "rate_long_edge_hike": strategy_state.get("rate_long_edge_hike"),
                     "rate_long_edge_hold": strategy_state.get("rate_long_edge_hold"),
                     "rate_long_edge_cut": strategy_state.get("rate_long_edge_cut"),
@@ -687,6 +740,18 @@ class BotRunner(XChangeClient):
                     "rate_reversion_last_event_reason": strategy_state.get("rate_reversion_last_event_reason"),
                     "rate_reversion_last_entry_px": strategy_state.get("rate_reversion_last_entry_px"),
                     "rate_reversion_last_exit_px": strategy_state.get("rate_reversion_last_exit_px"),
+                    "rate_global_flatten_signal": strategy_state.get("rate_global_flatten_signal"),
+                    "rate_global_flatten_reason": strategy_state.get("rate_global_flatten_reason"),
+                    "global_macro_flatten_active": self._global_macro_flatten_active(snapshot.now_ms, snapshot=snapshot),
+                    "global_macro_flatten_until_ms": self._global_macro_flatten_until_ms,
+                    "global_macro_flatten_reason": self._global_macro_flatten_reason,
+                    "mm_microprice": strategy_state.get("mm_microprice"),
+                    "mm_recent_trade_count": strategy_state.get("mm_recent_trade_count"),
+                    "mm_flow_score": strategy_state.get("mm_flow_score"),
+                    "mm_burst_active": strategy_state.get("mm_burst_active"),
+                    "mm_quote_side": strategy_state.get("mm_quote_side"),
+                    "mm_quote_px": strategy_state.get("mm_quote_px"),
+                    "mm_quote_reason": strategy_state.get("mm_quote_reason"),
                     "desired_side": None if desired is None else desired.side,
                     "desired_px": None if desired is None else desired.px,
                     "desired_qty": None if desired is None else desired.qty,
@@ -723,7 +788,7 @@ class BotRunner(XChangeClient):
             if desired is None:
                 return
 
-            if not self._trading_enabled_for_symbol(desired.symbol):
+            if not self._trading_enabled_for_symbol(desired.symbol) and not self._is_global_macro_flatten_order(desired):
                 if current_orders:
                     await self._cancel_managed_orders(current_orders, cancel_reason=f"{desired.symbol} execution disabled")
                 return
@@ -1027,12 +1092,132 @@ class BotRunner(XChangeClient):
     def _decision_focus_symbol(self, decision: Decision | None, *, event_symbol: str | None = None) -> str:
         if decision is not None and decision.desired_order is not None:
             return decision.desired_order.symbol
-        if event_symbol is not None and event_symbol in self._tracked_symbol_set:
+        if event_symbol is not None and event_symbol in self._strategy_symbol_set:
             return event_symbol
         active_symbol = getattr(self.strategy, "active_target_symbol", None)
-        if active_symbol in self._tracked_symbol_set:
+        if active_symbol in self._strategy_symbol_set:
             return str(active_symbol)
         return self._primary_symbol
+
+    def _should_arm_global_macro_flatten(self, strategy_state: dict) -> bool:
+        if self.active_strategy != "C":
+            return False
+        return bool(strategy_state.get("rate_global_flatten_signal"))
+
+    def _arm_global_macro_flatten(self, now_ms: int, strategy_state: dict) -> None:
+        window_ms = max(1, int(self.config.c_strategy.macro_signal_timeout_ms))
+        until_ms = int(now_ms) + window_ms
+        self._global_macro_flatten_until_ms = until_ms if self._global_macro_flatten_until_ms is None else max(self._global_macro_flatten_until_ms, until_ms)
+        self._global_macro_flatten_reason = str(
+            strategy_state.get("rate_global_flatten_reason")
+            or strategy_state.get("rate_no_trade_reason")
+            or "major macro shock; flattening all positions"
+        )
+        context_id = strategy_state.get("rate_macro_event_id")
+        signal_source = strategy_state.get("rate_signal_source")
+        self._global_macro_flatten_context_id = None if context_id is None else str(context_id)
+        self._global_macro_flatten_source = None if signal_source is None else str(signal_source)
+
+    def _clear_global_macro_flatten(self) -> None:
+        self._global_macro_flatten_until_ms = None
+        self._global_macro_flatten_reason = None
+        self._global_macro_flatten_context_id = None
+        self._global_macro_flatten_source = None
+
+    def _global_macro_flatten_active(self, now_ms: int, *, snapshot: StrategySnapshot | None = None) -> bool:
+        if self._global_macro_flatten_until_ms is None:
+            return False
+        if int(now_ms) <= int(self._global_macro_flatten_until_ms):
+            return True
+        if snapshot is not None:
+            has_residual_inventory = any(snapshot.inventory_for(symbol) != 0 for symbol in self._tracked_symbols)
+            has_open_orders = any(snapshot.open_orders_for(symbol) for symbol in self._tracked_symbols)
+            if has_residual_inventory or has_open_orders:
+                return True
+        self._clear_global_macro_flatten()
+        return False
+
+    @staticmethod
+    def _is_global_macro_flatten_order(desired: DesiredOrder) -> bool:
+        return str(desired.intent) == GLOBAL_MACRO_FLATTEN_INTENT
+
+    def _global_flatten_decision(
+        self,
+        snapshot: StrategySnapshot,
+        *,
+        event_symbol: str | None = None,
+        current_decision: Decision | None = None,
+    ) -> Decision:
+        reason = self._global_macro_flatten_reason or "major macro shock; flattening all positions"
+        positions = {symbol: snapshot.inventory_for(symbol) for symbol in self._tracked_symbols}
+        candidate_symbols: list[str] = []
+        if event_symbol in self._tracked_symbol_set and positions.get(str(event_symbol), 0) != 0:
+            candidate_symbols.append(str(event_symbol))
+        for symbol, qty in sorted(positions.items(), key=lambda item: abs(item[1]), reverse=True):
+            if qty != 0 and symbol not in candidate_symbols:
+                candidate_symbols.append(symbol)
+
+        for symbol in candidate_symbols:
+            qty = int(positions[symbol])
+            book = snapshot.book_for(symbol)
+            if qty > 0 and book.best_bid is not None:
+                return Decision(
+                    mode="UNWIND",
+                    target_inventory=0,
+                    desired_order=DesiredOrder(
+                        side="SELL",
+                        px=book.best_bid.px,
+                        qty=abs(qty),
+                        aggressive=True,
+                        intent=GLOBAL_MACRO_FLATTEN_INTENT,
+                        reason=reason,
+                        symbol=symbol,
+                        context_id=self._global_macro_flatten_context_id,
+                    ),
+                    cancel_all=True,
+                    observe_only=False,
+                    reason=reason,
+                    fair_value=None,
+                )
+            if qty < 0 and book.best_ask is not None:
+                return Decision(
+                    mode="UNWIND",
+                    target_inventory=0,
+                    desired_order=DesiredOrder(
+                        side="BUY",
+                        px=book.best_ask.px,
+                        qty=abs(qty),
+                        aggressive=True,
+                        intent=GLOBAL_MACRO_FLATTEN_INTENT,
+                        reason=reason,
+                        symbol=symbol,
+                        context_id=self._global_macro_flatten_context_id,
+                    ),
+                    cancel_all=True,
+                    observe_only=False,
+                    reason=reason,
+                    fair_value=None,
+                )
+
+        if any(snapshot.open_orders_for(symbol) for symbol in self._tracked_symbols):
+            return Decision(
+                mode="UNWIND",
+                target_inventory=0,
+                desired_order=None,
+                cancel_all=True,
+                observe_only=True,
+                reason=reason,
+                fair_value=None,
+            )
+        return Decision(
+            mode="IDLE",
+            target_inventory=0,
+            desired_order=None,
+            cancel_all=False,
+            observe_only=True,
+            reason=reason,
+            fair_value=None,
+        )
 
     def _execution_enabled(self) -> bool:
         return self.a_trading_enable if self.active_strategy == "A" else self.c_trading_enable
@@ -1040,6 +1225,8 @@ class BotRunner(XChangeClient):
     def _trading_enabled_for_symbol(self, symbol: str) -> bool:
         if symbol == self.config.strategy.symbol:
             return self.a_trading_enable
+        if symbol == self.config.c_mm_strategy.symbol:
+            return self.c_trading_enable
         if symbol in set(self.config.c_strategy.tracked_symbols):
             return self.c_trading_enable
         return False
@@ -1047,6 +1234,8 @@ class BotRunner(XChangeClient):
     def _strategy_order_config(self, symbol: str) -> StrategyConfig | MarketCStrategyConfig:
         if symbol == self.config.strategy.symbol:
             return self.config.strategy
+        if symbol == self.config.c_mm_strategy.symbol:
+            return self.config.c_mm_strategy
         if symbol in set(self.config.c_strategy.tracked_symbols):
             return self.config.c_strategy
         return self.config.strategy

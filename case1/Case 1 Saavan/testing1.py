@@ -14,8 +14,13 @@ from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import MarketAStrategy
 from a_bot_trace import TraceRecorder
 from ayush_a_port import AyushPortStrategy
+from b_mean_reversion import BMeanReversionStrategy
 from b_observer import MarketBObserver
+from b_option_lottery import BOptionLotteryStrategy
+from b_parity_opportunist import BParityOpportunist
 from b_underlying_mm import BUnderlyingMMStrategy
+from b_underlying_mm_v2 import BUnderlyingMMv2
+from etf_a_follower import ETFAFollowerStrategy
 
 try:
     from utcxchangelib import Side, XChangeClient
@@ -46,6 +51,8 @@ class MarketABot(XChangeClient):
 
     def __init__(self, config: BotConfig):
         subscribed_symbols = ["A"]
+        if config.etf.enabled and config.etf.symbol not in subscribed_symbols:
+            subscribed_symbols.append(config.etf.symbol)
         if config.market_b.enabled:
             subscribed_symbols.extend([config.market_b.underlying_symbol, *config.market_b.option_symbols])
         super().__init__(
@@ -62,17 +69,56 @@ class MarketABot(XChangeClient):
             signal_change_threshold_ticks=config.market_b.signal_change_threshold_ticks,
         )
         self._ayush_port_mode = config.a_strategy_mode == "ayush_port"
-        self._b_observe_only = bool(config.market_b.observe_only or self._ayush_port_mode)
+        self._b_observe_only = bool(
+            config.market_b.observe_only
+            or (self._ayush_port_mode and not config.market_b.allow_trading_with_ayush_port)
+        )
         self._b_trading_enabled = bool(config.market_b.enabled and config.market_b.trading_enabled and not self._b_observe_only)
+        if config.market_b.meanrev_enabled:
+            b_strategy_cls = BMeanReversionStrategy
+        else:
+            b_strategy_cls = BUnderlyingMMv2 if config.market_b.mm_v2_enabled else BUnderlyingMMStrategy
+        b_risk = replace(
+            config.risk,
+            passive_reprice_threshold_ticks=int(config.market_b.mm_reprice_threshold_ticks),
+        )
         self.b_strategy = (
-            BUnderlyingMMStrategy(
+            b_strategy_cls(
                 config.market_b,
-                config.risk,
+                b_risk,
                 book_depth_levels=max(10, config.trace.trace_book_depth_levels),
             )
             if self._b_trading_enabled
             else None
         )
+        self.b_option_strategy = (
+            BOptionLotteryStrategy(
+                config.market_b,
+                config.risk,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
+            if bool(config.market_b.enabled and config.market_b.trading_enabled and config.market_b.option_lottery_enabled)
+            else None
+        )
+        self._last_b_eval_ms: int | None = None
+        self._last_etf_eval_ms: int | None = None
+        self._last_position_update_by_symbol: dict[str, tuple[int, int, int]] = {}
+        self._etf_trading_enabled = bool(config.etf.enabled and config.etf.trading_enabled)
+        etf_risk = replace(
+            config.risk,
+            reprice_cooldown_ms=int(config.etf.reprice_cooldown_ms),
+            passive_reprice_threshold_ticks=int(config.etf.unwind_reprice_threshold_ticks),
+        )
+        self.etf_strategy = (
+            ETFAFollowerStrategy(
+                config.etf,
+                etf_risk,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
+            if self._etf_trading_enabled
+            else None
+        )
+        self.b_parity_opportunist = BParityOpportunist(config.market_b)
         if hasattr(self.journal, "prepare_for_startup"):
             replay_state = self.journal.prepare_for_startup()
         else:
@@ -158,15 +204,52 @@ class MarketABot(XChangeClient):
                     "trace_snapshot_interval_ms": config.trace.trace_snapshot_interval_ms,
                     "trace_book_depth_levels": config.trace.trace_book_depth_levels,
                     "trace_markout_windows_ms": list(config.trace.trace_markout_windows_ms),
+                    "trace_record_book_updates": config.trace.trace_record_book_updates,
+                    "trace_record_observe_only_decisions": config.trace.trace_record_observe_only_decisions,
                     "journal_path": str(config.paths.journal_path),
                     "trace_root": str(config.trace.trace_root),
                     "recover_pricing_state": config.market_a.recover_pricing_state,
                     "a_strategy_mode": config.a_strategy_mode,
+                    "etf_enabled": config.etf.enabled,
+                    "etf_trading_enabled": self._etf_trading_enabled,
+                    "etf_alpha_from_a": config.etf.alpha_from_a,
+                    "etf_alpha_from_a_earnings": config.etf.alpha_from_a_earnings,
+                    "etf_alpha_from_a_news": config.etf.alpha_from_a_news,
+                    "etf_max_position": config.etf.max_position,
+                    "etf_quote_size": config.etf.quote_size,
+                    "etf_target_position_per_a_shock_inventory": config.etf.target_position_per_a_shock_inventory,
+                    "etf_min_hold_ms": config.etf.min_hold_ms,
+                    "etf_min_target_position_for_major_a_shock": config.etf.min_target_position_for_major_a_shock,
                     "market_b_enabled": config.market_b.enabled,
                     "market_b_trading_enabled": self._b_trading_enabled,
                     "market_b_observe_only": self._b_observe_only,
+                    "market_b_allow_trading_with_ayush_port": config.market_b.allow_trading_with_ayush_port,
+                    "market_b_mm_v2_enabled": config.market_b.mm_v2_enabled,
+                    "market_b_parity_enabled": config.market_b.parity_enabled,
+                    "market_b_parity_shadow_enabled": config.market_b.parity_shadow_enabled,
+                    "market_b_parity_edge_threshold_ticks": config.market_b.parity_edge_threshold_ticks,
                     "market_b_signal_snapshot_interval_ms": config.market_b.signal_snapshot_interval_ms,
                     "market_b_signal_change_threshold_ticks": config.market_b.signal_change_threshold_ticks,
+                    "market_b_mm_min_eval_interval_ms": config.market_b.mm_min_eval_interval_ms,
+                    "market_b_mm_reprice_threshold_ticks": config.market_b.mm_reprice_threshold_ticks,
+                    "market_b_mm_min_valid_spread_ticks": config.market_b.mm_min_valid_spread_ticks,
+                    "market_b_mm_min_healthy_book_age_ms": config.market_b.mm_min_healthy_book_age_ms,
+                    "market_b_mm_bad_fill_cooldown_ms": config.market_b.mm_bad_fill_cooldown_ms,
+                    "market_b_meanrev_enabled": config.market_b.meanrev_enabled,
+                    "market_b_meanrev_max_position": config.market_b.meanrev_max_position,
+                    "market_b_meanrev_entry_z": config.market_b.meanrev_entry_z,
+                    "market_b_meanrev_entry_z2": config.market_b.meanrev_entry_z2,
+                    "market_b_meanrev_stop_z": config.market_b.meanrev_stop_z,
+                    "market_b_option_lottery_enabled": bool(self.b_option_strategy is not None),
+                    "market_b_option_lottery_max_ask": config.market_b.option_lottery_max_ask,
+                    "market_b_option_lottery_total_premium_budget": config.market_b.option_lottery_total_premium_budget,
+                    "market_b_option_lottery_wing_max_position": config.market_b.option_lottery_wing_max_position,
+                    "market_b_option_lottery_atm_max_position": config.market_b.option_lottery_atm_max_position,
+                    "market_b_option_hedge_enabled": config.market_b.option_hedge_enabled,
+                    "market_b_option_hedge_max_ask": config.market_b.option_hedge_max_ask,
+                    "market_b_option_hedge_premium_budget": config.market_b.option_hedge_premium_budget,
+                    "etf_min_eval_interval_ms": config.etf.min_eval_interval_ms,
+                    "etf_unwind_reprice_threshold_ticks": config.etf.unwind_reprice_threshold_ticks,
                     "auto_stop_on_market_resolved": config.auto_stop_on_market_resolved,
                     "auto_stop_on_followup_position_snapshot": config.auto_stop_on_followup_position_snapshot,
                 },
@@ -188,6 +271,16 @@ class MarketABot(XChangeClient):
             self.strategy.sync_inventory_from_exchange(a_position)
         if self.b_strategy is not None:
             self.b_strategy.sync_inventory_from_exchange(int(self.positions.get(self.config.market_b.underlying_symbol, 0)))
+        if self.b_option_strategy is not None:
+            self.b_option_strategy.sync_inventory(
+                self.config.market_b.underlying_symbol,
+                int(self.positions.get(self.config.market_b.underlying_symbol, 0)),
+                now_ms=now_ms,
+            )
+            for symbol in self.config.market_b.option_symbols:
+                self.b_option_strategy.sync_inventory(symbol, int(self.positions.get(symbol, 0)), now_ms=now_ms)
+        if self.etf_strategy is not None:
+            self.etf_strategy.sync_inventory_from_exchange(int(self.positions.get(self.config.etf.symbol, 0)), now_ms=now_ms)
         for symbol in self.b_observer.symbols:
             self.b_observer.sync_inventory(symbol, int(self.positions.get(symbol, 0)))
         self.journal.record_inventory(a_position, cash=cash_value)
@@ -202,6 +295,13 @@ class MarketABot(XChangeClient):
                 self.tracer.record_inventory_update(
                     now_ms=now_ms,
                     state=self._trace_state_for_symbol(symbol, now_ms),
+                    cash=cash_value,
+                    trigger="position_snapshot",
+                )
+            if self.etf_strategy is not None:
+                self.tracer.record_inventory_update(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
                     cash=cash_value,
                     trigger="position_snapshot",
                 )
@@ -293,9 +393,16 @@ class MarketABot(XChangeClient):
         elif msg_type == "position_update" and msg.position_update.symbol in self.b_observer.symbols:
             now_ms = self._now_ms()
             symbol = msg.position_update.symbol
-            self.b_observer.sync_inventory(symbol, int(msg.position_update.value))
+            inventory = int(msg.position_update.value)
+            before_inventory = self._strategy_inventory_for_symbol(symbol)
+            self._last_position_update_by_symbol[symbol] = (now_ms, before_inventory, inventory)
+            self.b_observer.sync_inventory(symbol, inventory)
             if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
-                self.b_strategy.sync_inventory_from_exchange(int(msg.position_update.value))
+                self.b_strategy.sync_inventory_from_exchange(inventory)
+            if self.b_option_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                self.b_option_strategy.sync_inventory(symbol, inventory, now_ms=now_ms)
+            if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
+                self.b_option_strategy.sync_inventory(symbol, inventory, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.record_inventory_update(
                     now_ms=now_ms,
@@ -304,7 +411,29 @@ class MarketABot(XChangeClient):
                     trigger="position_update",
                 )
             if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
-                await self._evaluate_and_sync_b("position update")
+                await self._evaluate_and_sync_b("position update", force=True)
+            if self.b_option_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+                await self._evaluate_and_sync_b_options(f"position update:{symbol}", force=True)
+            if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
+                await self._evaluate_and_sync_b_options(f"position update:{symbol}", symbols=(symbol,), force=True)
+        elif msg_type == "position_update" and msg.position_update.symbol == self.config.etf.symbol:
+            now_ms = self._now_ms()
+            inventory = int(msg.position_update.value)
+            before_inventory = self._strategy_inventory_for_symbol(self.config.etf.symbol)
+            self._last_position_update_by_symbol[self.config.etf.symbol] = (now_ms, before_inventory, inventory)
+            if self.etf_strategy is not None:
+                accepted = self.etf_strategy.sync_inventory_from_exchange(inventory, now_ms=now_ms)
+                if not accepted:
+                    self._last_position_update_by_symbol.pop(self.config.etf.symbol, None)
+            if self.tracer is not None:
+                self.tracer.record_inventory_update(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                    cash=self._current_cash(),
+                    trigger="position_update",
+                )
+            if self.etf_strategy is not None:
+                await self._evaluate_and_sync_etf("position update", force=True)
         elif msg_type == "cash_update":
             now_ms = self._now_ms()
             self.journal.record_inventory(
@@ -325,6 +454,41 @@ class MarketABot(XChangeClient):
         success: bool,
         error: Optional[str] = None,
     ) -> None:
+        if self.etf_strategy is not None and order_id in self.etf_strategy.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.etf_strategy.on_cancel_response(order_id, success)
+            if self.tracer is not None:
+                self.tracer.record_cancel_response(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    success=success,
+                    error=error,
+                    side=None if order is None else order.side,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync_etf("cancel response", force=True)
+            return
+
+        if self.b_option_strategy is not None and self.b_option_strategy.has_order(order_id):
+            now_ms = self._now_ms()
+            symbol, order = self.b_option_strategy.on_cancel_response(order_id, success)
+            if self.tracer is not None and symbol is not None:
+                self.tracer.record_cancel_response(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(symbol, now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    success=success,
+                    error=error,
+                    side=None if order is None else order.side,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            if symbol is not None:
+                await self._evaluate_and_sync_b_options("cancel response", symbols=(symbol,), force=True)
+            return
+
         if self.b_strategy is not None and order_id in self.b_strategy.order_manager.orders:
             now_ms = self._now_ms()
             order = self.b_strategy.on_cancel_response(order_id, success)
@@ -339,7 +503,7 @@ class MarketABot(XChangeClient):
                     side=None if order is None else order.side,
                     order=None if order is None else self._order_to_dict(order),
                 )
-            await self._evaluate_and_sync_b("cancel response")
+            await self._evaluate_and_sync_b("cancel response", force=True)
             return
 
         was_recovery_active = self.strategy.recovery_active
@@ -363,10 +527,99 @@ class MarketABot(XChangeClient):
         await self._evaluate_and_sync("cancel response")
 
     async def bot_handle_order_fill(self, order_id: str, qty: int, price: int) -> None:
+        if self.etf_strategy is not None and order_id in self.etf_strategy.order_manager.orders:
+            now_ms = self._now_ms()
+            existing_order = self.etf_strategy.order_manager.orders.get(order_id)
+            side = "BUY" if existing_order is None else existing_order.side
+            strategy_inventory = int(self.etf_strategy.inventory)
+            authoritative_inventory, _pre_fill_inventory = self._authoritative_inventory_after_fill(
+                self.config.etf.symbol,
+                side,
+                qty,
+                strategy_inventory,
+            )
+            order = self.etf_strategy.on_fill(
+                order_id,
+                qty,
+                price,
+                authoritative_inventory=authoritative_inventory,
+                now_ms=now_ms,
+            )
+            if self.tracer is not None:
+                self.tracer.record_fill(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                    cash=self._current_cash(),
+                    order=None if order is None else self._order_to_dict(order),
+                    order_id=order_id,
+                    qty=qty,
+                    price=price,
+                )
+            await self._evaluate_and_sync_etf("fill", force=True)
+            return
+
+        if self.b_option_strategy is not None and self.b_option_strategy.has_order(order_id):
+            now_ms = self._now_ms()
+            symbol, existing_order = self.b_option_strategy.order_for_id(order_id)
+            if symbol is None:
+                return
+            side = "BUY" if existing_order is None else existing_order.side
+            strategy_inventory = int(self.b_option_strategy.inventory(symbol))
+            authoritative_inventory, pre_fill_inventory = self._authoritative_inventory_after_fill(
+                symbol,
+                side,
+                qty,
+                strategy_inventory,
+            )
+            symbol, order = self.b_option_strategy.on_fill(
+                order_id,
+                qty,
+                price,
+                now_ms=now_ms,
+                authoritative_inventory=authoritative_inventory,
+                pre_fill_inventory=pre_fill_inventory,
+            )
+            if symbol is not None:
+                self.b_observer.sync_inventory(symbol, authoritative_inventory)
+                if self.b_option_strategy is not None:
+                    self.b_option_strategy.sync_inventory(
+                        self.config.market_b.underlying_symbol,
+                        int(self.positions.get(self.config.market_b.underlying_symbol, 0)),
+                        now_ms=now_ms,
+                    )
+            if self.tracer is not None and symbol is not None:
+                self.tracer.record_fill(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(symbol, now_ms),
+                    cash=self._current_cash(),
+                    order=None if order is None else self._order_to_dict(order),
+                    order_id=order_id,
+                    qty=qty,
+                    price=price,
+                )
+            if symbol is not None:
+                await self._evaluate_and_sync_b_options("fill", symbols=(symbol,), force=True)
+            return
+
         if self.b_strategy is not None and order_id in self.b_strategy.order_manager.orders:
             now_ms = self._now_ms()
-            order = self.b_strategy.on_fill(order_id, qty, price)
-            self.b_observer.sync_inventory(self.config.market_b.underlying_symbol, self.b_strategy.inventory)
+            existing_order = self.b_strategy.order_manager.orders.get(order_id)
+            side = "BUY" if existing_order is None else existing_order.side
+            strategy_inventory = int(self.b_strategy.inventory)
+            authoritative_inventory, _pre_fill_inventory = self._authoritative_inventory_after_fill(
+                self.config.market_b.underlying_symbol,
+                side,
+                qty,
+                strategy_inventory,
+            )
+            order = self.b_strategy.on_fill(order_id, qty, price, authoritative_inventory=authoritative_inventory)
+            self.b_observer.sync_inventory(self.config.market_b.underlying_symbol, authoritative_inventory)
+            if self.b_option_strategy is not None:
+                self.b_option_strategy.sync_inventory(
+                    self.config.market_b.underlying_symbol,
+                    authoritative_inventory,
+                    now_ms=now_ms,
+                )
             if self.tracer is not None:
                 self.tracer.record_fill(
                     now_ms=now_ms,
@@ -377,7 +630,9 @@ class MarketABot(XChangeClient):
                     qty=qty,
                     price=price,
                 )
-            await self._evaluate_and_sync_b("fill")
+            await self._evaluate_and_sync_b("fill", force=True)
+            if self.b_option_strategy is not None:
+                await self._evaluate_and_sync_b_options("underlying fill", force=True)
             return
 
         was_recovery_active = self.strategy.recovery_active
@@ -411,6 +666,39 @@ class MarketABot(XChangeClient):
         await self._evaluate_and_sync("fill")
 
     async def bot_handle_order_rejected(self, order_id: str, reason: str) -> None:
+        if self.etf_strategy is not None and order_id in self.etf_strategy.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.etf_strategy.on_rejection(order_id)
+            LOGGER.warning("ETF order %s rejected: %s", order_id, reason)
+            if self.tracer is not None:
+                self.tracer.record_rejection(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    reason=reason,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync_etf("rejection", force=True)
+            return
+
+        if self.b_option_strategy is not None and self.b_option_strategy.has_order(order_id):
+            now_ms = self._now_ms()
+            symbol, order = self.b_option_strategy.on_rejection(order_id)
+            LOGGER.warning("B option order %s rejected: %s", order_id, reason)
+            if self.tracer is not None and symbol is not None:
+                self.tracer.record_rejection(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(symbol, now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    reason=reason,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            if symbol is not None:
+                await self._evaluate_and_sync_b_options("rejection", symbols=(symbol,), force=True)
+            return
+
         if self.b_strategy is not None and order_id in self.b_strategy.order_manager.orders:
             now_ms = self._now_ms()
             order = self.b_strategy.on_rejection(order_id)
@@ -424,7 +712,7 @@ class MarketABot(XChangeClient):
                     reason=reason,
                     order=None if order is None else self._order_to_dict(order),
                 )
-            await self._evaluate_and_sync_b("rejection")
+            await self._evaluate_and_sync_b("rejection", force=True)
             return
 
         was_recovery_active = self.strategy.recovery_active
@@ -464,6 +752,8 @@ class MarketABot(XChangeClient):
             self.b_observer.on_market_trade(symbol, price, qty, now_ms=now_ms)
             if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
                 self.b_strategy.on_market_trade(price, qty, now_ms=now_ms)
+            if self.b_option_strategy is not None:
+                self.b_option_strategy.on_market_trade(symbol, price, qty, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.record_market_trade(
                     now_ms=now_ms,
@@ -473,8 +763,25 @@ class MarketABot(XChangeClient):
                     qty=qty,
                 )
                 self._record_b_signal(now_ms)
-            if self.b_strategy is not None:
+            if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
                 await self._evaluate_and_sync_b(f"market trade:{symbol}")
+            if self.b_option_strategy is not None:
+                option_symbols = self.config.market_b.option_symbols if symbol == self.config.market_b.underlying_symbol else (symbol,)
+                await self._evaluate_and_sync_b_options(f"market trade:{symbol}", symbols=option_symbols)
+            return
+
+        if self.etf_strategy is not None and symbol == self.config.etf.symbol:
+            now_ms = self._now_ms()
+            self.etf_strategy.on_market_trade(price, qty, now_ms=now_ms)
+            if self.tracer is not None:
+                self.tracer.record_market_trade(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(symbol, now_ms),
+                    cash=self._current_cash(),
+                    price=price,
+                    qty=qty,
+                )
+            await self._evaluate_and_sync_etf(f"market trade:{symbol}")
 
     async def bot_handle_book_update(self, symbol: str) -> None:
         if symbol == "A":
@@ -490,13 +797,32 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync("book update")
             return
 
+        if self.etf_strategy is not None and symbol == self.config.etf.symbol:
+            now_ms = self._now_ms()
+            self.etf_strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
+            if self.tracer is not None:
+                self.tracer.record_book_update(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(symbol, now_ms),
+                    cash=self._current_cash(),
+                    trigger="book_update",
+                )
+            await self._evaluate_and_sync_etf(f"book update:{symbol}")
+            return
+
         if not self.config.market_b.enabled or symbol not in self.b_observer.symbols:
             return
 
         now_ms = self._now_ms()
-        self.b_observer.on_book_update(symbol, self.order_books[symbol])
+        self.b_observer.on_book_update(symbol, self.order_books[symbol], now_ms=now_ms)
+        force_b_eval = False
         if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
             self.b_strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
+            force_b_eval = bool(
+                getattr(self.b_strategy, "should_force_bad_book_cancel", lambda: False)()
+            )
+        if self.b_option_strategy is not None:
+            self.b_option_strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
         if self.tracer is not None:
             self.tracer.record_book_update(
                 now_ms=now_ms,
@@ -511,8 +837,12 @@ class MarketABot(XChangeClient):
                 trigger="book_update",
             )
             self._record_b_signal(now_ms)
-        if self.b_strategy is not None:
-            await self._evaluate_and_sync_b(f"book update:{symbol}")
+        if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+            await self._evaluate_and_sync_b(f"book update:{symbol}", force=force_b_eval)
+        if self.b_option_strategy is not None:
+            option_symbols = self.config.market_b.option_symbols if symbol == self.config.market_b.underlying_symbol else (symbol,)
+            await self._evaluate_and_sync_b_options(f"book update:{symbol}", symbols=option_symbols)
+        return
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool) -> None:
         LOGGER.info("Ignoring swap response in A-only bot: %s qty=%s success=%s", swap, qty, success)
@@ -535,6 +865,24 @@ class MarketABot(XChangeClient):
                 news_payload=news_release,
                 reaction=reaction_dict,
             )
+        etf_signal = None
+        if self.etf_strategy is not None:
+            etf_signal = self.etf_strategy.on_a_news_reaction(reaction, now_ms=now_ms)
+            if etf_signal is not None and self.tracer is not None:
+                self.tracer.record_signal(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                    cash=self._current_cash(),
+                    strategy_family="etf_a_follower",
+                    action_class="a_shock_projection",
+                    pnl_owner="etf_a_follower",
+                    signal_id=etf_signal.signal_id,
+                    trade_group_id=etf_signal.signal_id,
+                    leg_role="single",
+                    payload=self.etf_strategy.signal_payload(etf_signal),
+                )
+            if etf_signal is not None:
+                await self._evaluate_and_sync_etf("A shock signal", force=True)
         if not reaction.relevant:
             if reaction.tick is not None:
                 await self._evaluate_and_sync("news tick")
@@ -786,7 +1134,11 @@ class MarketABot(XChangeClient):
                 )
         await self._evaluate_and_sync("startup recovery")
         if self.b_strategy is not None:
-            await self._evaluate_and_sync_b("startup")
+            await self._evaluate_and_sync_b("startup", force=True)
+        if self.b_option_strategy is not None:
+            await self._evaluate_and_sync_b_options("startup", force=True)
+        if self.etf_strategy is not None:
+            await self._evaluate_and_sync_etf("startup", force=True)
 
     async def _quote_refresh_loop(self) -> None:
         while not self._shutdown.is_set():
@@ -796,6 +1148,10 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync("timer")
             if self._b_trading_enabled and self.b_strategy is not None:
                 await self._evaluate_and_sync_b("timer")
+            if self.b_option_strategy is not None:
+                await self._evaluate_and_sync_b_options("timer")
+            if self._etf_trading_enabled and self.etf_strategy is not None:
+                await self._evaluate_and_sync_etf("timer")
 
     async def _evaluate_and_sync(self, reason: str) -> None:
         if self._ayush_port_mode:
@@ -1084,7 +1440,111 @@ class MarketABot(XChangeClient):
             desired.reason,
         )
 
-    async def _evaluate_and_sync_b(self, reason: str) -> None:
+    async def _evaluate_and_sync_etf(self, reason: str, *, force: bool = False) -> None:
+        if (
+            self._shutdown.is_set()
+            or self.etf_strategy is None
+            or not self.connected
+            or not self._position_snapshot_seen.is_set()
+            or not self.config.etf.enabled
+            or not self.config.etf.trading_enabled
+        ):
+            return
+        now_ms = self._now_ms()
+        pending_etf_entry = (
+            self.etf_strategy.active_signal is not None
+            and self.etf_strategy.inventory == 0
+            and self.etf_strategy.entry_diagnostics.get(self.etf_strategy.active_signal.signal_id) is not None
+            and self.etf_strategy.entry_diagnostics[self.etf_strategy.active_signal.signal_id].first_fill_ms is None
+        )
+        min_interval = max(
+            0,
+            int(self.config.etf.entry_retry_reprice_ms if pending_etf_entry else self.config.etf.min_eval_interval_ms),
+        )
+        if not force and self._last_etf_eval_ms is not None and now_ms - self._last_etf_eval_ms < min_interval:
+            return
+        async with self._quote_lock:
+            now_ms = self._now_ms()
+            pending_etf_entry = (
+                self.etf_strategy.active_signal is not None
+                and self.etf_strategy.inventory == 0
+                and self.etf_strategy.entry_diagnostics.get(self.etf_strategy.active_signal.signal_id) is not None
+                and self.etf_strategy.entry_diagnostics[self.etf_strategy.active_signal.signal_id].first_fill_ms is None
+            )
+            min_interval = max(
+                0,
+                int(self.config.etf.entry_retry_reprice_ms if pending_etf_entry else self.config.etf.min_eval_interval_ms),
+            )
+            if not force and self._last_etf_eval_ms is not None and now_ms - self._last_etf_eval_ms < min_interval:
+                return
+            self._last_etf_eval_ms = now_ms
+            plan = self.etf_strategy.compute_quotes(now_ms=now_ms, a_state=self._trace_state_for_symbol("A", now_ms))
+            if self.tracer is not None:
+                self.tracer.record_decision(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                    cash=self._current_cash(),
+                    trigger=reason,
+                    plan=plan,
+                )
+
+            actions = self.etf_strategy.order_manager.build_actions(plan, now_ms)
+            for cancel in actions.cancels:
+                order = self.etf_strategy.order_manager.mark_cancel_requested(cancel.order_id, now_ms)
+                if self.tracer is not None:
+                    self.tracer.record_cancel_requested(
+                        now_ms=now_ms,
+                        state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                        cash=self._current_cash(),
+                        order_id=cancel.order_id,
+                        side=cancel.side,
+                        cancel_reason=cancel.reason,
+                        mode_at_cancel=plan.mode,
+                        order=None if order is None else self._order_to_dict(order),
+                    )
+                await self.cancel_order(cancel.order_id)
+                LOGGER.info("Cancelling ETF %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
+
+            for placement in actions.placements:
+                side = Side.BUY if placement.side == "BUY" else Side.SELL
+                order_id = await self.place_order(self.config.etf.symbol, placement.qty, side, placement.px)
+                managed_order = self.etf_strategy.order_manager.note_submitted(
+                    order_id=order_id,
+                    side=placement.side,
+                    px=placement.px,
+                    qty=placement.qty,
+                    now_ms=now_ms,
+                    overlay=placement.overlay,
+                    aggressive=placement.aggressive,
+                    intent=placement.intent,
+                    mode_at_submit=placement.mode_at_submit,
+                    evaluation_reason=placement.evaluation_reason,
+                    market_key=placement.market_key,
+                    strategy_family=placement.strategy_family,
+                    action_class=placement.action_class,
+                    pnl_owner=placement.pnl_owner,
+                    signal_id=placement.signal_id,
+                    trade_group_id=placement.trade_group_id,
+                    leg_role=placement.leg_role,
+                )
+                if self.tracer is not None:
+                    self.tracer.record_order_submitted(
+                        now_ms=now_ms,
+                        state=self._trace_state_for_symbol(self.config.etf.symbol, now_ms),
+                        cash=self._current_cash(),
+                        order=self._order_to_dict(managed_order),
+                    )
+                LOGGER.info(
+                    "Placed %s %s order %s for ETF: qty=%s px=%s reason=%s",
+                    "aggressive" if placement.aggressive else "passive",
+                    placement.side,
+                    order_id,
+                    placement.qty,
+                    placement.px,
+                    placement.reason,
+                )
+
+    async def _evaluate_and_sync_b(self, reason: str, *, force: bool = False) -> None:
         if (
             self._shutdown.is_set()
             or
@@ -1095,9 +1555,16 @@ class MarketABot(XChangeClient):
             or not self.config.market_b.trading_enabled
         ):
             return
+        now_ms = self._now_ms()
+        min_interval = max(0, int(self.config.market_b.mm_min_eval_interval_ms))
+        if not force and self._last_b_eval_ms is not None and now_ms - self._last_b_eval_ms < min_interval:
+            return
         async with self._quote_lock:
             now_ms = self._now_ms()
-            residual_payload = self.b_observer.compute_residuals()
+            if not force and self._last_b_eval_ms is not None and now_ms - self._last_b_eval_ms < min_interval:
+                return
+            self._last_b_eval_ms = now_ms
+            residual_payload = self.b_observer.compute_residuals(now_ms=now_ms)
             plan = self.b_strategy.compute_quotes(now_ms=now_ms, residual_payload=residual_payload)
             if self.tracer is not None:
                 self.tracer.record_decision(
@@ -1108,7 +1575,10 @@ class MarketABot(XChangeClient):
                     plan=plan,
                 )
 
-            actions = self.b_strategy.order_manager.build_actions(plan, now_ms)
+            if hasattr(self.b_strategy, "build_actions"):
+                actions = self.b_strategy.build_actions(plan, now_ms)
+            else:
+                actions = self.b_strategy.order_manager.build_actions(plan, now_ms)
             for cancel in actions.cancels:
                 order = self.b_strategy.order_manager.mark_cancel_requested(cancel.order_id, now_ms)
                 if self.tracer is not None:
@@ -1155,7 +1625,8 @@ class MarketABot(XChangeClient):
                         order=self._order_to_dict(managed_order),
                     )
                 LOGGER.info(
-                    "Placed passive %s order %s for B: qty=%s px=%s reason=%s",
+                    "Placed %s %s order %s for B: qty=%s px=%s reason=%s",
+                    "aggressive" if placement.aggressive else "passive",
                     placement.side,
                     order_id,
                     placement.qty,
@@ -1170,6 +1641,83 @@ class MarketABot(XChangeClient):
                     trigger=reason,
                 )
 
+    async def _evaluate_and_sync_b_options(
+        self,
+        reason: str,
+        *,
+        symbols: tuple[str, ...] | None = None,
+        force: bool = False,
+    ) -> None:
+        if (
+            self._shutdown.is_set()
+            or self.b_option_strategy is None
+            or not self.connected
+            or not self._position_snapshot_seen.is_set()
+            or not self.config.market_b.enabled
+            or not self.config.market_b.trading_enabled
+            or not self.config.market_b.option_lottery_enabled
+        ):
+            return
+        option_symbols = tuple(symbols or self.config.market_b.option_symbols)
+        async with self._quote_lock:
+            now_ms = self._now_ms()
+            residual_payload = self.b_observer.compute_residuals(now_ms=now_ms)
+            for symbol in option_symbols:
+                if symbol not in self.config.market_b.option_symbols:
+                    continue
+                plan = self.b_option_strategy.compute_quote_plan(symbol, now_ms=now_ms, residual_payload=residual_payload)
+                if self.tracer is not None:
+                    self.tracer.record_decision(
+                        now_ms=now_ms,
+                        state=self._trace_state_for_symbol(symbol, now_ms),
+                        cash=self._current_cash(),
+                        trigger=reason,
+                        plan=plan,
+                    )
+
+                manager = self.b_option_strategy.order_managers[symbol]
+                actions = manager.build_actions(plan, now_ms)
+                for cancel in actions.cancels:
+                    order = manager.mark_cancel_requested(cancel.order_id, now_ms)
+                    if self.tracer is not None:
+                        self.tracer.record_cancel_requested(
+                            now_ms=now_ms,
+                            state=self._trace_state_for_symbol(symbol, now_ms),
+                            cash=self._current_cash(),
+                            order_id=cancel.order_id,
+                            side=cancel.side,
+                            cancel_reason=cancel.reason,
+                            mode_at_cancel=plan.mode,
+                            order=None if order is None else self._order_to_dict(order),
+                        )
+                    await self.cancel_order(cancel.order_id)
+                    LOGGER.info("Cancelling %s %s order %s because %s", symbol, cancel.side, cancel.order_id, cancel.reason)
+
+                for placement in actions.placements:
+                    side = Side.BUY if placement.side == "BUY" else Side.SELL
+                    order_id = await self.place_order(symbol, placement.qty, side, placement.px)
+                    managed_order = self.b_option_strategy.note_submitted(
+                        symbol,
+                        order_id=order_id,
+                        desired=placement,
+                        now_ms=now_ms,
+                    )
+                    if self.tracer is not None:
+                        self.tracer.record_order_submitted(
+                            now_ms=now_ms,
+                            state=self._trace_state_for_symbol(symbol, now_ms),
+                            cash=self._current_cash(),
+                            order=self._order_to_dict(managed_order),
+                        )
+                    LOGGER.info(
+                        "Placed B option lottery BUY order %s for %s: qty=%s px=%s reason=%s",
+                        order_id,
+                        symbol,
+                        placement.qty,
+                        placement.px,
+                        placement.reason,
+                    )
+
     @staticmethod
     def _now_ms() -> int:
         return int(time.monotonic() * 1000)
@@ -1177,6 +1725,51 @@ class MarketABot(XChangeClient):
     @staticmethod
     def symbol_from_side(side: str) -> str:
         return "shares" if side in {"BUY", "SELL"} else side
+
+    def _exchange_side_for_order(self, order_id: str) -> str | None:
+        order_info = self.open_orders.get(order_id)
+        if not order_info:
+            return None
+        raw_side = getattr(order_info[0], "side", None)
+        if raw_side == Side.BUY:
+            return "BUY"
+        if raw_side == Side.SELL:
+            return "SELL"
+        side_text = str(raw_side).upper()
+        if "BUY" in side_text:
+            return "BUY"
+        if "SELL" in side_text:
+            return "SELL"
+        return None
+
+    def _strategy_inventory_for_symbol(self, symbol: str) -> int:
+        if symbol == "A":
+            return int(self.strategy.inventory)
+        if self.etf_strategy is not None and symbol == self.config.etf.symbol:
+            return int(self.etf_strategy.inventory)
+        if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
+            return int(self.b_strategy.inventory)
+        if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
+            return int(self.b_option_strategy.inventory(symbol))
+        return int(self.positions.get(symbol, 0))
+
+    def _authoritative_inventory_after_fill(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        strategy_inventory_before_fill: int,
+    ) -> tuple[int, int]:
+        signed_qty = int(qty) if side == "BUY" else -int(qty)
+        exchange_inventory = int(self.positions.get(symbol, strategy_inventory_before_fill))
+        update = self._last_position_update_by_symbol.get(symbol)
+        if update is not None:
+            _update_ms, inventory_before_update, inventory_after_update = update
+            if inventory_after_update == inventory_before_update + signed_qty and exchange_inventory == inventory_after_update:
+                return exchange_inventory, inventory_before_update
+        if exchange_inventory == strategy_inventory_before_fill + signed_qty:
+            return exchange_inventory, strategy_inventory_before_fill
+        return strategy_inventory_before_fill + signed_qty, strategy_inventory_before_fill
 
     def _current_cash(self) -> int | None:
         return int(self.positions.get("cash", 0)) if self._position_snapshot_seen.is_set() else None
@@ -1187,9 +1780,26 @@ class MarketABot(XChangeClient):
     def _trace_state_for_symbol(self, symbol: str, now_ms: int) -> dict:
         if symbol == "A":
             return self.strategy.trace_state(now_ms)
+        exchange_inventory = int(self.positions.get(symbol, 0))
+        if self.etf_strategy is not None and symbol == self.config.etf.symbol:
+            state = self.etf_strategy.trace_state(now_ms)
+            state["strategy_inventory"] = int(state.get("inventory") or 0)
+            state["exchange_inventory"] = exchange_inventory
+            return state
         if self.b_strategy is not None and symbol == self.config.market_b.underlying_symbol:
-            return self.b_strategy.trace_state(now_ms)
-        return self.b_observer.trace_state(symbol, now_ms)
+            state = self.b_strategy.trace_state(now_ms)
+            state["strategy_inventory"] = int(state.get("inventory") or 0)
+            state["exchange_inventory"] = exchange_inventory
+            return state
+        if self.b_option_strategy is not None and symbol in self.config.market_b.option_symbols:
+            state = self.b_option_strategy.trace_state(symbol, now_ms)
+            state["strategy_inventory"] = int(state.get("inventory") or 0)
+            state["exchange_inventory"] = exchange_inventory
+            return state
+        state = self.b_observer.trace_state(symbol, now_ms)
+        state["strategy_inventory"] = int(state.get("inventory") or 0)
+        state["exchange_inventory"] = exchange_inventory
+        return state
 
     def _record_b_signal(self, now_ms: int) -> None:
         if self.tracer is None or not self.config.market_b.enabled:
@@ -1208,6 +1818,27 @@ class MarketABot(XChangeClient):
             trade_group_id=bundle.trade_group_id,
             leg_role="composite",
             payload=bundle.payload,
+        )
+        if not self.config.market_b.parity_shadow_enabled:
+            return
+        opportunity = self.b_parity_opportunist.evaluate(bundle.payload, now_ms=now_ms)
+        if opportunity is None:
+            return
+        self.tracer.record_signal(
+            now_ms=now_ms,
+            state=self._trace_state_for_symbol(self.b_observer.underlying_symbol, now_ms),
+            cash=self._current_cash(),
+            strategy_family="b_parity_opportunist",
+            action_class="parity_shadow",
+            pnl_owner="b_parity_opportunist",
+            signal_id=opportunity.signal_id,
+            trade_group_id=opportunity.trade_group_id,
+            leg_role="multi_leg",
+            payload={
+                "enabled_for_live_trading": bool(self.config.market_b.parity_enabled),
+                "threshold_ticks": self.config.market_b.parity_edge_threshold_ticks,
+                "opportunity": opportunity.to_dict(),
+            },
         )
 
     @staticmethod
@@ -1261,6 +1892,7 @@ class MarketABot(XChangeClient):
             "resolved_news_text": reaction.resolved_news_text,
             "resolved_news_text_source": reaction.resolved_news_text_source,
             "shock_direction": reaction.shock_direction,
+            "shock_target_inventory": reaction.shock_target_inventory,
             "shock_threshold": reaction.shock_threshold,
             "tick": reaction.tick,
         }
