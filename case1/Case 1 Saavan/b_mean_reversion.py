@@ -345,6 +345,12 @@ class BMeanReversionStrategy:
                 return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion signal below entry; reducing", False
             return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion waiting for z-score entry", False
 
+        if abs_deviation < float(self.config.meanrev_extreme_entry_ticks) and abs_z < float(self.config.meanrev_entry_z):
+            self.last_block_reason = "b_meanrev_waiting_for_z_entry"
+            if self.inventory != 0:
+                return 0, "B_MEANREV_EXIT", "mean_reversion_exit", "B mean-reversion z-score below entry; reducing", False
+            return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion waiting for z-score entry", False
+
         if (
             self.inventory == 0
             and abs_deviation < float(self.config.meanrev_extreme_entry_ticks)
@@ -360,17 +366,20 @@ class BMeanReversionStrategy:
                 return 0, "OBSERVE_ONLY", "observe_only", "B mean-reversion entry cooldown", False
 
         direction = -1 if float(deviation or 0.0) > 0 else 1
-        size = (
-            int(self.config.meanrev_full_target)
-            if abs_deviation >= float(self.config.meanrev_full_entry_ticks)
-            else int(self.config.meanrev_base_target)
+        full_signal = (
+            abs_deviation >= float(self.config.meanrev_extreme_entry_ticks)
+            or (
+                abs_deviation >= float(self.config.meanrev_full_entry_ticks)
+                and abs_z >= float(self.config.meanrev_entry_z2)
+            )
         )
+        size = int(self.config.meanrev_full_target) if full_signal else int(self.config.meanrev_base_target)
         target = direction * max(0, min(int(self.config.meanrev_max_position), size))
         if abs_deviation >= float(self.config.meanrev_extreme_entry_ticks):
             aggressive = True
             entry_style = "extreme"
             reason = "B mean-reversion extreme tick-deviation entry"
-        elif abs_deviation >= float(self.config.meanrev_full_entry_ticks):
+        elif full_signal:
             aggressive = self.inventory == 0
             entry_style = "full"
             reason = "B mean-reversion full tick-deviation entry"

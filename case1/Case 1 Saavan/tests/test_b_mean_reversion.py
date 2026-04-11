@@ -144,6 +144,33 @@ class BMeanReversionStrategyTests(unittest.TestCase):
         self.assertEqual(plan.mode, "B_MEANREV_EXIT")
         self.assertEqual(plan.ask.action_class, "mean_reversion_exit")
 
+    def test_low_z_blocks_non_extreme_entry_even_when_ticks_are_large_enough(self) -> None:
+        strategy = self.make_strategy()
+        self.seed_signal(strategy, mid=1010.0)
+        strategy.last_sigma = 16.0
+        strategy.ewma_var = 256.0
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "B mean-reversion waiting for z-score entry")
+        self.assertEqual(strategy.last_block_reason, "b_meanrev_waiting_for_z_entry")
+
+    def test_high_tick_low_z_signal_downshifts_to_base_target(self) -> None:
+        strategy = self.make_strategy()
+        self.seed_signal(strategy, mid=1015.0)
+        strategy.last_sigma = 8.0
+        strategy.ewma_var = 64.0
+
+        plan = strategy.compute_quotes(now_ms=1_000, residual_payload=self.payload())
+
+        self.assertEqual(strategy.last_target_inventory, -6)
+        self.assertEqual(len(plan.aggressive_actions), 0)
+        self.assertIsNotNone(plan.ask)
+        self.assertFalse(plan.ask.aggressive)
+        self.assertEqual(plan.ask.side, "SELL")
+        self.assertEqual(plan.ask.action_class, "mean_reversion_entry")
+
     def test_waits_for_turn_confirmation_for_normal_fade(self) -> None:
         strategy = self.make_strategy()
         self.seed_signal(strategy, mid=1010.0)
