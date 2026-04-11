@@ -14,6 +14,9 @@ from testing1 import LOGGER, MarketABot, load_runtime_config
 
 REQUIRED_ENV_KEYS = ("UTC_HOST", "UTC_USERNAME", "UTC_PASSWORD")
 COMPETITION_ENV_DEFAULTS: dict[str, str] = {
+    "UTC_HOST": "uchicago.exchange:3333",
+    "UTC_USERNAME": "uiuc",
+    "UTC_PASSWORD": "mesa-lynx-octopus",
     "TRACE_ENABLED": "0",
     "TRACE_WRITE_SUMMARY_ON_SHUTDOWN": "0",
     "TRACE_RECORD_BOOK_UPDATES": "0",
@@ -25,7 +28,7 @@ COMPETITION_ENV_DEFAULTS: dict[str, str] = {
 
 
 def validate_required_env(environ: Mapping[str, str] | None = None) -> None:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     missing = [key for key in REQUIRED_ENV_KEYS if not str(env.get(key, "")).strip()]
     if missing:
         joined = ", ".join(missing)
@@ -33,13 +36,13 @@ def validate_required_env(environ: Mapping[str, str] | None = None) -> None:
 
 
 def apply_competition_env_defaults(environ: MutableMapping[str, str] | None = None) -> None:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     for key, value in COMPETITION_ENV_DEFAULTS.items():
         env.setdefault(key, value)
 
 
 def pm_guard_enabled(environ: Mapping[str, str] | None = None) -> bool:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     raw = str(env.get("PM_GUARD_ENABLED", "1")).strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
@@ -104,9 +107,13 @@ async def _terminate_pm_guard(process: asyncio.subprocess.Process | None) -> Non
 
 
 async def main() -> None:
-    validate_required_env()
     apply_competition_env_defaults()
-    config = load_runtime_config(default_host=None, default_username=None, default_password=None)
+    validate_required_env()
+    config = load_runtime_config(
+        default_host=COMPETITION_ENV_DEFAULTS["UTC_HOST"],
+        default_username=COMPETITION_ENV_DEFAULTS["UTC_USERNAME"],
+        default_password=COMPETITION_ENV_DEFAULTS["UTC_PASSWORD"],
+    )
 
     LOGGER.info("Starting competition runtime against %s", config.exchange.host)
     LOGGER.info("Journal path: %s", config.paths.journal_path)

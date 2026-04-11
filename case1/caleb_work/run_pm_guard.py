@@ -30,7 +30,7 @@ PM_GUARD_DEFAULTS: dict[str, str] = {
 
 
 def validate_required_env(environ: Mapping[str, str] | None = None) -> None:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     missing = [key for key in REQUIRED_ENV_KEYS if not str(env.get(key, "")).strip()]
     if missing:
         joined = ", ".join(missing)
@@ -38,7 +38,7 @@ def validate_required_env(environ: Mapping[str, str] | None = None) -> None:
 
 
 def apply_pm_guard_env_defaults(environ: MutableMapping[str, str] | None = None) -> None:
-    env = environ or os.environ
+    env = os.environ if environ is None else environ
     for key, value in PM_GUARD_DEFAULTS.items():
         env.setdefault(key, value)
     trace_dir = Path(env.get("PM3_TRACE_DIR") or (Path(__file__).resolve().parent / "logs"))

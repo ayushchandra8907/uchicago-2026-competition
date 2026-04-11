@@ -29,8 +29,8 @@ def apply_upgraded_env_defaults(environ=None) -> None:
 
 
 async def main() -> None:
-    run_competition.validate_required_env()
     apply_upgraded_env_defaults()
+    run_competition.validate_required_env()
     LOGGER.info("UPGRADED PRACTICE RUNNER: ETF A-only mode ON")
     LOGGER.info("UPGRADED PRACTICE RUNNER: A earnings trap overlay ON")
     await run_competition.main()
