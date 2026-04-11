@@ -1,1994 +1,2710 @@
-from __future__ import annotations
-
-import argparse
-import asyncio
-import logging
-import math
-import time
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, Optional
+from typing import Optional, Dict, Tuple
 
 try:
-    from utcxchangelib import Side, XChangeClient
-except ModuleNotFoundError:
-    class Side(Enum):
-        BUY = "BUY"
-        SELL = "SELL"
+    from utcxchangelib import XChangeClient, Side
+except ImportError:
+    from utcxchangelib.xchange_client import XChangeClient, Side
 
-    class XChangeClient:  # pragma: no cover - fallback for offline replay analysis mode
-        def __init__(self, *args, **kwargs):
-            raise ModuleNotFoundError(
-                "utcxchangelib is required to run the live bot. Replay analysis mode can run without it."
-            )
+try:
+    from utcxchangelib.xchange_client import OrderBook
+except ImportError:
+    OrderBook = None
+
+import asyncio
+import csv
+import logging
+import math
+import re
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from statistics import median
 
 
 logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger("prediction-c")
+logger = logging.getLogger("c-only")
 
 
-@dataclass(frozen=True)
-class BotConfig:
-    symbol_c: str = "C"
-    fed_hike: str = "R_HIKE"
-    fed_hold: str = "R_HOLD"
-    fed_cut: str = "R_CUT"
+C_SYMBOL = "C"
+R_HIKE = "R_HIKE"
+R_HOLD = "R_HOLD"
+R_CUT = "R_CUT"
+PM_SYMBOLS = [R_HIKE, R_HOLD, R_CUT]
 
-    payout_scale: float = 100.0
-    default_eps_c: float = 2.0
+ORDER_LIMIT = 40
+C_POSITION_LIMIT = 200
 
-    c_ops_weight: float = 0.72
-    c_bond_weight: float = 0.28
-    c_pe_yield_gamma: float = 13.0
-    c_bond_duration: float = 4.5
-    c_bond_convexity: float = 30.0
+C_MM_ENABLED = False
+C_MM_QUOTE_SIZE = 5
+C_MM_MAX_POSITION = 40
+C_MM_HALF_SPREAD_TICKS = 2.0
+C_MM_INVENTORY_SKEW = 0.75
+C_MM_MIN_BOOK_SPREAD = 2
+C_MM_PASSIVE_REDUCE_START = 12
+C_MM_PASSIVE_REDUCE_FULL = 28
+C_MM_REDUCE_ONLY_POSITION = 34
+C_MM_REPRICE_THRESHOLD_TICKS = 2
+C_MM_QUOTE_TTL_SECONDS = 3.0
+C_MM_NEWS_COOLDOWN_SECONDS = 8.0
 
-    cpi_to_rate_bp: float = 4000.0
-    max_temp_rate_bias_bp: float = 8.0
-    cpi_bias_ttl_secs: float = 2.5
-    headline_bias_ttl_secs: float = 2.0
+CPI_DEADBAND = 0.00025
+CPI_STRONG_SURPRISE = 0.00050
+CPI_VERY_STRONG_SURPRISE = 0.00100
+CPI_EXTREME_SURPRISE = 0.00200
+CPI_SIGNAL_TTL_SECONDS = 20.0
+CPI_MAX_HOLD_SECONDS = 45.0
+CPI_TO_RATE_BP = 4000.0
+MAX_CPI_RATE_BIAS_BP = 8.0
+# Some practice feeds have shown CPI prints in the UI while the raw callback
+# arrives as an empty petition payload at the same timestamp.  Use only the
+# confirmed CPI ticks as a fallback, after first trying to parse real fields.
+CPI_PRINT_FALLBACKS_BY_TICK = {
+    100: (0.0030, 0.0019),
+    1650: (0.0003, 0.0015),
+    1900: (0.0022, 0.0021),
+    2100: (0.0030, 0.0019),
+}
 
-    c_earnings_ignore_delta: float = 0.010
-    c_earnings_small_delta: float = 0.025
-    c_earnings_medium_delta: float = 0.045
-    c_earnings_fresh_secs: float = 4.0
-    c_earnings_hold_secs: float = 2.5
-    c_initial_shock_window_secs: float = 4.0
-    c_initial_shock_gap_ticks: float = 14.0
-    c_initial_shock_initial_size: int = 60
-    c_initial_shock_add_size: int = 60
-    c_initial_shock_cap: int = 120
-    c_initial_shock_compress_ticks: float = 10.0
-    c_initial_shock_flatten_ticks: float = 6.0
-    c_initial_shock_max_hold_secs: float = 12.0
-    c_leadlag_max_hold_secs: float = 25.0
+EARNINGS_IGNORE_DELTA = 0.010
+EARNINGS_SMALL_DELTA = 0.025
+EARNINGS_MEDIUM_DELTA = 0.050
+EARNINGS_EXTREME_DELTA = 0.075
+EARNINGS_SIGNAL_TTL_SECONDS = 20.0
+EARNINGS_MAX_HOLD_SECONDS = 24.0
+EARNINGS_FAST_HARVEST_SECONDS = 5.0
+EARNINGS_FAST_TIMEOUT_SECONDS = 8.0
+EARNINGS_FAST_HARVEST_MIN_TICKS = 6.0
+LATE_SESSION_WEAK_EARNINGS_CUTOFF_TICK = 4300
+LATE_SESSION_EARNINGS_TARGET_CAP_TICK = 4485
+LATE_SESSION_EARNINGS_TARGET_CAP = ORDER_LIMIT
 
-    post_baseline_entry_secs: float = 10.0
-    post_baseline_gap_ticks: float = 14.0
-    post_baseline_add_ticks: float = 20.0
+C_SHOCK_POSITION_CAP = C_POSITION_LIMIT
+C_SHOCK_MIN_EDGE_TICKS = 10.0
+C_SHOCK_FULL_CONFIDENCE_EDGE_TICKS = 80.0
+C_SHOCK_POSITION_SCALE = 1.20
+C_SHOCK_FULL_CONFIDENCE_CHANGE_TICKS = 40.0
+C_SHOCK_CHANGE_POSITION_SCALE = 0.75
+C_SHOCK_MIN_POSITION = ORDER_LIMIT
+C_SHOCK_SLICE_TARGET_QTY = 12
+C_SHOCK_SLICE_MIN_QTY = 7
+C_SHOCK_SLICE_MAX_QTY = 15
+C_SHOCK_MIN_ORDER_LIVE_SECONDS = 0.075
+C_SHOCK_EMERGENCY_DUMP_MIN_SECONDS = 0.250
+C_SHOCK_EMERGENCY_DUMP_TICKS = 40.0
+C_SHOCK_EMERGENCY_DUMP_FRACTION = 0.20
+C_SHOCK_EMERGENCY_DUMP_MIN_INVENTORY = 12
+C_SHOCK_MAX_HOLD_SECONDS = 12.5
+C_SHOCK_DECAY_START_SECONDS = 5.0
+C_SHOCK_DECAY_INTERVAL_SECONDS = 0.5
+C_SHOCK_DECAY_FRACTION = 0.08
+C_SHOCK_DECAY_MIN_QTY = 6
+C_SHOCK_DECAY_MAX_QTY = 10
+C_SHOCK_DECAY_MIN_INVENTORY = 40
+C_SHOCK_DECAY_MIN_RESIDUAL_FRACTION = 0.10
+C_SHOCK_DECAY_STALL_WINDOW_SECONDS = 1.2
+C_SHOCK_DECAY_STALL_THRESHOLD_TICKS = 12.0
+C_SHOCK_OVERSHOOT_HOLD_SECONDS = 0.225
+C_SHOCK_OVERSHOOT_MAX_WAIT_SECONDS = 0.600
+C_SHOCK_OVERSHOOT_BAND_TICKS = 10.0
+C_SHOCK_OVERSHOOT_REVERSAL_TICKS = 2.0
+C_SHOCK_OVERSHOOT_STAGE_FRACTIONS = (0.30, 0.25, 0.20)
+C_SHOCK_OVERSHOOT_STAGE_MIN_QTY = 4
+C_SHOCK_OVERSHOOT_STAGE_MAX_QTY = 16
+C_SHOCK_OVERSHOOT_MIN_RESIDUAL_FRACTION = 0.30
+C_SHOCK_OVERSHOOT_LARGE_POSITION_THRESHOLD = 100
+C_SHOCK_OVERSHOOT_LARGE_STAGE1_FRACTION = 0.50
+C_SHOCK_OVERSHOOT_LARGE_RESIDUAL_FRACTION = 0.50
+C_SHOCK_EQUILIBRIUM_BAND_TICKS = 8.0
+C_SHOCK_EQUILIBRIUM_HOLD_SECONDS = 1.0
+C_SHOCK_EQUILIBRIUM_MIN_SAMPLES = 6
+C_SHOCK_EQUILIBRIUM_MIN_SECONDS = 1.0
+C_SHOCK_EQUILIBRIUM_RESIDUAL_EDGE_TICKS = 40.0
+C_SHOCK_EQUILIBRIUM_MIN_CAPTURE_FRACTION = 0.55
 
-    lead_lag_bp_trigger: float = 3.0
-    lead_lag_entry_ticks: float = 16.0
-    lead_lag_add_ticks: float = 22.0
+MACRO_HEADLINE_MIN_SCORE = 2.5
+MACRO_HEADLINE_STRONG_SCORE = 3.5
+MACRO_HEADLINE_VERY_STRONG_SCORE = 5.5
+MACRO_SIGNAL_TTL_SECONDS = 8.0
+MACRO_MAX_HOLD_SECONDS = 12.0
+MACRO_TO_RATE_BP = 1.5
+MACRO_EARNINGS_TREND_BLOCK = 0.020
+MACRO_FLAT_TARGET_CAP = 80
 
-    c_hard_position_limit: int = 200
-    rate_hard_position_limit: int = 150
-    c_max_order_size: int = 40
-    rate_max_order_size: int = 40
+DEFAULT_EPS_C = 2.0
+# Released C parameters retained for reference.  For live trading we keep
+# the anchor-price framework calibrated to observed C rather than letting
+# the raw case proxy block large earnings moves by 80+ ticks.
+C_PE0 = 14.0
+C_EPS0 = 2.0
+C_BASE_BOND_PER_SHARE = 40.0
+C_LAMBDA = 0.65
+C_OPS_WEIGHT = 0.72
+C_BOND_WEIGHT = 0.28
+C_PE_YIELD_GAMMA = 13.0
+C_BOND_DURATION = 4.5
+C_BOND_CONVEXITY = 30.0
+FAIR_VALUE_GUARD_TICKS = 8.0
+MACRO_FAIR_VALUE_GUARD_TICKS = 35.0
+EARNINGS_EXTREME_FAIR_VALUE_GUARD_TICKS = 180.0
+EARNINGS_STRONG_FAIR_VALUE_GUARD_TICKS = 90.0
+EARNINGS_WEAK_FAIR_VALUE_GUARD_TICKS = 45.0
+REVERSAL_TREND_MIN_ABS = 0.060
 
-    rate_normal_size: int = 50
-    rate_strong_size: int = 100
-    rate_extreme_size: int = 150
-    rate_entry_edge_bp: float = 2.5
-    rate_exit_edge_bp: float = 1.0
-    rate_add_edge_step_bp: float = 1.5
-    rate_add_edge_frac: float = 0.65
-    rate_reentry_block_secs: float = 1.0
+MAX_C_SPREAD = 12
+C_ACTION_COOLDOWN_SECONDS = 0.20
+C_SYMBOL_COOLDOWN_SECONDS = 0.25
+ORDER_REPRICE_SECONDS = 0.45
+HEARTBEAT_LOG_SECONDS = 3.0
 
-    c_tier1_initial_size: int = 60
-    c_tier1_add_size: int = 40
-    c_tier1_cap: int = 100
-    c_tier2_initial_size: int = 80
-    c_tier2_add_size: int = 70
-    c_tier2_cap: int = 150
-    c_tier3_initial_size: int = 100
-    c_tier3_add_size: int = 100
-    c_tier3_cap: int = 200
-    c_baseline_initial_size: int = 60
-    c_baseline_add_size: int = 60
-    c_baseline_cap: int = 120
-    c_leadlag_initial_size: int = 50
-    c_leadlag_add_size: int = 50
-    c_leadlag_cap: int = 100
-    c_event_base_budget: int = 120
-    c_background_base_budget: int = 100
-    c_event_shift_budget: int = 200
-    c_background_shift_budget: int = 0
-    c_unwind_entry_position: int = 80
-    c_unwind_exit_position: int = 20
-    c_unwind_aggressive_entry: int = 140
-    c_unwind_aggressive_exit: int = 80
+DEFAULT_PROFIT_1_TICKS = 8.0
+DEFAULT_PROFIT_2_TICKS = 20.0
+DEFAULT_PROFIT_FULL_TICKS = 40.0
+ADVERSE_STOP_ADD_TICKS = 12.0
+DEFAULT_ADVERSE_FLATTEN_TICKS = 24.0
+WEAK_SIGNAL_ADVERSE_FLATTEN_TICKS = 16.0
+DEFAULT_TRAIL_START_TICKS = 24.0
+DEFAULT_TRAIL_GIVEBACK_TICKS = 14.0
+EARNINGS_PROFIT_1_TICKS = 12.0
+EARNINGS_PROFIT_2_TICKS = 30.0
+EARNINGS_PROFIT_FULL_TICKS = 65.0
+EARNINGS_TRAIL_START_TICKS = 32.0
+EARNINGS_TRAIL_GIVEBACK_TICKS = 16.0
+EARNINGS_ADVERSE_FLATTEN_TICKS = 24.0
+EARNINGS_MEDIUM_PROFIT_1_TICKS = 10.0
+EARNINGS_MEDIUM_PROFIT_2_TICKS = 22.0
+EARNINGS_MEDIUM_PROFIT_FULL_TICKS = 45.0
+EARNINGS_MEDIUM_TRAIL_START_TICKS = 24.0
+EARNINGS_MEDIUM_TRAIL_GIVEBACK_TICKS = 10.0
+EARNINGS_MEDIUM_ADVERSE_FLATTEN_TICKS = 18.0
+EARNINGS_WEAK_PROFIT_1_TICKS = 7.0
+EARNINGS_WEAK_PROFIT_2_TICKS = 14.0
+EARNINGS_WEAK_PROFIT_FULL_TICKS = 24.0
+EARNINGS_WEAK_TRAIL_START_TICKS = 14.0
+EARNINGS_WEAK_TRAIL_GIVEBACK_TICKS = 7.0
+EARNINGS_WEAK_ADVERSE_FLATTEN_TICKS = 12.0
+CPI_PROFIT_1_TICKS = 12.0
+CPI_PROFIT_2_TICKS = 30.0
+CPI_PROFIT_FULL_TICKS = 75.0
+CPI_TRAIL_START_TICKS = 36.0
+CPI_TRAIL_GIVEBACK_TICKS = 20.0
+CPI_ADVERSE_FLATTEN_TICKS = 28.0
+MACRO_PROFIT_1_TICKS = 8.0
+MACRO_PROFIT_2_TICKS = 18.0
+MACRO_PROFIT_FULL_TICKS = 40.0
+MACRO_TRAIL_START_TICKS = 20.0
+MACRO_TRAIL_GIVEBACK_TICKS = 10.0
+MACRO_ADVERSE_FLATTEN_TICKS = 16.0
+STRONG_FAIR_GAP_HOLD_TICKS = 25.0
+C_TOTAL_PNL_HARD_STOP = -12000.0
+C_SESSION_PROFIT_LOCK_START = 60000.0
+C_SESSION_PROFIT_LOCK_GIVEBACK = 12000.0
 
-    c_add_edge_step_ticks: float = 6.0
-    c_news_add_edge_frac: float = 0.60
-    c_hard_flip_min_ticks: float = 6.0
-    c_compression_min_ticks: float = 6.0
-    c_compression_frac: float = 0.35
-    c_rate_reversal_bp: float = 1.5
-    c_reentry_block_secs: float = 1.5
-    c_flat_entry_cooldown_secs: float = 0.8
-    c_add_cooldown_secs: float = 0.35
-
-    max_active_orders_per_symbol: int = 1
-    order_stale_secs: float = 0.50
-    anchor_reprice_secs: float = 2.0
-    loop_sleep_secs: float = 0.20
-    status_log_interval_secs: float = 3.0
-
-    startup_flatten_chunk_c: int = 25
-    startup_flatten_chunk_rate: int = 40
-    startup_flatten_sleep_secs: float = 0.25
-
-    @property
-    def tracked_symbols(self) -> tuple[str, str, str, str]:
-        return (self.symbol_c, self.fed_hike, self.fed_hold, self.fed_cut)
-
-    @property
-    def rate_symbols(self) -> tuple[str, str, str]:
-        return (self.fed_hike, self.fed_hold, self.fed_cut)
+FLOAT_RE = r"[-+]?\d*\.?\d+"
 
 
 @dataclass
-class TopOfBook:
-    bid: Optional[int] = None
-    bid_qty: int = 0
-    ask: Optional[int] = None
-    ask_qty: int = 0
-    updated_ts: float = 0.0
-
-    @property
-    def mid(self) -> Optional[float]:
-        if self.bid is not None and self.ask is not None:
-            return 0.5 * (self.bid + self.ask)
-        if self.bid is not None:
-            return float(self.bid)
-        if self.ask is not None:
-            return float(self.ask)
-        return None
-
-    @property
-    def spread(self) -> Optional[float]:
-        if self.bid is None or self.ask is None:
-            return None
-        return float(self.ask - self.bid)
-
-    @property
-    def usable_spread(self) -> float:
-        spread = self.spread
-        if spread is None:
-            return 0.0
-        return max(1.0, abs(spread))
-
-
-@dataclass
-class TrackedOrder:
+class OrderRef:
     order_id: str
     symbol: str
     side: Side
     qty: int
     price: int
-    role: str
-    engine: str
-    reason: str
-    thesis: Optional[str]
-    signal_strength: float
-    created_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class RateSnapshot:
-    q_hike: float
-    q_hold: float
-    q_cut: float
-    market_expected_rate_bp: float
-    effective_expected_rate_bp: float
-    delta_market_bp: float
-    delta_effective_bp: float
-    bias_bp: float
-    urgent: bool
-    fresh_macro_event: bool
-    macro_source: Optional[str]
-
-
-@dataclass
-class EarningsContext:
-    delta: float
-    abs_delta: float
-    age: float
-    tier: int
-    is_initial: bool
-    side: Optional[Side]
-    hold_active: bool
+    tag: str
+    ts: float
 
 
 @dataclass
 class CSignal:
-    bid: int
-    bid_qty: int
-    ask: int
-    ask_qty: int
-    mid: float
-    spread: float
-    fair: float
-    gap: float
-    gap_abs: float
-    bp_dislocation: float
-    fair_change: float
-    entry_threshold: float
-    exit_threshold: float
-
-
-@dataclass
-class CEntryDecision:
     side: Side
+    target: int
     thesis: str
-    edge_ticks: float
-    initial_size: int
-    add_size: int
-    thesis_cap: int
+    strength: float
+    tick: int
+    ts: float
+    description: str
 
 
 @dataclass
-class RatesEntryDecision:
-    direction: str
-    edge_bp: float
-    target_size: int
+class CEarningsShockState:
+    mode: str = "IDLE"
+    signal_id: int = 0
+    direction: int = 0
+    target_inventory: int = 0
+    original_target_inventory: int = 0
+    peak_inventory_abs: int = 0
+    started_ts: float = 0.0
+    tick: int = 0
+    reference_mid: Optional[float] = None
+    fair_before: Optional[float] = None
+    fair_after: Optional[float] = None
+    fair_change_ticks: Optional[float] = None
+    initial_edge: float = 0.0
+    equilibrium_reached_ts: Optional[float] = None
+    overshoot_stage_index: int = 0
+    overshoot_trimmed_qty_total: int = 0
+    overshoot_active: bool = False
+    overshoot_trigger_ticks: Optional[float] = None
+    overshoot_crossed_ts: Optional[float] = None
+    decay_steps_applied: int = 0
+    decay_trimmed_qty_total: int = 0
+    post_event_mids: deque = field(default_factory=lambda: deque(maxlen=160))
 
 
 @dataclass
-class MarketState:
-    books: Dict[str, TopOfBook] = field(default_factory=dict)
-    live_orders: Dict[str, TrackedOrder] = field(default_factory=dict)
-    pending_cancels: set[str] = field(default_factory=set)
-    last_trade_price: Dict[str, int] = field(default_factory=dict)
-
-    current_eps_c: float = 2.0
-    have_real_eps_c: bool = False
-    last_c_earnings_delta: float = 0.0
-    last_c_earnings_ts: float = 0.0
-    last_c_earnings_is_initial: bool = False
-    last_c_initial_baseline_ts: float = 0.0
-    c_initial_shock_consumed: bool = False
-
-    anchor_price: Optional[float] = None
-    anchor_eps: Optional[float] = None
-    anchor_yield_bp: Optional[float] = None
-    anchor_has_real_eps: bool = False
-    last_anchor_update_ts: float = 0.0
-
-    temp_rate_bias_bp: float = 0.0
-    temp_rate_bias_started_at: float = 0.0
-    temp_rate_bias_expires_at: float = 0.0
-    last_macro_event_ts: float = 0.0
-    last_macro_source: Optional[str] = None
-    last_macro_bias_bp: float = 0.0
-    news_urgency_until: float = 0.0
-
-    last_market_expected_rate_bp: Optional[float] = None
-    last_effective_expected_rate_bp: Optional[float] = None
-    last_fair_c: Optional[float] = None
-
-    startup_flatten_complete: bool = False
-    session_start_cash: Optional[float] = None
-    session_start_mtm: Optional[float] = None
-
-    last_status_log_ts: float = 0.0
-
-    c_regime_side: Optional[Side] = None
-    c_regime_thesis: Optional[str] = None
-    c_entry_stage: int = 0
-    c_last_entry_edge: float = 0.0
-    c_last_add_ts: float = 0.0
-    c_regime_started_at: float = 0.0
-    c_blocked_side: Optional[Side] = None
-    c_blocked_until: float = 0.0
-    c_flat_entry_cooldown_until: float = 0.0
-    c_unwind_active: bool = False
-    c_unwind_aggressive_active: bool = False
-
-    rates_regime_direction: Optional[str] = None
-    rates_entry_stage: int = 0
-    rates_last_entry_edge: float = 0.0
-    rates_last_add_ts: float = 0.0
-    rates_blocked_direction: Optional[str] = None
-    rates_blocked_until: float = 0.0
-
-    def clear_c_regime(self) -> None:
-        self.c_regime_side = None
-        self.c_regime_thesis = None
-        self.c_entry_stage = 0
-        self.c_last_entry_edge = 0.0
-        self.c_last_add_ts = 0.0
-        self.c_regime_started_at = 0.0
-        self.c_unwind_active = False
-        self.c_unwind_aggressive_active = False
-
-    def clear_rates_regime(self) -> None:
-        self.rates_regime_direction = None
-        self.rates_entry_stage = 0
-        self.rates_last_entry_edge = 0.0
-        self.rates_last_add_ts = 0.0
+class RateContext:
+    q_hike: float
+    q_hold: float
+    q_cut: float
+    market_rate_bp: float
+    effective_rate_bp: float
+    cpi_bias_bp: float
 
 
-class OrderManager:
-    def __init__(self, client: "MyXchangeClient", cfg: BotConfig, state: MarketState):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
+class CsvRunLogger:
+    FIELDNAMES = [
+        "wall_ts",
+        "event",
+        "tick",
+        "symbol",
+        "side",
+        "qty",
+        "price",
+        "order_id",
+        "tag",
+        "reason",
+        "message",
+        "pos_C",
+        "avg_C",
+        "realized_pnl",
+        "unrealized_pnl",
+        "total_pnl",
+        "cash",
+        "session_mtm",
+        "thesis",
+        "signal_thesis",
+        "signal_side",
+        "signal_target",
+        "signal_strength",
+        "signal_fresh",
+        "fair",
+        "c_bid",
+        "c_ask",
+        "c_mid",
+        "c_spread",
+        "eps",
+        "earnings_delta",
+        "cpi_surprise",
+        "cpi_bias_bp",
+        "cpi_actual",
+        "cpi_forecast",
+        "macro_score",
+        "macro_target",
+        "macro_direction",
+        "earnings_trend",
+        "news_kind",
+        "news_subtype",
+        "news_asset",
+        "rate_bp",
+        "market_rate_bp",
+        "q_hike",
+        "q_hold",
+        "q_cut",
+        "pm_pos_hike",
+        "pm_pos_hold",
+        "pm_pos_cut",
+        "mark_source",
+        "kill_switch",
+        "shock_mode",
+        "shock_target",
+        "shock_original_target",
+        "shock_direction",
+        "shock_reference_mid",
+        "shock_edge",
+        "shock_fair_before",
+        "shock_fair_after",
+        "shock_overshoot_stage",
+        "shock_decay_steps",
+        "shock_equilibrium",
+        "shock_intent",
+        "raw_news",
+    ]
 
-    def has_live_order(
-        self,
-        *,
-        symbol: Optional[str] = None,
-        role: Optional[str] = None,
-        engine: Optional[str] = None,
-        side: Optional[Side] = None,
-    ) -> bool:
-        for order in self.state.live_orders.values():
-            if symbol is not None and order.symbol != symbol:
-                continue
-            if role is not None and order.role != role:
-                continue
-            if engine is not None and order.engine != engine:
-                continue
-            if side is not None and order.side != side:
-                continue
-            return True
-        return False
-
-    def pending_qty(self, symbol: str, side: Side) -> int:
-        total = 0
-        for order in self.state.live_orders.values():
-            if order.symbol == symbol and order.side == side:
-                total += int(order.qty)
-        return total
-
-    async def cancel_order_if_present(self, order_id: str) -> None:
-        order_key = str(order_id)
-        if order_key in self.state.pending_cancels:
-            return
-
-        tracked = self.state.live_orders.get(order_key)
-        self.state.pending_cancels.add(order_key)
+    def __init__(self, root: Path):
         try:
-            await self.client.cancel_order(order_id)
-        except Exception as exc:
-            message = str(exc)
-            if "No such order" in message:
-                self.state.live_orders.pop(order_key, None)
-            else:
-                LOGGER.warning("Cancel failed for %s: %s", order_id, exc)
-                if tracked is not None:
-                    self.state.live_orders[order_key] = tracked
-        finally:
-            self.state.pending_cancels.discard(order_key)
-
-    async def cancel_live_orders(
-        self,
-        *,
-        symbol: Optional[str] = None,
-        role: Optional[str] = None,
-        engine: Optional[str] = None,
-        side: Optional[Side] = None,
-    ) -> None:
-        order_ids: list[str] = []
-        for order_id, order in self.state.live_orders.items():
-            if symbol is not None and order.symbol != symbol:
-                continue
-            if role is not None and order.role != role:
-                continue
-            if engine is not None and order.engine != engine:
-                continue
-            if side is not None and order.side != side:
-                continue
-            order_ids.append(order_id)
-
-        for order_id in order_ids:
-            await self.cancel_order_if_present(order_id)
-
-    async def cancel_stale_orders(self) -> None:
-        now = time.time()
-        stale = [
-            order_id
-            for order_id, order in self.state.live_orders.items()
-            if now - order.created_at >= self.cfg.order_stale_secs
-        ]
-        for order_id in stale:
-            await self.cancel_order_if_present(order_id)
-
-    async def place_tracked_order(
-        self,
-        *,
-        symbol: str,
-        qty: int,
-        side: Side,
-        price: int,
-        role: str,
-        engine: str,
-        reason: str,
-        thesis: Optional[str] = None,
-        signal_strength: float = 0.0,
-    ) -> bool:
-        if qty <= 0:
-            return False
-
-        if self.has_live_order(symbol=symbol):
-            return False
-
-        same_symbol_orders = [order for order in self.state.live_orders.values() if order.symbol == symbol]
-        if len(same_symbol_orders) >= self.cfg.max_active_orders_per_symbol:
-            await self.cancel_order_if_present(same_symbol_orders[0].order_id)
-            return False
-
-        order_id = await self.client.place_order(symbol, int(qty), side, int(price))
-        if order_id is None:
-            return False
-
-        tracked = TrackedOrder(
-            order_id=str(order_id),
-            symbol=symbol,
-            side=side,
-            qty=int(qty),
-            price=int(price),
-            role=role,
-            engine=engine,
-            reason=reason,
-            thesis=thesis,
-            signal_strength=float(signal_strength),
-        )
-        self.state.live_orders[str(order_id)] = tracked
-        LOGGER.info(
-            "Placed %s order: symbol=%s side=%s qty=%s price=%s thesis=%s strength=%.2f pos=%s",
-            reason,
-            symbol,
-            side.name,
-            qty,
-            price,
-            thesis or "none",
-            signal_strength,
-            self.client.get_position(symbol),
-        )
-        return True
-
-    def sync_fill(self, order_id: str) -> Optional[TrackedOrder]:
-        order_key = str(order_id)
-        tracked = self.state.live_orders.get(order_key)
-        if tracked is None:
-            return None
-
-        if order_key in self.client.open_orders:
-            remaining_qty = int(self.client.open_orders[order_key][1])
-            tracked.qty = remaining_qty
-            if remaining_qty <= 0:
-                self.state.live_orders.pop(order_key, None)
-        else:
-            self.state.live_orders.pop(order_key, None)
-        return tracked
-
-    def sync_rejected(self, order_id: str) -> Optional[TrackedOrder]:
-        return self.state.live_orders.pop(str(order_id), None)
-
-    def sync_cancel_response(self, order_id: str, success: bool) -> Optional[TrackedOrder]:
-        if success:
-            return self.state.live_orders.pop(str(order_id), None)
-        return self.state.live_orders.get(str(order_id))
-
-
-class RiskManager:
-    def __init__(self, client: "MyXchangeClient", cfg: BotConfig, state: MarketState, orders: OrderManager):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
-        self.orders = orders
-
-    def clip_c_qty(self, side: Side, desired_qty: int, thesis_cap: int) -> int:
-        pos = self.client.get_position(self.cfg.symbol_c)
-        pending = self.orders.pending_qty(self.cfg.symbol_c, side)
-
-        same_dir_pos = max(0, pos) if side == Side.BUY else max(0, -pos)
-        hard_remaining = self.cfg.c_hard_position_limit - same_dir_pos - pending
-        soft_remaining = thesis_cap - same_dir_pos - pending
-        return max(0, min(int(desired_qty), hard_remaining, soft_remaining, self.cfg.c_max_order_size))
-
-    def clip_rate_qty(self, symbol: str, side: Side, desired_qty: int, thesis_cap: int) -> int:
-        pos = self.client.get_position(symbol)
-        pending = self.orders.pending_qty(symbol, side)
-
-        same_dir_pos = max(0, pos) if side == Side.BUY else max(0, -pos)
-        hard_remaining = self.cfg.rate_hard_position_limit - same_dir_pos - pending
-        soft_remaining = thesis_cap - same_dir_pos - pending
-        return max(0, min(int(desired_qty), hard_remaining, soft_remaining, self.cfg.rate_max_order_size))
-
-    def arm_session_baseline_if_ready(self) -> bool:
-        if self.state.session_start_cash is not None and self.state.session_start_mtm is not None:
-            return False
-
-        for symbol in self.cfg.tracked_symbols:
-            if self.client.get_position(symbol) != 0:
-                return False
-        if self.client.open_orders:
-            return False
-        if self.state.live_orders:
-            return False
-
-        cash, mtm = self.client.cash_and_total_mtm()
-        self.state.session_start_cash = cash
-        self.state.session_start_mtm = mtm
-        LOGGER.info(
-            "Session baseline armed: cash=%.2f mtm=%.2f session_pnl=0.00",
-            cash,
-            mtm,
-        )
-        return True
-
-    async def startup_flatten_step(self) -> bool:
-        inherited_order_ids = [str(order_id) for order_id in self.client.open_orders.keys() if str(order_id) not in self.state.live_orders]
-        for order_id in inherited_order_ids:
-            await self.orders.cancel_order_if_present(order_id)
-
-        for symbol in self.cfg.tracked_symbols:
-            pos = self.client.get_position(symbol)
-            if pos == 0:
-                continue
-
-            book = self.client.top(symbol)
-            if book.bid is None or book.ask is None:
-                continue
-
-            side = Side.SELL if pos > 0 else Side.BUY
-            chunk = self.cfg.startup_flatten_chunk_c if symbol == self.cfg.symbol_c else self.cfg.startup_flatten_chunk_rate
-            max_order_size = self.cfg.c_max_order_size if symbol == self.cfg.symbol_c else self.cfg.rate_max_order_size
-            qty = min(abs(pos), chunk, max_order_size)
-            price = int(book.bid if side == Side.SELL else book.ask)
-            if self.orders.has_live_order(symbol=symbol):
-                continue
-            await self.orders.place_tracked_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                price=price,
-                role="flatten",
-                engine="risk",
-                reason="startup_flatten",
-                signal_strength=float(abs(pos)),
-            )
-
-        all_flat = all(self.client.get_position(symbol) == 0 for symbol in self.cfg.tracked_symbols)
-        no_orders = not self.client.open_orders and not self.state.live_orders
-        if all_flat and no_orders:
-            self.state.startup_flatten_complete = True
-            self.arm_session_baseline_if_ready()
-            LOGGER.info("Startup flatten complete; all tracked positions and inherited orders are flat.")
-            return True
-        return False
-
-
-class RatesSignalEngine:
-    def __init__(self, client: "MyXchangeClient", cfg: BotConfig, state: MarketState):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
-
-    def current_temp_bias(self) -> float:
-        now = time.time()
-        if now >= self.state.temp_rate_bias_expires_at or self.state.temp_rate_bias_expires_at <= self.state.temp_rate_bias_started_at:
-            self.state.temp_rate_bias_bp = 0.0
-            return 0.0
-
-        duration = self.state.temp_rate_bias_expires_at - self.state.temp_rate_bias_started_at
-        remaining = max(0.0, self.state.temp_rate_bias_expires_at - now)
-        if duration <= 0:
-            return 0.0
-        return self.state.temp_rate_bias_bp * (remaining / duration)
-
-    def mark_news_urgent(self, ttl_secs: float) -> None:
-        self.state.news_urgency_until = max(self.state.news_urgency_until, time.time() + ttl_secs)
-
-    def is_news_urgent(self) -> bool:
-        return time.time() < self.state.news_urgency_until
-
-    def apply_temp_rate_bias(self, delta_bp: float, ttl_secs: float, source: str) -> None:
-        current_bias = self.current_temp_bias()
-        next_bias = self.client.clip(current_bias + delta_bp, -self.cfg.max_temp_rate_bias_bp, self.cfg.max_temp_rate_bias_bp)
-        now = time.time()
-        self.state.temp_rate_bias_bp = next_bias
-        self.state.temp_rate_bias_started_at = now
-        self.state.temp_rate_bias_expires_at = now + ttl_secs
-        self.state.last_macro_event_ts = now
-        self.state.last_macro_source = source
-        self.state.last_macro_bias_bp = next_bias
-        self.mark_news_urgent(ttl_secs)
-
-    def headline_rate_bias_bp(self, content: str) -> float:
-        text = content.lower()
-        score = 0.0
-
-        hawkish = {
-            "inflation risks": 1.5,
-            "reassess path of cuts": 1.5,
-            "higher for longer": 2.0,
-            "keeps options open": 1.0,
-            "keep options open": 1.0,
-            "strong demand and sticky prices": 2.0,
-            "sticky prices": 1.5,
-            "stay restrictive for longer": 2.0,
-            "policy may stay restrictive": 2.0,
-            "persistent inflation": 1.5,
-            "concerned about wage growth": 1.5,
-            "pressure on the fed": 1.5,
-            "emphasizes inflation risks": 2.0,
-        }
-        dovish = {
-            "moving back to target": -1.5,
-            "cooling inflation": -1.0,
-            "softer inflation": -1.0,
-            "disinflation": -1.0,
-            "confidence inflation is moving back to target": -2.0,
-            "softening data": -1.5,
-            "policy easing": -1.5,
-            "expectations of policy easing": -2.0,
-            "cooling labor market": -1.25,
-            "easing inflation pressures": -1.5,
-            "cooling labor market and easing inflation pressures": -2.0,
-            "increasing confidence inflation is moving back to target": -2.0,
-        }
-
-        for phrase, value in hawkish.items():
-            if phrase in text:
-                score += value
-        for phrase, value in dovish.items():
-            if phrase in text:
-                score += value
-
-        if (
-            "balanced risks" in text
-            or "mixed economic indicators" in text
-            or "communication remains cautious" in text
-            or "await upcoming data" in text
-        ):
-            score *= 0.5
-
-        return self.client.clip(score, -2.0, 2.0)
-
-    def fed_probs(self) -> Optional[tuple[float, float, float]]:
-        mid_hike = self.client.mid(self.cfg.fed_hike)
-        mid_hold = self.client.mid(self.cfg.fed_hold)
-        mid_cut = self.client.mid(self.cfg.fed_cut)
-        if mid_hike is None or mid_hold is None or mid_cut is None:
-            return None
-
-        q_hike = mid_hike / self.cfg.payout_scale
-        q_hold = mid_hold / self.cfg.payout_scale
-        q_cut = mid_cut / self.cfg.payout_scale
-        total = q_hike + q_hold + q_cut
-        if total <= 1e-9:
-            return None
-        return q_hike / total, q_hold / total, q_cut / total
-
-    def expected_rate_bp(self) -> Optional[float]:
-        probs = self.fed_probs()
-        if probs is None:
-            return None
-        q_hike, _, q_cut = probs
-        return 25.0 * q_hike - 25.0 * q_cut
-
-    def snapshot(self) -> Optional[RateSnapshot]:
-        probs = self.fed_probs()
-        if probs is None:
-            return None
-
-        market_expected_rate_bp = self.expected_rate_bp()
-        if market_expected_rate_bp is None:
-            return None
-
-        bias_bp = self.current_temp_bias()
-        effective_expected_rate_bp = market_expected_rate_bp + bias_bp
-        delta_market_bp = (
-            0.0
-            if self.state.last_market_expected_rate_bp is None
-            else market_expected_rate_bp - self.state.last_market_expected_rate_bp
-        )
-        delta_effective_bp = (
-            0.0
-            if self.state.last_effective_expected_rate_bp is None
-            else effective_expected_rate_bp - self.state.last_effective_expected_rate_bp
-        )
-        fresh_macro = False
-        if self.state.last_macro_event_ts > 0.0:
-            ttl = self.cfg.cpi_bias_ttl_secs if self.state.last_macro_source == "cpi_print" else self.cfg.headline_bias_ttl_secs
-            fresh_macro = time.time() - self.state.last_macro_event_ts <= ttl
-
-        return RateSnapshot(
-            q_hike=probs[0],
-            q_hold=probs[1],
-            q_cut=probs[2],
-            market_expected_rate_bp=market_expected_rate_bp,
-            effective_expected_rate_bp=effective_expected_rate_bp,
-            delta_market_bp=delta_market_bp,
-            delta_effective_bp=delta_effective_bp,
-            bias_bp=bias_bp,
-            urgent=self.is_news_urgent(),
-            fresh_macro_event=fresh_macro,
-            macro_source=self.state.last_macro_source,
-        )
-
-
-class CFairValueEngine:
-    def __init__(self, client: "MyXchangeClient", cfg: BotConfig, state: MarketState, rates: RatesSignalEngine):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
-        self.rates = rates
-
-    def earnings_context(self) -> EarningsContext:
-        if self.state.last_c_earnings_ts <= 0.0:
-            return EarningsContext(0.0, 0.0, float("inf"), 0, False, None, False)
-
-        age = max(0.0, time.time() - self.state.last_c_earnings_ts)
-        delta = self.state.last_c_earnings_delta
-        abs_delta = abs(delta)
-        side: Optional[Side] = None
-        if delta > 0:
-            side = Side.BUY
-        elif delta < 0:
-            side = Side.SELL
-
-        tier = 0
-        if not self.state.last_c_earnings_is_initial:
-            if abs_delta >= self.cfg.c_earnings_medium_delta:
-                tier = 3
-            elif abs_delta >= self.cfg.c_earnings_small_delta:
-                tier = 2
-            elif abs_delta >= self.cfg.c_earnings_ignore_delta:
-                tier = 1
-
-        hold_secs = {
-            0: 0.0,
-            1: 1.50,
-            2: self.cfg.c_earnings_hold_secs,
-            3: self.cfg.c_earnings_hold_secs + 0.75,
-        }[tier]
-
-        return EarningsContext(
-            delta=delta,
-            abs_delta=abs_delta,
-            age=age,
-            tier=tier,
-            is_initial=self.state.last_c_earnings_is_initial,
-            side=side,
-            hold_active=tier > 0 and age <= hold_secs,
-        )
-
-    def initialize_anchor(self, rate_snapshot: Optional[RateSnapshot], *, force: bool = False) -> bool:
-        book = self.client.top(self.cfg.symbol_c)
-        mid_c = book.mid
-        if mid_c is None or rate_snapshot is None:
-            return False
-
-        if (
-            self.state.anchor_price is None
-            or self.state.anchor_eps is None
-            or self.state.anchor_yield_bp is None
-            or force
-        ):
-            self.state.anchor_price = mid_c
-            self.state.anchor_eps = self.state.current_eps_c
-            self.state.anchor_yield_bp = rate_snapshot.effective_expected_rate_bp
-            self.state.anchor_has_real_eps = self.state.have_real_eps_c
-            self.state.last_anchor_update_ts = time.time()
-            LOGGER.info(
-                "Initialized C anchor: price=%.2f eps=%.4f exp_bp=%.2f source=%s",
-                self.state.anchor_price,
-                self.state.anchor_eps,
-                self.state.anchor_yield_bp,
-                "real_earnings" if self.state.anchor_has_real_eps else "default_eps",
-            )
-            return True
-        return False
-
-    def maybe_refresh_anchor_after_first_real_eps(self, rate_snapshot: Optional[RateSnapshot]) -> None:
-        if not self.state.have_real_eps_c:
-            return
-        if self.state.anchor_has_real_eps:
-            return
-        if self.initialize_anchor(rate_snapshot, force=True):
-            now = time.time()
-            self.state.last_c_initial_baseline_ts = now
-            self.state.c_initial_shock_consumed = False
-            LOGGER.info(
-                "Adopted first real C EPS as new baseline anchor: price=%.2f eps=%.4f exp_bp=%.2f",
-                self.state.anchor_price or 0.0,
-                self.state.anchor_eps or 0.0,
-                self.state.anchor_yield_bp or 0.0,
-            )
-
-    def maybe_reanchor(self, signal: Optional[CSignal], rate_snapshot: Optional[RateSnapshot]) -> None:
-        if signal is None or rate_snapshot is None:
-            return
-        if self.client.get_position(self.cfg.symbol_c) != 0:
-            return
-        if self.orders_live_for_c():
-            return
-        if self.rates.is_news_urgent():
-            return
-        if time.time() - self.state.last_anchor_update_ts < self.cfg.anchor_reprice_secs:
-            return
-        if signal.gap_abs > max(signal.spread, signal.exit_threshold):
-            return
-
-        self.state.anchor_price = 0.98 * float(self.state.anchor_price) + 0.02 * signal.mid
-        self.state.anchor_yield_bp = (
-            0.98 * float(self.state.anchor_yield_bp) + 0.02 * rate_snapshot.effective_expected_rate_bp
-        )
-        self.state.last_anchor_update_ts = time.time()
-
-    def orders_live_for_c(self) -> bool:
-        return any(order.symbol == self.cfg.symbol_c for order in self.state.live_orders.values())
-
-    def fair_value(self, rate_snapshot: Optional[RateSnapshot]) -> Optional[float]:
-        if (
-            self.state.anchor_price is None
-            or self.state.anchor_eps is None
-            or self.state.anchor_yield_bp is None
-            or rate_snapshot is None
-        ):
-            return None
-
-        if self.state.anchor_eps == 0:
-            return None
-
-        anchor_price = float(self.state.anchor_price)
-        anchor_eps = float(self.state.anchor_eps)
-        anchor_yield_bp = float(self.state.anchor_yield_bp)
-        yield_now = float(rate_snapshot.effective_expected_rate_bp)
-        dy = (yield_now - anchor_yield_bp) / 10000.0
-
-        ops_anchor = self.cfg.c_ops_weight * anchor_price
-        bond_anchor = self.cfg.c_bond_weight * anchor_price
-
-        ops_fair = ops_anchor * (self.state.current_eps_c / anchor_eps) * math.exp(-self.cfg.c_pe_yield_gamma * dy)
-        bond_fair = bond_anchor * (1.0 - self.cfg.c_bond_duration * dy + 0.5 * self.cfg.c_bond_convexity * dy * dy)
-        return ops_fair + bond_fair
-
-    def snapshot(self, rate_snapshot: Optional[RateSnapshot]) -> Optional[CSignal]:
-        book = self.client.top(self.cfg.symbol_c)
-        if book.bid is None or book.ask is None:
-            return None
-
-        fair = self.fair_value(rate_snapshot)
-        if fair is None:
-            return None
-        if self.state.anchor_yield_bp is None or rate_snapshot is None:
-            return None
-
-        mid = book.mid
-        if mid is None:
-            return None
-
-        fair_change = 0.0 if self.state.last_fair_c is None else fair - self.state.last_fair_c
-        spread = book.usable_spread
-        return CSignal(
-            bid=int(book.bid),
-            bid_qty=int(book.bid_qty),
-            ask=int(book.ask),
-            ask_qty=int(book.ask_qty),
-            mid=float(mid),
-            spread=float(spread),
-            fair=float(fair),
-            gap=float(fair - mid),
-            gap_abs=float(abs(fair - mid)),
-            bp_dislocation=float(rate_snapshot.effective_expected_rate_bp - self.state.anchor_yield_bp),
-            fair_change=float(fair_change),
-            entry_threshold=max(8.0, 1.25 * spread),
-            exit_threshold=max(6.0, 0.75 * spread),
-        )
-
-
-class RatesTradingEngine:
-    def __init__(
-        self,
-        client: "MyXchangeClient",
-        cfg: BotConfig,
-        state: MarketState,
-        orders: OrderManager,
-        risk: RiskManager,
-    ):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
-        self.orders = orders
-        self.risk = risk
-
-    def current_pair_direction(self) -> Optional[str]:
-        pos_hike = self.client.get_position(self.cfg.fed_hike)
-        pos_cut = self.client.get_position(self.cfg.fed_cut)
-        if pos_hike > 0 and pos_cut < 0:
-            return "hawkish"
-        if pos_hike < 0 and pos_cut > 0:
-            return "dovish"
-        return None
-
-    def current_pair_abs(self) -> int:
-        pos_hike = abs(self.client.get_position(self.cfg.fed_hike))
-        pos_cut = abs(self.client.get_position(self.cfg.fed_cut))
-        return max(pos_hike, pos_cut)
-
-    def max_entry_stages(self, target_size: int) -> int:
-        return max(1, math.ceil(max(0, target_size) / max(1, self.cfg.rate_max_order_size)))
-
-    async def flatten_all_rates(self, reason: str) -> bool:
-        acted = False
-        for symbol in self.cfg.rate_symbols:
-            pos = self.client.get_position(symbol)
-            if pos == 0:
-                continue
-            book = self.client.top(symbol)
-            if book.bid is None or book.ask is None:
-                continue
-            side = Side.SELL if pos > 0 else Side.BUY
-            qty = min(abs(pos), self.cfg.rate_max_order_size)
-            price = int(book.bid if side == Side.SELL else book.ask)
-            if self.orders.has_live_order(symbol=symbol):
-                continue
-            placed = await self.orders.place_tracked_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                price=price,
-                role="exit",
-                engine="rates",
-                reason=reason,
-                thesis=self.state.rates_regime_direction,
-                signal_strength=float(abs(pos)),
-            )
-            acted = acted or placed
-        if acted:
-            self.state.rates_blocked_direction = self.state.rates_regime_direction
-            self.state.rates_blocked_until = time.time() + self.cfg.rate_reentry_block_secs
-            self.state.clear_rates_regime()
-            LOGGER.info("Rates exit trigger: %s", reason)
-        return acted
-
-    async def handle_missing_signal_exit(self) -> bool:
-        if any(self.client.get_position(symbol) != 0 for symbol in self.cfg.rate_symbols):
-            return await self.flatten_all_rates("signal_lost")
-        return False
-
-    async def maybe_exit(self, snapshot: RateSnapshot) -> bool:
-        direction = self.current_pair_direction()
-        if direction is None:
-            if self.client.get_position(self.cfg.fed_hold) != 0:
-                return await self.flatten_all_rates("signal_lost")
-            return False
-
-        edge_bp = abs(snapshot.bias_bp)
-        compressed = edge_bp <= max(self.cfg.rate_exit_edge_bp, self.state.rates_last_entry_edge * 0.30)
-        opposite = (direction == "hawkish" and snapshot.bias_bp <= -self.cfg.rate_exit_edge_bp) or (
-            direction == "dovish" and snapshot.bias_bp >= self.cfg.rate_exit_edge_bp
-        )
-        stale = edge_bp < self.cfg.rate_exit_edge_bp
-
-        if stale or opposite or compressed:
-            return await self.flatten_all_rates("bias_decay" if stale or compressed else "macro_reversal")
-        return False
-
-    def compute_entry_decision(self, snapshot: RateSnapshot) -> Optional[RatesEntryDecision]:
-        if not snapshot.fresh_macro_event:
-            return None
-        if snapshot.bias_bp >= self.cfg.rate_entry_edge_bp:
-            direction = "hawkish"
-        elif snapshot.bias_bp <= -self.cfg.rate_entry_edge_bp:
-            direction = "dovish"
-        else:
-            return None
-
-        edge_bp = abs(snapshot.bias_bp)
-        if snapshot.macro_source == "cpi_print" and edge_bp >= 5.0:
-            target_size = self.cfg.rate_extreme_size
-        elif edge_bp >= 3.5 or snapshot.urgent:
-            target_size = self.cfg.rate_strong_size
-        else:
-            target_size = self.cfg.rate_normal_size
-        return RatesEntryDecision(direction=direction, edge_bp=edge_bp, target_size=target_size)
-
-    async def maybe_enter(self, snapshot: RateSnapshot) -> bool:
-        decision = self.compute_entry_decision(snapshot)
-        if decision is None:
-            return False
-
-        now = time.time()
-        if self.state.rates_blocked_direction == decision.direction and now < self.state.rates_blocked_until:
-            return False
-
-        current_direction = self.current_pair_direction()
-        if current_direction is not None and current_direction != decision.direction:
-            return False
-
-        if current_direction is not None:
-            if self.state.rates_entry_stage >= self.max_entry_stages(decision.target_size):
-                return False
-            if decision.edge_bp < self.state.rates_last_entry_edge + self.cfg.rate_add_edge_step_bp:
-                required_edge = max(
-                    self.cfg.rate_entry_edge_bp,
-                    self.state.rates_last_entry_edge * self.cfg.rate_add_edge_frac,
-                )
-                if decision.edge_bp < required_edge:
-                    return False
-            if now - self.state.rates_last_add_ts < self.cfg.c_add_cooldown_secs:
-                return False
-
-        if decision.direction == "hawkish":
-            buy_symbol = self.cfg.fed_hike
-            sell_symbol = self.cfg.fed_cut
-        else:
-            buy_symbol = self.cfg.fed_cut
-            sell_symbol = self.cfg.fed_hike
-
-        buy_book = self.client.top(buy_symbol)
-        sell_book = self.client.top(sell_symbol)
-        if buy_book.ask is None or sell_book.bid is None:
-            return False
-
-        current_leg_abs = self.current_pair_abs()
-        if current_leg_abs >= decision.target_size:
-            return False
-        desired_leg = decision.target_size - current_leg_abs
-
-        buy_qty = self.risk.clip_rate_qty(buy_symbol, Side.BUY, desired_leg, decision.target_size)
-        sell_qty = self.risk.clip_rate_qty(sell_symbol, Side.SELL, desired_leg, decision.target_size)
-        qty = min(buy_qty, sell_qty)
-        if qty <= 0:
-            return False
-
-        if self.orders.has_live_order(symbol=buy_symbol) or self.orders.has_live_order(symbol=sell_symbol):
-            return False
-
-        placed_buy = await self.orders.place_tracked_order(
-            symbol=buy_symbol,
-            qty=qty,
-            side=Side.BUY,
-            price=int(buy_book.ask),
-            role="entry",
-            engine="rates",
-            reason="rates_entry",
-            thesis=decision.direction,
-            signal_strength=decision.edge_bp,
-        )
-        placed_sell = await self.orders.place_tracked_order(
-            symbol=sell_symbol,
-            qty=qty,
-            side=Side.SELL,
-            price=int(sell_book.bid),
-            role="entry",
-            engine="rates",
-            reason="rates_entry",
-            thesis=decision.direction,
-            signal_strength=decision.edge_bp,
-        )
-        placed = placed_buy or placed_sell
-        if placed:
-            self.state.rates_regime_direction = decision.direction
-            self.state.rates_entry_stage = 1 if current_direction is None else self.state.rates_entry_stage + 1
-            self.state.rates_last_entry_edge = decision.edge_bp
-            self.state.rates_last_add_ts = now
-            LOGGER.info(
-                "Rates entry: direction=%s qty=%s edge_bp=%.2f target=%s",
-                decision.direction,
-                qty,
-                decision.edge_bp,
-                decision.target_size,
-            )
-        return placed
-
-
-class CTradingEngine:
-    def __init__(
-        self,
-        client: "MyXchangeClient",
-        cfg: BotConfig,
-        state: MarketState,
-        orders: OrderManager,
-        risk: RiskManager,
-        fair_engine: CFairValueEngine,
-    ):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
-        self.orders = orders
-        self.risk = risk
-        self.fair_engine = fair_engine
-
-    def initial_shock_window_remaining(self, now: Optional[float] = None) -> float:
-        if self.state.last_c_initial_baseline_ts <= 0.0:
-            return 0.0
-        if now is None:
-            now = time.time()
-        elapsed = max(0.0, now - self.state.last_c_initial_baseline_ts)
-        return max(0.0, self.cfg.c_initial_shock_window_secs - elapsed)
-
-    def initial_shock_window_active(self, now: Optional[float] = None) -> bool:
-        return self.initial_shock_window_remaining(now) > 0.0
-
-    def is_news_thesis(self, thesis: str) -> bool:
-        return thesis in {"earnings", "initial_earnings_shock"}
-
-    def max_entry_stages(self, thesis_cap: int) -> int:
-        return max(1, math.ceil(max(0, thesis_cap) / max(1, self.cfg.c_max_order_size)))
-
-    def rates_positions_or_orders_live(self) -> bool:
-        if any(self.client.get_position(symbol) != 0 for symbol in self.cfg.rate_symbols):
-            return True
-        return any(order.symbol in self.cfg.rate_symbols for order in self.state.live_orders.values())
-
-    def leadlag_catalyst_live(self, rate_snapshot: RateSnapshot) -> bool:
-        if self.rates_positions_or_orders_live():
-            return True
-        if rate_snapshot.fresh_macro_event:
-            return True
-        return abs(rate_snapshot.bias_bp) >= self.cfg.rate_entry_edge_bp
-
-    def refresh_unwind_state(self) -> None:
-        pos_abs = abs(self.client.get_position(self.cfg.symbol_c))
-        active_news_regime = self.is_news_thesis(self.state.c_regime_thesis or "")
-        if not active_news_regime or pos_abs == 0:
-            self.state.c_unwind_active = False
-            self.state.c_unwind_aggressive_active = False
-            return
-
-        if self.state.c_unwind_active:
-            if pos_abs <= self.cfg.c_unwind_exit_position:
-                self.state.c_unwind_active = False
-                self.state.c_unwind_aggressive_active = False
-                return
-        elif pos_abs >= self.cfg.c_unwind_entry_position:
-            self.state.c_unwind_active = True
-
-        if not self.state.c_unwind_active:
-            self.state.c_unwind_aggressive_active = False
-            return
-
-        if self.state.c_unwind_aggressive_active:
-            if pos_abs <= self.cfg.c_unwind_aggressive_exit:
-                self.state.c_unwind_aggressive_active = False
-            return
-
-        if pos_abs >= self.cfg.c_unwind_aggressive_entry:
-            self.state.c_unwind_aggressive_active = True
-
-    def c_mode_name(self, earnings: EarningsContext, now: float) -> str:
-        if self.initial_shock_window_active(now):
-            return "INITIAL_EARNINGS_SHOCK"
-        if self.state.c_unwind_active:
-            return "EARNINGS_UNWIND"
-        if earnings.tier >= 1 and earnings.age <= self.cfg.c_earnings_fresh_secs:
-            return "EARNINGS_ACTIVE"
-        return "NORMAL"
-
-    def c_overlay_budgets(self, earnings: EarningsContext, now: float) -> tuple[int, int, bool]:
-        mode = self.c_mode_name(earnings, now)
-        if mode in {"INITIAL_EARNINGS_SHOCK", "EARNINGS_ACTIVE", "EARNINGS_UNWIND"}:
-            return self.cfg.c_event_shift_budget, self.cfg.c_background_shift_budget, True
-        return self.cfg.c_event_base_budget, self.cfg.c_background_base_budget, False
-
-    def budgeted_decision(
-        self,
-        decision: CEntryDecision,
-        *,
-        event_budget: int,
-        background_budget: int,
-    ) -> Optional[CEntryDecision]:
-        if self.is_news_thesis(decision.thesis):
-            cap = min(decision.thesis_cap, event_budget)
-        else:
-            cap = min(decision.thesis_cap, background_budget)
-        if cap <= 0:
-            return None
-        if cap == decision.thesis_cap:
-            return decision
-        return CEntryDecision(
-            side=decision.side,
-            thesis=decision.thesis,
-            edge_ticks=decision.edge_ticks,
-            initial_size=decision.initial_size,
-            add_size=decision.add_size,
-            thesis_cap=cap,
-        )
-
-    def compute_entry_decision(self, signal: CSignal, rate_snapshot: RateSnapshot) -> Optional[CEntryDecision]:
-        if not self.state.have_real_eps_c:
-            return None
-
-        now = time.time()
-        earnings = self.fair_engine.earnings_context()
-        fresh_earnings = earnings.tier >= 1 and not earnings.is_initial and earnings.age <= self.cfg.c_earnings_fresh_secs
-        initial_shock_window = self.initial_shock_window_active(now)
-        self.refresh_unwind_state()
-        event_budget, background_budget, _ = self.c_overlay_budgets(earnings, now)
-
-        rate_tailwind = (
-            (signal.gap > 0 and signal.bp_dislocation <= -self.cfg.lead_lag_bp_trigger)
-            or (signal.gap < 0 and signal.bp_dislocation >= self.cfg.lead_lag_bp_trigger)
-        )
-
-        if fresh_earnings and earnings.side is not None:
-            if earnings.side == Side.BUY and signal.gap <= 0:
-                return None
-            if earnings.side == Side.SELL and signal.gap >= 0:
-                return None
-
-            if earnings.tier == 1:
-                threshold = max(self.cfg.lead_lag_entry_ticks - 2.0, 1.25 * signal.spread, 14.0)
-                if signal.gap_abs >= threshold:
-                    return self.budgeted_decision(CEntryDecision(
-                        side=earnings.side,
-                        thesis="earnings",
-                        edge_ticks=signal.gap_abs,
-                        initial_size=self.cfg.c_tier1_initial_size,
-                        add_size=self.cfg.c_tier1_add_size,
-                        thesis_cap=self.cfg.c_tier1_cap,
-                    ), event_budget=event_budget, background_budget=background_budget)
-            elif earnings.tier == 2:
-                initial_size = self.cfg.c_tier2_initial_size
-                add_size = self.cfg.c_tier2_add_size
-                cap = self.cfg.c_tier2_cap
-                if rate_tailwind:
-                    initial_size = self.cfg.c_tier3_initial_size
-                    add_size = self.cfg.c_tier3_add_size
-                    cap = self.cfg.c_tier3_cap
-                threshold = max(10.0, signal.entry_threshold)
-                if signal.gap_abs >= threshold:
-                    return self.budgeted_decision(CEntryDecision(
-                        side=earnings.side,
-                        thesis="earnings",
-                        edge_ticks=signal.gap_abs,
-                        initial_size=initial_size,
-                        add_size=add_size,
-                        thesis_cap=cap,
-                    ), event_budget=event_budget, background_budget=background_budget)
-            else:
-                threshold = max(8.0, signal.entry_threshold)
-                if signal.gap_abs >= threshold:
-                    return self.budgeted_decision(CEntryDecision(
-                        side=earnings.side,
-                        thesis="earnings",
-                        edge_ticks=signal.gap_abs,
-                        initial_size=self.cfg.c_tier3_initial_size,
-                        add_size=self.cfg.c_tier3_add_size,
-                        thesis_cap=self.cfg.c_tier3_cap,
-                    ), event_budget=event_budget, background_budget=background_budget)
-
-        if not fresh_earnings and initial_shock_window:
-            threshold = max(self.cfg.c_initial_shock_gap_ticks, 1.25 * signal.spread)
-            if signal.gap_abs >= threshold and (
-                not self.state.c_initial_shock_consumed or self.state.c_regime_thesis == "initial_earnings_shock"
-            ):
-                side = Side.BUY if signal.gap > 0 else Side.SELL
-                return self.budgeted_decision(CEntryDecision(
-                    side=side,
-                    thesis="initial_earnings_shock",
-                    edge_ticks=signal.gap_abs,
-                    initial_size=self.cfg.c_initial_shock_initial_size,
-                    add_size=self.cfg.c_initial_shock_add_size,
-                    thesis_cap=self.cfg.c_initial_shock_cap,
-                ), event_budget=event_budget, background_budget=background_budget)
-            return None
-
-        if background_budget <= 0:
-            return None
-
-        if (
-            not fresh_earnings
-            and abs(signal.bp_dislocation) >= self.cfg.lead_lag_bp_trigger
-            and signal.gap_abs >= max(self.cfg.lead_lag_entry_ticks, 1.5 * signal.spread)
-        ):
-            side = Side.BUY if signal.gap > 0 else Side.SELL
-            return self.budgeted_decision(CEntryDecision(
-                side=side,
-                thesis="rates_lead_lag",
-                edge_ticks=signal.gap_abs,
-                initial_size=self.cfg.c_leadlag_initial_size,
-                add_size=self.cfg.c_leadlag_add_size,
-                thesis_cap=self.cfg.c_leadlag_cap,
-            ), event_budget=event_budget, background_budget=background_budget)
-
-        return None
-
-    async def handle_missing_signal_exit(self) -> bool:
-        pos = self.client.get_position(self.cfg.symbol_c)
-        if pos == 0:
-            return False
-
-        book = self.client.top(self.cfg.symbol_c)
-        if book.bid is None or book.ask is None:
-            return False
-        if self.orders.has_live_order(symbol=self.cfg.symbol_c):
-            return False
-
-        side = Side.SELL if pos > 0 else Side.BUY
-        price = int(book.bid if side == Side.SELL else book.ask)
-        qty = min(abs(pos), self.cfg.c_max_order_size)
-        placed = await self.orders.place_tracked_order(
-            symbol=self.cfg.symbol_c,
-            qty=qty,
-            side=side,
-            price=price,
-            role="exit",
-            engine="c",
-            reason="signal_lost",
-            thesis=self.state.c_regime_thesis,
-            signal_strength=float(abs(pos)),
-        )
-        if placed:
-            self.state.c_blocked_side = self.state.c_regime_side
-            self.state.c_blocked_until = time.time() + self.cfg.c_reentry_block_secs
-            self.state.clear_c_regime()
-            LOGGER.info("C exit trigger: signal_lost")
-        return placed
-
-    async def maybe_exit(self, signal: CSignal, rate_snapshot: RateSnapshot) -> bool:
-        pos = self.client.get_position(self.cfg.symbol_c)
-        if pos == 0:
-            self.state.clear_c_regime()
-            return False
-
-        now = time.time()
-        earnings = self.fair_engine.earnings_context()
-        side = None
-        reason = None
-        qty = 0
-        long_pos = pos > 0
-        favorable_gap = signal.gap if long_pos else -signal.gap
-        adverse_gap = -signal.gap if long_pos else signal.gap
-        entry_edge = max(self.state.c_last_entry_edge, signal.entry_threshold)
-        compression_band = max(self.cfg.c_compression_min_ticks, self.cfg.c_compression_frac * entry_edge)
-        initial_shock_active = self.initial_shock_window_active()
-        thesis = self.state.c_regime_thesis or ""
-        regime_age = 0.0 if self.state.c_regime_started_at <= 0.0 else max(0.0, now - self.state.c_regime_started_at)
-        self.refresh_unwind_state()
-        if thesis in {"earnings", "initial_earnings_shock"} and self.state.c_unwind_active:
-            unwind_band = entry_edge if self.state.c_unwind_aggressive_active else max(self.cfg.c_initial_shock_compress_ticks, 0.60 * entry_edge)
-            compression_band = max(compression_band, unwind_band)
-
-        earnings_opposite = (
-            earnings.tier >= 1
-            and earnings.side is not None
-            and earnings.side != (Side.BUY if long_pos else Side.SELL)
-            and earnings.age <= self.cfg.c_earnings_fresh_secs
-        )
-
-        if earnings_opposite and earnings.tier >= 2:
-            side = Side.SELL if long_pos else Side.BUY
-            qty = abs(pos)
-            reason = "earnings_reversal"
-        elif adverse_gap >= max(self.cfg.c_hard_flip_min_ticks, signal.exit_threshold):
-            side = Side.SELL if long_pos else Side.BUY
-            qty = abs(pos)
-            reason = "gap_flip"
-        elif self.state.c_regime_thesis == "initial_earnings_shock":
-            compress_threshold = max(self.cfg.c_initial_shock_compress_ticks, signal.exit_threshold)
-            if regime_age >= self.cfg.c_initial_shock_max_hold_secs:
-                side = Side.SELL if long_pos else Side.BUY
-                qty = abs(pos)
-                reason = "initial_shock_timeout"
-            elif not initial_shock_active:
-                side = Side.SELL if long_pos else Side.BUY
-                qty = abs(pos)
-                reason = "initial_shock_unwind"
-            elif favorable_gap <= compress_threshold:
-                side = Side.SELL if long_pos else Side.BUY
-                if favorable_gap <= self.cfg.c_initial_shock_flatten_ticks:
-                    qty = abs(pos)
-                    reason = "initial_shock_compress_full"
-                else:
-                    qty = min(abs(pos), max(10, abs(pos) // 2))
-                    reason = "initial_shock_compress_trim"
-        elif thesis == "earnings" and self.state.c_unwind_active and favorable_gap <= compression_band:
-            side = Side.SELL if long_pos else Side.BUY
-            qty = min(abs(pos), max(20 if self.state.c_unwind_aggressive_active else 10, abs(pos) // 2))
-            reason = "earnings_unwind_aggressive" if self.state.c_unwind_aggressive_active else "earnings_unwind_passive"
-        elif thesis == "rates_lead_lag":
-            if regime_age >= self.cfg.c_leadlag_max_hold_secs:
-                side = Side.SELL if long_pos else Side.BUY
-                qty = abs(pos)
-                reason = "leadlag_timeout"
-            elif not self.leadlag_catalyst_live(rate_snapshot):
-                side = Side.SELL if long_pos else Side.BUY
-                qty = abs(pos)
-                reason = "leadlag_catalyst_gone"
-            else:
-                rate_reversal = (
-                    (long_pos and rate_snapshot.delta_effective_bp >= self.cfg.c_rate_reversal_bp)
-                    or ((not long_pos) and rate_snapshot.delta_effective_bp <= -self.cfg.c_rate_reversal_bp)
-                )
-                if rate_reversal and favorable_gap <= max(entry_edge * 0.75, compression_band):
-                    side = Side.SELL if long_pos else Side.BUY
-                    qty = abs(pos)
-                    reason = "rate_reversal"
-        elif thesis == "post_baseline_gap":
-            rate_reversal = (
-                (long_pos and rate_snapshot.delta_effective_bp >= self.cfg.c_rate_reversal_bp)
-                or ((not long_pos) and rate_snapshot.delta_effective_bp <= -self.cfg.c_rate_reversal_bp)
-            )
-            if rate_reversal and favorable_gap <= max(entry_edge * 0.75, compression_band):
-                side = Side.SELL if long_pos else Side.BUY
-                qty = abs(pos)
-                reason = "rate_reversal"
-
-        if side is None and favorable_gap <= compression_band:
-            side = Side.SELL if long_pos else Side.BUY
-            if favorable_gap <= 0:
-                qty = abs(pos)
-                reason = "gap_compress_full"
-            else:
-                qty = min(abs(pos), max(10, abs(pos) // 2))
-                reason = "gap_compress_trim"
-
-        qty = min(int(qty), self.cfg.c_max_order_size)
-
-        if side is None or qty <= 0:
-            return False
-
-        book = self.client.top(self.cfg.symbol_c)
-        if book.bid is None or book.ask is None:
-            return False
-        if self.orders.has_live_order(symbol=self.cfg.symbol_c):
-            return False
-
-        await self.orders.cancel_live_orders(symbol=self.cfg.symbol_c, role="entry", engine="c")
-
-        price = int(book.bid if side == Side.SELL else book.ask)
-        placed = await self.orders.place_tracked_order(
-            symbol=self.cfg.symbol_c,
-            qty=qty,
-            side=side,
-            price=price,
-            role="exit",
-            engine="c",
-            reason=reason,
-            thesis=self.state.c_regime_thesis,
-            signal_strength=signal.gap_abs,
-        )
-        if placed:
-            if qty >= abs(pos):
-                self.state.c_blocked_side = self.state.c_regime_side
-                self.state.c_blocked_until = time.time() + self.cfg.c_reentry_block_secs
-                self.state.clear_c_regime()
-            LOGGER.info(
-                "C exit trigger: %s pos=%s gap=%.2f delta_effective_bp=%.2f",
-                reason,
-                pos,
-                signal.gap,
-                rate_snapshot.delta_effective_bp,
-            )
-        return placed
-
-    async def maybe_enter(self, decision: Optional[CEntryDecision], signal: Optional[CSignal]) -> bool:
-        if decision is None or signal is None:
-            return False
-
-        now = time.time()
-        pos = self.client.get_position(self.cfg.symbol_c)
-        same_direction = (pos > 0 and decision.side == Side.BUY) or (pos < 0 and decision.side == Side.SELL)
-
-        if self.state.c_blocked_side == decision.side and now < self.state.c_blocked_until:
-            return False
-        if pos == 0 and now < self.state.c_flat_entry_cooldown_until:
-            return False
-        if self.orders.has_live_order(symbol=self.cfg.symbol_c):
-            return False
-        if pos != 0 and not same_direction:
-            return False
-        self.refresh_unwind_state()
-
-        if same_direction:
-            if self.state.c_regime_thesis != decision.thesis:
-                return False
-            if self.is_news_thesis(decision.thesis) and self.state.c_unwind_active:
-                return False
-            max_stages = self.max_entry_stages(decision.thesis_cap)
-            if self.state.c_entry_stage >= max_stages:
-                return False
-            if now - self.state.c_last_add_ts < self.cfg.c_add_cooldown_secs:
-                return False
-            if self.is_news_thesis(decision.thesis):
-                required_edge = max(signal.entry_threshold, self.state.c_last_entry_edge * self.cfg.c_news_add_edge_frac)
-                if decision.edge_ticks < required_edge:
-                    return False
-            elif decision.edge_ticks < self.state.c_last_entry_edge + self.cfg.c_add_edge_step_ticks:
-                return False
-            raw_qty = decision.add_size
-        else:
-            raw_qty = decision.initial_size
-
-        qty = self.risk.clip_c_qty(decision.side, raw_qty, decision.thesis_cap)
-        if qty <= 0:
-            return False
-
-        book = self.client.top(self.cfg.symbol_c)
-        if book.bid is None or book.ask is None:
-            return False
-        price = int(book.ask if decision.side == Side.BUY else book.bid)
-
-        placed = await self.orders.place_tracked_order(
-            symbol=self.cfg.symbol_c,
-            qty=qty,
-            side=decision.side,
-            price=price,
-            role="entry",
-            engine="c",
-            reason="add_entry" if same_direction else "initial_entry",
-            thesis=decision.thesis,
-            signal_strength=decision.edge_ticks,
-        )
-        if placed:
-            self.state.c_regime_side = decision.side
-            self.state.c_regime_thesis = decision.thesis
-            self.state.c_entry_stage = 1 if not same_direction else self.state.c_entry_stage + 1
-            self.state.c_last_entry_edge = decision.edge_ticks
-            self.state.c_last_add_ts = now
-            if not same_direction:
-                self.state.c_regime_started_at = now
-            if decision.thesis == "initial_earnings_shock":
-                self.state.c_initial_shock_consumed = True
-            if pos == 0:
-                self.state.c_flat_entry_cooldown_until = now + self.cfg.c_flat_entry_cooldown_secs
-            LOGGER.info(
-                "C entry: thesis=%s side=%s qty=%s gap=%.2f fair=%.2f mid=%.2f",
-                decision.thesis,
-                decision.side.name,
-                qty,
-                signal.gap,
-                signal.fair,
-                signal.mid,
-            )
-        return placed
-
-
-class Coordinator:
-    def __init__(
-        self,
-        client: "MyXchangeClient",
-        cfg: BotConfig,
-        state: MarketState,
-        orders: OrderManager,
-        risk: RiskManager,
-        rates_signals: RatesSignalEngine,
-        c_fair: CFairValueEngine,
-        rates_trading: RatesTradingEngine,
-        c_trading: CTradingEngine,
-    ):
-        self.client = client
-        self.cfg = cfg
-        self.state = state
-        self.orders = orders
-        self.risk = risk
-        self.rates_signals = rates_signals
-        self.c_fair = c_fair
-        self.rates_trading = rates_trading
-        self.c_trading = c_trading
-
-    def sync_regimes_to_positions(self) -> None:
-        pos_c = self.client.get_position(self.cfg.symbol_c)
-        if pos_c == 0 and not self.orders.has_live_order(symbol=self.cfg.symbol_c):
-            self.state.clear_c_regime()
-        if all(self.client.get_position(symbol) == 0 for symbol in self.cfg.rate_symbols):
-            if not any(order.symbol in self.cfg.rate_symbols for order in self.state.live_orders.values()):
-                self.state.clear_rates_regime()
-
-    async def evaluate(self) -> None:
-        self.client.refresh_all_books()
-        await self.orders.cancel_stale_orders()
-        self.sync_regimes_to_positions()
-
-        if not self.state.startup_flatten_complete:
-            await self.risk.startup_flatten_step()
-            self.log_status("startup_flatten")
-            return
-
-        self.risk.arm_session_baseline_if_ready()
-
-        rate_snapshot = self.rates_signals.snapshot()
-        self.c_fair.initialize_anchor(rate_snapshot)
-        self.c_fair.maybe_refresh_anchor_after_first_real_eps(rate_snapshot)
-        c_signal = self.c_fair.snapshot(rate_snapshot)
-        self.c_fair.maybe_reanchor(c_signal, rate_snapshot)
-
-        if rate_snapshot is None:
-            rates_acted = await self.rates_trading.handle_missing_signal_exit()
-            c_acted = await self.c_trading.handle_missing_signal_exit()
-            self.log_status("signal_not_ready" if rates_acted or c_acted else "signal_not_ready")
-            return
-
-        if c_signal is None:
-            c_acted = await self.c_trading.handle_missing_signal_exit()
-            self.log_status("waiting_real_eps" if not self.state.have_real_eps_c else "signal_not_ready")
-            self.state.last_market_expected_rate_bp = rate_snapshot.market_expected_rate_bp
-            self.state.last_effective_expected_rate_bp = rate_snapshot.effective_expected_rate_bp
-            return
-
-        c_entry_decision = self.c_trading.compute_entry_decision(c_signal, rate_snapshot)
-
-        if await self.rates_trading.maybe_exit(rate_snapshot):
-            self.update_last_signals(rate_snapshot, c_signal)
-            return
-        if await self.c_trading.maybe_exit(c_signal, rate_snapshot):
-            self.update_last_signals(rate_snapshot, c_signal)
-            return
-
-        rates_entered = await self.rates_trading.maybe_enter(rate_snapshot)
-
-        c_is_high_priority = c_entry_decision is not None and c_entry_decision.thesis in {
-            "earnings",
-            "initial_earnings_shock",
-            "post_baseline_gap",
-        }
-        if (not rates_entered) or c_is_high_priority:
-            if await self.c_trading.maybe_enter(c_entry_decision, c_signal):
-                self.update_last_signals(rate_snapshot, c_signal)
-                return
-
-        self.log_status("no_trade", rate_snapshot, c_signal)
-        self.update_last_signals(rate_snapshot, c_signal)
-
-    def update_last_signals(self, rate_snapshot: RateSnapshot, c_signal: CSignal) -> None:
-        self.state.last_market_expected_rate_bp = rate_snapshot.market_expected_rate_bp
-        self.state.last_effective_expected_rate_bp = rate_snapshot.effective_expected_rate_bp
-        self.state.last_fair_c = c_signal.fair
-
-    def log_status(
-        self,
-        reason: str,
-        rate_snapshot: Optional[RateSnapshot] = None,
-        c_signal: Optional[CSignal] = None,
-    ) -> None:
-        now = time.time()
-        if now - self.state.last_status_log_ts < self.cfg.status_log_interval_secs:
-            return
-        self.state.last_status_log_ts = now
-
-        cash, mtm = self.client.cash_and_total_mtm()
-        session_cash, session_mtm = self.client.session_pnl_snapshot(cash, mtm)
-
-        if rate_snapshot is None or c_signal is None:
-            LOGGER.info(
-                "Idle: %s missing=%s pos_C=%s pos_rates=%s/%s/%s eps=%.4f cash=%.2f mtm=%.2f session_cash=%.2f session_mtm=%.2f",
-                reason,
-                self.client.missing_prereqs(),
-                self.client.get_position(self.cfg.symbol_c),
-                self.client.get_position(self.cfg.fed_hike),
-                self.client.get_position(self.cfg.fed_hold),
-                self.client.get_position(self.cfg.fed_cut),
-                self.state.current_eps_c,
-                cash,
-                mtm,
-                session_cash,
-                session_mtm,
-            )
-            return
-
-        earnings = self.c_fair.earnings_context()
-        LOGGER.info(
-            "Idle: %s exp_bp=%.2f market_bp=%.2f bias=%.2f eps=%.4f eps_delta=%+.4f eps_tier=%s fair=%.2f C=%s/%s gap=%.2f bp_disloc=%.2f pos_C=%s rates=%s/%s cash=%.2f mtm=%.2f session_cash=%.2f session_mtm=%.2f",
-            reason,
-            rate_snapshot.effective_expected_rate_bp,
-            rate_snapshot.market_expected_rate_bp,
-            rate_snapshot.bias_bp,
-            self.state.current_eps_c,
-            earnings.delta,
-            earnings.tier,
-            c_signal.fair,
-            c_signal.bid,
-            c_signal.ask,
-            c_signal.gap,
-            c_signal.bp_dislocation,
-            self.client.get_position(self.cfg.symbol_c),
-            self.client.get_position(self.cfg.fed_hike),
-            self.client.get_position(self.cfg.fed_cut),
-            cash,
-            mtm,
-            session_cash,
-            session_mtm,
-        )
+            root.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            root = Path("/tmp/c_only_logs")
+            root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.path = root / f"c_only_run_{stamp}.csv"
+        try:
+            self._fh = self.path.open("w", newline="", buffering=1)
+        except PermissionError:
+            root = Path("/tmp/c_only_logs")
+            root.mkdir(parents=True, exist_ok=True)
+            self.path = root / f"c_only_run_{stamp}.csv"
+            self._fh = self.path.open("w", newline="", buffering=1)
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.FIELDNAMES, extrasaction="ignore")
+        self._writer.writeheader()
+
+    def write(self, row: Dict[str, object]) -> None:
+        clean = {field: row.get(field, "") for field in self.FIELDNAMES}
+        self._writer.writerow(clean)
 
 
 class MyXchangeClient(XChangeClient):
+
     def __init__(self, host: str, username: str, password: str):
-        self.cfg = BotConfig()
-        super().__init__(host, username, password, silent=True, symbols=list(self.cfg.tracked_symbols))
+        super().__init__(host, username, password)
 
-        self.state = MarketState(current_eps_c=self.cfg.default_eps_c)
-        self._decision_lock = asyncio.Lock()
+        # Some provided utcxchangelib builds ship stale hard-coded symbols.
+        # A dynamic book map prevents snapshots for A/B/C/ETF/options from crashing.
+        if OrderBook is not None:
+            self.order_books = defaultdict(OrderBook, dict(self.order_books))
 
-        self.order_manager = OrderManager(self, self.cfg, self.state)
-        self.risk_manager = RiskManager(self, self.cfg, self.state, self.order_manager)
-        self.rates_signal_engine = RatesSignalEngine(self, self.cfg, self.state)
-        self.c_fair_engine = CFairValueEngine(self, self.cfg, self.state, self.rates_signal_engine)
-        self.rates_trading_engine = RatesTradingEngine(
-            self,
-            self.cfg,
-            self.state,
-            self.order_manager,
-            self.risk_manager,
-        )
-        self.c_trading_engine = CTradingEngine(
-            self,
-            self.cfg,
-            self.state,
-            self.order_manager,
-            self.risk_manager,
-            self.c_fair_engine,
-        )
-        self.coordinator = Coordinator(
-            self,
-            self.cfg,
-            self.state,
-            self.order_manager,
-            self.risk_manager,
-            self.rates_signal_engine,
-            self.c_fair_engine,
-            self.rates_trading_engine,
-            self.c_trading_engine,
-        )
+        # The exchange rejects reused/old ids. Millisecond ids avoid restart collisions.
+        self.order_id = max(int(getattr(self, "order_id", 0)), int(time.time() * 1000))
 
-    @staticmethod
-    def clip(value: float, lo: float, hi: float) -> float:
+        self.pos: Dict[str, int] = {C_SYMBOL: 0, R_HIKE: 0, R_HOLD: 0, R_CUT: 0}
+        self.cash = 0.0
+        self.session_start_cash: Optional[float] = None
+        self.session_start_mtm: Optional[float] = None
+
+        self.live_orders: Dict[str, OrderRef] = {}
+        self.pending_cancels: set[str] = set()
+        self.pending_buy: Dict[str, int] = defaultdict(int)
+        self.pending_sell: Dict[str, int] = defaultdict(int)
+        self.symbol_cooldown_until: Dict[str, float] = defaultdict(float)
+
+        self.current_eps_c = DEFAULT_EPS_C
+        self.have_real_eps_c = False
+        self.baseline_eps_c: Optional[float] = None
+        self.last_c_earnings_delta = 0.0
+        self.recent_c_earnings_deltas = deque(maxlen=4)
+
+        self.anchor_price: Optional[float] = None
+        self.anchor_eps: Optional[float] = None
+        self.anchor_rate_bp: Optional[float] = None
+        self.last_anchor_update_ts = 0.0
+        self.last_rate_context: Optional[RateContext] = None
+
+        self.active_signal: Optional[CSignal] = None
+        self.c_earnings_shock = CEarningsShockState()
+        self.c_earnings_shock_seq = 0
+        self.last_cpi_surprise = 0.0
+        self.last_cpi_bias_bp = 0.0
+        self.last_cpi_ts = 0.0
+        self.last_rate_bias_ttl = CPI_SIGNAL_TTL_SECONDS
+
+        self.c_avg_entry: Optional[float] = None
+        self.c_realized_pnl = 0.0
+        self.c_unrealized_pnl = 0.0
+        self.c_total_pnl = 0.0
+        self.c_peak_total_pnl = 0.0
+        self.c_peak_abs = 0
+        self.c_exit_stage = 0
+        self.c_best_profit_ticks = 0.0
+        self.c_thesis = "flat"
+        self.c_regime_started_at = 0.0
+        self.c_last_fill_price: Optional[int] = None
+        self.profit_lock_engaged = False
+        self.kill_switch = False
+
+        self.last_c_action_ts = 0.0
+        self.last_c_signal_ts = 0.0
+        self.last_heartbeat_log = 0.0
+        self.last_entry_block_log_ts = 0.0
+        self.last_entry_block_key = ""
+        self.last_tick_seen = 0
+        self.decision_lock = asyncio.Lock()
+        self.csv_logger = CsvRunLogger(Path(__file__).resolve().parent / "logs")
+        logger.info("CSV run log: %s", self.csv_logger.path)
+
+    def now(self) -> float:
+        return time.time()
+
+    def side_name(self, side: Side) -> str:
+        return "BUY" if side == Side.BUY else "SELL"
+
+    def sign(self, x: int | float) -> int:
+        return 1 if x > 0 else (-1 if x < 0 else 0)
+
+    def clamp_price(self, px: int) -> int:
+        return max(1, min(9999, int(px)))
+
+    def clip(self, value: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, value))
 
-    def get_position(self, symbol: str) -> int:
-        return int(self.positions.get(symbol, 0))
-
-    def refresh_book(self, symbol: str) -> TopOfBook:
+    def book_top(self, symbol: str) -> Tuple[Optional[int], Optional[int]]:
         book = self.order_books.get(symbol)
-        bids = []
-        asks = []
-        if book is not None:
-            bids = [(int(px), int(qty)) for px, qty in book.bids.items() if int(qty) > 0]
-            asks = [(int(px), int(qty)) for px, qty in book.asks.items() if int(qty) > 0]
-
-        best_bid = max(bids, key=lambda level: level[0]) if bids else None
-        best_ask = min(asks, key=lambda level: level[0]) if asks else None
-        snapshot = TopOfBook(
-            bid=None if best_bid is None else best_bid[0],
-            bid_qty=0 if best_bid is None else best_bid[1],
-            ask=None if best_ask is None else best_ask[0],
-            ask_qty=0 if best_ask is None else best_ask[1],
-            updated_ts=time.time(),
-        )
-        self.state.books[symbol] = snapshot
-        return snapshot
-
-    def refresh_all_books(self) -> None:
-        for symbol in self.cfg.tracked_symbols:
-            self.refresh_book(symbol)
-
-    def top(self, symbol: str) -> TopOfBook:
-        if symbol not in self.state.books:
-            return self.refresh_book(symbol)
-        return self.state.books[symbol]
+        if book is None:
+            return None, None
+        bids = getattr(book, "bids", {}) or {}
+        asks = getattr(book, "asks", {}) or {}
+        live_bids = [int(px) for px, qty in bids.items() if qty != 0]
+        live_asks = [int(px) for px, qty in asks.items() if qty != 0]
+        bid = max(live_bids) if live_bids else None
+        ask = min(live_asks) if live_asks else None
+        return bid, ask
 
     def mid(self, symbol: str) -> Optional[float]:
-        return self.top(symbol).mid
+        bid, ask = self.book_top(symbol)
+        if bid is not None and ask is not None:
+            return 0.5 * (bid + ask)
+        if bid is not None:
+            return float(bid)
+        if ask is not None:
+            return float(ask)
+        return None
 
-    def mark_price(self, symbol: str) -> Optional[float]:
-        return self.mid(symbol)
+    def spread(self, symbol: str) -> Optional[int]:
+        bid, ask = self.book_top(symbol)
+        if bid is None or ask is None:
+            return None
+        return ask - bid
 
-    def cash_and_total_mtm(self) -> tuple[float, float]:
-        cash = float(self.positions.get("cash", 0))
-        mtm = cash
-        for symbol in self.cfg.tracked_symbols:
-            pos = self.get_position(symbol)
-            if pos == 0:
+    def csv_snapshot(self, event: str, **extra: object) -> Dict[str, object]:
+        unrealized, mark_source = self.mark_c_unrealized()
+        bid, ask = self.book_top(C_SYMBOL)
+        mid_c = self.mid(C_SYMBOL)
+        spread = self.spread(C_SYMBOL)
+        fair = self.fair_value_c()
+        rate = self.rate_context()
+        sig = self.active_signal
+        shock = self.c_earnings_shock
+        session_mtm = self.c_total_pnl
+        row: Dict[str, object] = {
+            "wall_ts": f"{self.now():.6f}",
+            "event": event,
+            "tick": self.last_tick_seen,
+            "pos_C": self.pos.get(C_SYMBOL, 0),
+            "avg_C": "" if self.c_avg_entry is None else f"{self.c_avg_entry:.4f}",
+            "realized_pnl": f"{self.c_realized_pnl:.2f}",
+            "unrealized_pnl": f"{unrealized:.2f}",
+            "total_pnl": f"{self.c_total_pnl:.2f}",
+            "cash": f"{self.cash:.2f}",
+            "session_mtm": f"{session_mtm:.2f}",
+            "thesis": self.c_thesis,
+            "signal_thesis": "" if sig is None else sig.thesis,
+            "signal_side": "" if sig is None else self.side_name(sig.side),
+            "signal_target": "" if sig is None else sig.target,
+            "signal_strength": "" if sig is None else f"{sig.strength:.6f}",
+            "signal_fresh": "" if sig is None else self.c_signal_is_fresh(),
+            "fair": "" if fair is None else f"{fair:.4f}",
+            "c_bid": "" if bid is None else bid,
+            "c_ask": "" if ask is None else ask,
+            "c_mid": "" if mid_c is None else f"{mid_c:.4f}",
+            "c_spread": "" if spread is None else spread,
+            "eps": f"{self.current_eps_c:.6f}",
+            "earnings_delta": f"{self.last_c_earnings_delta:.6f}",
+            "cpi_surprise": f"{self.last_cpi_surprise:.6f}",
+            "cpi_bias_bp": f"{self.last_cpi_bias_bp:.4f}",
+            "rate_bp": "" if rate is None else f"{rate.effective_rate_bp:.4f}",
+            "market_rate_bp": "" if rate is None else f"{rate.market_rate_bp:.4f}",
+            "q_hike": "" if rate is None else f"{rate.q_hike:.6f}",
+            "q_hold": "" if rate is None else f"{rate.q_hold:.6f}",
+            "q_cut": "" if rate is None else f"{rate.q_cut:.6f}",
+            "pm_pos_hike": self.pos.get(R_HIKE, 0),
+            "pm_pos_hold": self.pos.get(R_HOLD, 0),
+            "pm_pos_cut": self.pos.get(R_CUT, 0),
+            "mark_source": mark_source,
+            "kill_switch": self.kill_switch,
+            "shock_mode": shock.mode,
+            "shock_target": shock.target_inventory if shock.mode != "IDLE" else "",
+            "shock_original_target": shock.original_target_inventory if shock.mode != "IDLE" else "",
+            "shock_direction": shock.direction if shock.mode != "IDLE" else "",
+            "shock_reference_mid": "" if shock.reference_mid is None else f"{shock.reference_mid:.4f}",
+            "shock_edge": "" if shock.mode == "IDLE" else f"{shock.initial_edge:.4f}",
+            "shock_fair_before": "" if shock.fair_before is None else f"{shock.fair_before:.4f}",
+            "shock_fair_after": "" if shock.fair_after is None else f"{shock.fair_after:.4f}",
+            "shock_overshoot_stage": shock.overshoot_stage_index if shock.mode != "IDLE" else "",
+            "shock_decay_steps": shock.decay_steps_applied if shock.mode != "IDLE" else "",
+            "shock_equilibrium": shock.equilibrium_reached_ts is not None,
+        }
+        row.update(extra)
+        return row
+
+    def log_csv(self, event: str, **extra: object) -> None:
+        try:
+            self.csv_logger.write(self.csv_snapshot(event, **extra))
+        except Exception as e:
+            logger.warning("CSV logging failed: event=%s error=%s", event, e)
+
+    def is_mm_tag(self, tag: str) -> bool:
+        return tag.startswith("mm_")
+
+    def live_c_order(self, side: Optional[Side] = None, *, mm_only: Optional[bool] = None, include_pending: bool = True) -> Optional[OrderRef]:
+        for oid, ref in self.live_orders.items():
+            if ref.symbol != C_SYMBOL:
                 continue
-            mark = self.mark_price(symbol)
-            if mark is not None:
-                mtm += pos * mark
-        return cash, mtm
+            if not include_pending and oid in self.pending_cancels:
+                continue
+            if side is not None and ref.side != side:
+                continue
+            if mm_only is not None and self.is_mm_tag(ref.tag) != mm_only:
+                continue
+            return ref
+        return None
 
-    def session_pnl_snapshot(self, cash: float, mtm: float) -> tuple[float, float]:
-        if self.state.session_start_cash is None or self.state.session_start_mtm is None:
-            return 0.0, 0.0
-        return cash - self.state.session_start_cash, mtm - self.state.session_start_mtm
-
-    def missing_prereqs(self) -> list[str]:
-        missing: list[str] = []
-        for symbol in self.cfg.tracked_symbols:
-            book = self.top(symbol)
-            if book.bid is None or book.ask is None:
-                missing.append(f"{symbol}_book")
-        if self.state.anchor_price is None or self.state.anchor_eps is None or self.state.anchor_yield_bp is None:
-            missing.append("anchor")
-        return missing
-
-    async def evaluate(self) -> None:
-        async with self._decision_lock:
-            await self.coordinator.evaluate()
-
-    async def bot_handle_cancel_response(
-        self,
-        order_id: str,
-        success: bool,
-        error: Optional[str] = None,
-    ) -> None:
-        tracked = self.order_manager.sync_cancel_response(order_id, success)
-        self.state.pending_cancels.discard(str(order_id))
-        if success:
-            LOGGER.info("Cancel acknowledged: order_id=%s", order_id)
-        else:
-            LOGGER.warning("Cancel failed: order_id=%s error=%s", order_id, error)
-            if tracked is not None:
-                self.state.live_orders[str(order_id)] = tracked
-
-    async def bot_handle_order_fill(self, order_id: str, qty: int, price: int):
-        tracked = self.order_manager.sync_fill(order_id)
-        pos_c = self.get_position(self.cfg.symbol_c)
-        if pos_c == 0 and not self.order_manager.has_live_order(symbol=self.cfg.symbol_c):
-            self.state.clear_c_regime()
-
-        if self.get_position(self.cfg.fed_hike) == 0 and self.get_position(self.cfg.fed_cut) == 0 and self.get_position(self.cfg.fed_hold) == 0:
-            if not any(order.symbol in self.cfg.rate_symbols for order in self.state.live_orders.values()):
-                self.state.clear_rates_regime()
-
-        cash, mtm = self.cash_and_total_mtm()
-        session_cash, session_mtm = self.session_pnl_snapshot(cash, mtm)
-        LOGGER.info(
-            "Fill: order_id=%s symbol=%s qty=%s price=%s pos_C=%s pos_rates=%s/%s/%s cash=%.2f mtm=%.2f session_cash=%.2f session_mtm=%.2f",
-            order_id,
-            tracked.symbol if tracked is not None else "unknown",
-            qty,
-            price,
-            self.get_position(self.cfg.symbol_c),
-            self.get_position(self.cfg.fed_hike),
-            self.get_position(self.cfg.fed_hold),
-            self.get_position(self.cfg.fed_cut),
-            cash,
-            mtm,
-            session_cash,
-            session_mtm,
+    def has_live_order(self, symbol: str) -> bool:
+        return any(
+            ref.symbol == symbol and oid not in self.pending_cancels
+            for oid, ref in self.live_orders.items()
         )
 
+    def has_live_non_mm_order(self, symbol: str) -> bool:
+        return any(
+            ref.symbol == symbol and not self.is_mm_tag(ref.tag) and oid not in self.pending_cancels
+            for oid, ref in self.live_orders.items()
+        )
+
+    def remaining_capacity(self, symbol: str, side: Side) -> int:
+        if symbol != C_SYMBOL:
+            return 0
+        pos = int(self.pos.get(symbol, 0))
+        buy_pending = int(self.pending_buy.get(symbol, 0))
+        sell_pending = int(self.pending_sell.get(symbol, 0))
+        if side == Side.BUY:
+            return max(0, C_POSITION_LIMIT - (pos + buy_pending))
+        return max(0, C_POSITION_LIMIT + (pos - sell_pending))
+
+    def order_qty(self, symbol: str, side: Side, desired_qty: int) -> int:
+        return max(0, min(ORDER_LIMIT, int(desired_qty), self.remaining_capacity(symbol, side)))
+
+    def best_price_for_cross(self, symbol: str, side: Side) -> Optional[int]:
+        bid, ask = self.book_top(symbol)
+        if bid is None or ask is None:
+            return None
+        if side == Side.BUY:
+            return self.clamp_price(ask)
+        return self.clamp_price(bid)
+
+    def rate_context(self) -> Optional[RateContext]:
+        mid_hike = self.mid(R_HIKE)
+        mid_hold = self.mid(R_HOLD)
+        mid_cut = self.mid(R_CUT)
+        if mid_hike is None or mid_hold is None or mid_cut is None:
+            return None
+
+        total = mid_hike + mid_hold + mid_cut
+        if total <= 1e-9:
+            return None
+
+        q_hike = mid_hike / total
+        q_hold = mid_hold / total
+        q_cut = mid_cut / total
+        market_rate_bp = 25.0 * q_hike - 25.0 * q_cut
+        cpi_bias_bp = 0.0
+        if self.last_cpi_ts > 0.0 and self.now() - self.last_cpi_ts <= self.last_rate_bias_ttl:
+            cpi_bias_bp = self.last_cpi_bias_bp
+        context = RateContext(
+            q_hike=q_hike,
+            q_hold=q_hold,
+            q_cut=q_cut,
+            market_rate_bp=market_rate_bp,
+            effective_rate_bp=market_rate_bp + cpi_bias_bp,
+            cpi_bias_bp=cpi_bias_bp,
+        )
+        self.last_rate_context = context
+        return context
+
+    def maybe_initialize_anchor(self, force: bool = False) -> bool:
+        rate = self.rate_context()
+        mid_c = self.mid(C_SYMBOL)
+        if rate is None or mid_c is None:
+            return False
+        if (
+            force
+            or self.anchor_price is None
+            or self.anchor_eps is None
+            or self.anchor_rate_bp is None
+        ):
+            self.anchor_price = float(mid_c)
+            self.anchor_eps = float(self.current_eps_c)
+            self.anchor_rate_bp = float(rate.effective_rate_bp)
+            self.last_anchor_update_ts = self.now()
+            logger.info(
+                "Initialized C anchor: price=%.2f eps=%.4f rate_bp=%.2f source=%s",
+                self.anchor_price,
+                self.anchor_eps,
+                self.anchor_rate_bp,
+                "real_earnings" if self.have_real_eps_c else "default_eps",
+            )
+            self.log_csv(
+                "anchor_init",
+                message="real_earnings" if self.have_real_eps_c else "default_eps",
+            )
+            return True
+        return False
+
+    def fair_value_c(self) -> Optional[float]:
+        rate = self.rate_context() or self.last_rate_context
+        if (
+            rate is None
+            or self.anchor_price is None
+            or self.anchor_eps is None
+            or self.anchor_rate_bp is None
+            or self.anchor_eps == 0
+        ):
+            return None
+
+        dy = (rate.effective_rate_bp - self.anchor_rate_bp) / 10000.0
+        ops_anchor = C_OPS_WEIGHT * self.anchor_price
+        bond_anchor = C_BOND_WEIGHT * self.anchor_price
+        ops_fair = ops_anchor * (self.current_eps_c / self.anchor_eps) * math.exp(-C_PE_YIELD_GAMMA * dy)
+        bond_fair = bond_anchor * (1.0 - C_BOND_DURATION * dy + 0.5 * C_BOND_CONVEXITY * dy * dy)
+        return ops_fair + bond_fair
+
+    def fair_gap(self) -> Optional[float]:
+        fair = self.fair_value_c()
+        mid_c = self.mid(C_SYMBOL)
+        if fair is None or mid_c is None:
+            return None
+        return fair - mid_c
+
+    def c_signal_is_fresh(self) -> bool:
+        sig = self.active_signal
+        if sig is None or sig.target <= 0:
+            return False
+        if sig.thesis == "cpi":
+            ttl = CPI_SIGNAL_TTL_SECONDS
+        elif sig.thesis == "macro":
+            ttl = MACRO_SIGNAL_TTL_SECONDS
+        else:
+            ttl = EARNINGS_SIGNAL_TTL_SECONDS
+        return self.now() - sig.ts <= ttl
+
+    def c_signal_max_hold(self) -> float:
+        if self.c_thesis == "cpi":
+            return CPI_MAX_HOLD_SECONDS
+        if self.c_thesis == "macro":
+            return MACRO_MAX_HOLD_SECONDS
+        if self.c_thesis == "earnings":
+            sig = self.active_signal
+            if sig is not None and sig.thesis == "earnings":
+                if sig.strength < EARNINGS_SMALL_DELTA:
+                    return 10.0
+                if sig.strength < EARNINGS_MEDIUM_DELTA:
+                    return 16.0
+            return EARNINGS_MAX_HOLD_SECONDS
+        return 18.0
+
+    def c_target_for_cpi_surprise(self, surprise: float) -> int:
+        abs_surprise = abs(surprise)
+        if abs_surprise <= CPI_DEADBAND:
+            return 0
+        if abs_surprise >= CPI_EXTREME_SURPRISE:
+            return 200
+        if abs_surprise >= CPI_VERY_STRONG_SURPRISE:
+            return 200
+        if abs_surprise >= CPI_STRONG_SURPRISE:
+            return 160
+        return 120
+
+    def c_target_for_earnings_delta(self, delta: float) -> int:
+        abs_delta = abs(delta)
+        if abs_delta < EARNINGS_IGNORE_DELTA:
+            return 0
+        if abs_delta >= EARNINGS_EXTREME_DELTA:
+            return 200
+        if abs_delta >= EARNINGS_MEDIUM_DELTA:
+            return 200
+        if abs_delta >= EARNINGS_SMALL_DELTA:
+            return 160
+        return 120
+
+    def c_earnings_shock_active(self) -> bool:
+        return self.c_earnings_shock.mode in {"SHOCK", "UNWIND"}
+
+    def reset_c_earnings_shock(self) -> None:
+        self.c_earnings_shock = CEarningsShockState()
+
+    def c_shock_scaled_target(self, edge: float, fair_change_ticks: Optional[float]) -> int:
+        edge_abs = abs(edge)
+        if edge_abs < C_SHOCK_MIN_EDGE_TICKS:
+            return 0
+
+        confidence_span = max(1.0, C_SHOCK_FULL_CONFIDENCE_EDGE_TICKS - C_SHOCK_MIN_EDGE_TICKS)
+        confidence = self.clip((edge_abs - C_SHOCK_MIN_EDGE_TICKS) / confidence_span, 0.0, 1.0)
+        base_target = max(C_SHOCK_MIN_POSITION, round(C_SHOCK_POSITION_CAP * confidence))
+        scaled_target = max(base_target, round(edge_abs * C_SHOCK_POSITION_SCALE))
+        target_abs = min(C_SHOCK_POSITION_CAP, scaled_target)
+
+        if fair_change_ticks is not None:
+            change_abs = abs(fair_change_ticks)
+            change_span = max(1.0, C_SHOCK_FULL_CONFIDENCE_CHANGE_TICKS - C_SHOCK_MIN_EDGE_TICKS)
+            change_confidence = self.clip((change_abs - C_SHOCK_MIN_EDGE_TICKS) / change_span, 0.0, 1.0)
+            change_base_target = max(C_SHOCK_MIN_POSITION, round(C_SHOCK_POSITION_CAP * change_confidence))
+            change_scaled_target = max(change_base_target, round(change_abs * C_SHOCK_CHANGE_POSITION_SCALE))
+            target_abs = max(target_abs, min(C_SHOCK_POSITION_CAP, change_scaled_target))
+
+        return self.sign(edge) * int(target_abs)
+
+    def c_shock_next_slice_qty(self, remaining_target_qty: int) -> int:
+        remaining = max(0, int(remaining_target_qty))
+        max_legal = min(ORDER_LIMIT, C_SHOCK_SLICE_MAX_QTY)
+        if remaining <= max_legal:
+            return remaining
+
+        slice_qty = min(max_legal, C_SHOCK_SLICE_TARGET_QTY)
+        remainder = remaining - slice_qty
+        if 0 < remainder < C_SHOCK_SLICE_MIN_QTY:
+            slice_qty = min(max_legal, slice_qty + (C_SHOCK_SLICE_MIN_QTY - remainder))
+        return max(1, slice_qty)
+
+    def record_c_shock_mid(self) -> None:
+        shock = self.c_earnings_shock
+        mid_c = self.mid(C_SYMBOL)
+        if mid_c is None:
+            return
+        shock.post_event_mids.append((self.now(), float(mid_c)))
+
+    def update_c_shock_peak_and_ratchet(self) -> None:
+        shock = self.c_earnings_shock
+        pos = self.pos.get(C_SYMBOL, 0)
+        if shock.mode != "SHOCK":
+            return
+        if self.sign(pos) == shock.direction:
+            shock.peak_inventory_abs = max(shock.peak_inventory_abs, abs(pos))
+        if shock.target_inventory == 0 or pos == 0:
+            return
+
+        target_sign = self.sign(shock.target_inventory)
+        pos_sign = self.sign(pos)
+        if (
+            pos_sign == target_sign
+            and shock.peak_inventory_abs > 0
+            and abs(pos) < shock.peak_inventory_abs
+            and abs(pos) < abs(shock.target_inventory)
+        ):
+            shock.target_inventory = target_sign * abs(pos)
+        elif pos_sign != target_sign:
+            shock.target_inventory = 0
+
+    def c_shock_stage_thresholds(self) -> Tuple[int, int, int]:
+        edge_abs = abs(self.c_earnings_shock.initial_edge)
+        return (
+            max(12, round(0.20 * edge_abs)),
+            max(20, round(0.35 * edge_abs)),
+            max(28, round(0.50 * edge_abs)),
+        )
+
+    def c_shock_should_emergency_dump(self) -> bool:
+        shock = self.c_earnings_shock
+        pos = self.pos.get(C_SYMBOL, 0)
+        mid_c = self.mid(C_SYMBOL)
+        if (
+            shock.mode != "SHOCK"
+            or shock.reference_mid is None
+            or mid_c is None
+            or pos == 0
+            or abs(pos) < C_SHOCK_EMERGENCY_DUMP_MIN_INVENTORY
+        ):
+            return False
+        if self.now() - shock.started_ts < C_SHOCK_EMERGENCY_DUMP_MIN_SECONDS:
+            return False
+
+        move_from_reference = float(mid_c) - float(shock.reference_mid)
+        adverse_move = -move_from_reference if pos > 0 else move_from_reference
+        threshold = max(C_SHOCK_EMERGENCY_DUMP_TICKS, abs(shock.initial_edge) * C_SHOCK_EMERGENCY_DUMP_FRACTION)
+        return adverse_move >= threshold
+
+    def c_shock_should_force_time_flatten(self) -> bool:
+        shock = self.c_earnings_shock
+        return shock.mode == "SHOCK" and self.pos.get(C_SYMBOL, 0) != 0 and self.now() - shock.started_ts >= C_SHOCK_MAX_HOLD_SECONDS
+
+    def c_shock_stall_confirmed(self) -> bool:
+        shock = self.c_earnings_shock
+        now = self.now()
+        recent = [mid for ts, mid in shock.post_event_mids if ts >= now - C_SHOCK_DECAY_STALL_WINDOW_SECONDS]
+        if len(recent) < 3:
+            return True
+        return max(recent) - min(recent) <= C_SHOCK_DECAY_STALL_THRESHOLD_TICKS
+
+    def maybe_apply_c_shock_decay(self) -> bool:
+        shock = self.c_earnings_shock
+        if shock.mode != "SHOCK" or shock.direction == 0 or shock.target_inventory == 0:
+            return False
+        original_abs = abs(shock.original_target_inventory)
+        if original_abs < C_SHOCK_DECAY_MIN_INVENTORY:
+            return False
+        elapsed = self.now() - shock.started_ts
+        if elapsed < C_SHOCK_DECAY_START_SECONDS or not self.c_shock_stall_confirmed():
+            return False
+
+        steps_due = 1 + int((elapsed - C_SHOCK_DECAY_START_SECONDS) // C_SHOCK_DECAY_INTERVAL_SECONDS)
+        if steps_due <= shock.decay_steps_applied:
+            return False
+
+        step_qty = round(original_abs * C_SHOCK_DECAY_FRACTION)
+        step_qty = max(C_SHOCK_DECAY_MIN_QTY, min(C_SHOCK_DECAY_MAX_QTY, step_qty))
+        residual_floor = max(C_SHOCK_MIN_POSITION, round(original_abs * C_SHOCK_DECAY_MIN_RESIDUAL_FRACTION))
+        current_abs = abs(shock.target_inventory)
+        allowed_trim = max(0, current_abs - residual_floor)
+        trim_qty = min(allowed_trim, (steps_due - shock.decay_steps_applied) * step_qty)
+        shock.decay_steps_applied = steps_due
+        if trim_qty <= 0:
+            return False
+
+        shock.target_inventory = shock.direction * (current_abs - trim_qty)
+        shock.decay_trimmed_qty_total += trim_qty
+        return True
+
+    def maybe_build_c_overshoot_trim(self) -> Optional[Tuple[Side, int, int, str]]:
+        shock = self.c_earnings_shock
+        pos = self.pos.get(C_SYMBOL, 0)
+        mid_c = self.mid(C_SYMBOL)
+        if (
+            shock.mode != "SHOCK"
+            or shock.fair_after is None
+            or mid_c is None
+            or pos == 0
+            or shock.target_inventory == 0
+            or shock.overshoot_stage_index >= 3
+            or pos * shock.direction <= 0
+        ):
+            return None
+
+        threshold = self.c_shock_stage_thresholds()[shock.overshoot_stage_index]
+        crossed_fair = mid_c >= shock.fair_after if shock.direction > 0 else mid_c <= shock.fair_after
+        if crossed_fair and shock.overshoot_crossed_ts is None:
+            shock.overshoot_crossed_ts = self.now()
+
+        beyond_fair = (
+            mid_c >= shock.fair_after + threshold
+            if shock.direction > 0
+            else mid_c <= shock.fair_after - threshold
+        )
+        if not beyond_fair:
+            return None
+
+        window = [(ts, mid) for ts, mid in shock.post_event_mids if ts >= self.now() - C_SHOCK_OVERSHOOT_HOLD_SECONDS]
+        if len(window) < 3:
+            return None
+        mids = [mid for _, mid in window]
+        if max(mids) - min(mids) > C_SHOCK_OVERSHOOT_BAND_TICKS:
+            return None
+
+        reversal_ticks = max(mids) - mid_c if shock.direction > 0 else mid_c - min(mids)
+        if reversal_ticks < C_SHOCK_OVERSHOOT_REVERSAL_TICKS:
+            return None
+
+        original_abs = abs(shock.original_target_inventory)
+        stage_fractions = list(C_SHOCK_OVERSHOOT_STAGE_FRACTIONS)
+        residual_fraction = C_SHOCK_OVERSHOOT_MIN_RESIDUAL_FRACTION
+        stage_max_qty = C_SHOCK_OVERSHOOT_STAGE_MAX_QTY
+        if original_abs >= C_SHOCK_OVERSHOOT_LARGE_POSITION_THRESHOLD:
+            residual_fraction = max(residual_fraction, C_SHOCK_OVERSHOOT_LARGE_RESIDUAL_FRACTION)
+            if shock.overshoot_stage_index == 0:
+                stage_fractions[0] = max(stage_fractions[0], C_SHOCK_OVERSHOOT_LARGE_STAGE1_FRACTION)
+                stage_max_qty = max(stage_max_qty, round(original_abs * C_SHOCK_OVERSHOOT_LARGE_STAGE1_FRACTION))
+
+        residual_floor = max(C_SHOCK_MIN_POSITION, round(original_abs * residual_fraction))
+        remaining_abs = abs(shock.target_inventory)
+        allowed_trim = max(0, remaining_abs - residual_floor)
+        if allowed_trim <= 0:
+            return None
+
+        trim_qty = round(original_abs * stage_fractions[shock.overshoot_stage_index])
+        trim_qty = max(C_SHOCK_OVERSHOOT_STAGE_MIN_QTY, min(stage_max_qty, trim_qty, allowed_trim))
+        if trim_qty <= 0:
+            return None
+
+        new_target_abs = remaining_abs - trim_qty
+        new_target = shock.direction * new_target_abs
+        delta = new_target - pos
+        if pos > 0 and delta >= 0:
+            return None
+        if pos < 0 and delta <= 0:
+            return None
+
+        side = Side.BUY if delta > 0 else Side.SELL
+        px = self.best_price_for_cross(C_SYMBOL, side)
+        if px is None:
+            return None
+
+        shock.target_inventory = new_target
+        shock.overshoot_active = True
+        shock.overshoot_trigger_ticks = float(threshold)
+        shock.overshoot_trimmed_qty_total += abs(delta)
+        shock.overshoot_stage_index += 1
+        return side, abs(delta), px, "earnings_overshoot_trim"
+
+    def c_shock_equilibrium_reached(self) -> bool:
+        shock = self.c_earnings_shock
+        if shock.mode != "SHOCK":
+            return False
+        now = self.now()
+        if now - shock.started_ts < C_SHOCK_EQUILIBRIUM_MIN_SECONDS:
+            return False
+
+        window = [(ts, mid) for ts, mid in shock.post_event_mids if ts >= now - C_SHOCK_EQUILIBRIUM_HOLD_SECONDS]
+        if len(window) < C_SHOCK_EQUILIBRIUM_MIN_SAMPLES:
+            return False
+        if window[-1][0] - window[0][0] < C_SHOCK_EQUILIBRIUM_HOLD_SECONDS:
+            return False
+
+        mids = [mid for _, mid in window]
+        if max(mids) - min(mids) > C_SHOCK_EQUILIBRIUM_BAND_TICKS:
+            return False
+        if shock.fair_after is None:
+            return True
+
+        settled_mid = float(median(mids))
+        current_edge = float(shock.fair_after) - settled_mid
+        current_direction = self.sign(current_edge)
+        residual_edge = abs(current_edge)
+        if current_direction != shock.direction or residual_edge <= C_SHOCK_EQUILIBRIUM_RESIDUAL_EDGE_TICKS:
+            return True
+        if shock.reference_mid is None:
+            return False
+        if shock.overshoot_crossed_ts is not None and now - shock.overshoot_crossed_ts >= C_SHOCK_OVERSHOOT_MAX_WAIT_SECONDS and shock.overshoot_stage_index == 0:
+            return True
+
+        initial_edge_abs = max(1e-9, abs(shock.initial_edge))
+        captured_ticks = abs(settled_mid - float(shock.reference_mid))
+        captured_fraction = min(1.0, captured_ticks / initial_edge_abs)
+        return captured_fraction >= C_SHOCK_EQUILIBRIUM_MIN_CAPTURE_FRACTION
+
+    def start_c_earnings_shock(
+        self,
+        *,
+        tick: int,
+        old_eps: float,
+        new_eps: float,
+        delta: float,
+        fair_before: Optional[float],
+        fair_after: Optional[float],
+        reference_mid: Optional[float],
+    ) -> None:
+        if fair_after is None or reference_mid is None:
+            self.active_signal = None
+            self.reset_c_earnings_shock()
+            logger.info(
+                "C earnings signal blocked: tick=%d old=%.4f new=%.4f delta=%+.4f reason=missing_shock_fair",
+                tick,
+                old_eps,
+                new_eps,
+                delta,
+            )
+            self.log_csv(
+                "earnings_blocked",
+                tick=tick,
+                reason="missing_shock_fair",
+                message=f"old={old_eps:.6f} new={new_eps:.6f} delta={delta:+.6f}",
+                shock_intent="blocked",
+            )
+            return
+
+        edge = float(fair_after) - float(reference_mid)
+        fair_change = None if fair_before is None else float(fair_after) - float(fair_before)
+        target = self.c_shock_scaled_target(edge, fair_change)
+        if target == 0:
+            self.active_signal = None
+            self.reset_c_earnings_shock()
+            logger.info(
+                "C earnings inside shock deadband: tick=%d old=%.4f new=%.4f delta=%+.4f edge=%+.2f",
+                tick,
+                old_eps,
+                new_eps,
+                delta,
+                edge,
+            )
+            self.log_csv(
+                "earnings_deadband",
+                tick=tick,
+                message=f"old={old_eps:.6f} new={new_eps:.6f} delta={delta:+.6f} edge={edge:+.4f}",
+                shock_fair_before="" if fair_before is None else f"{fair_before:.4f}",
+                shock_fair_after=f"{fair_after:.4f}",
+                shock_reference_mid=f"{reference_mid:.4f}",
+                shock_edge=f"{edge:.4f}",
+                shock_intent="deadband",
+            )
+            return
+
+        self.c_earnings_shock_seq += 1
+        direction = self.sign(target)
+        shock = CEarningsShockState(
+            mode="SHOCK",
+            signal_id=self.c_earnings_shock_seq,
+            direction=direction,
+            target_inventory=target,
+            original_target_inventory=target,
+            started_ts=self.now(),
+            tick=tick,
+            reference_mid=float(reference_mid),
+            fair_before=fair_before,
+            fair_after=float(fair_after),
+            fair_change_ticks=fair_change,
+            initial_edge=edge,
+        )
+        shock.post_event_mids.append((self.now(), float(reference_mid)))
+        self.c_earnings_shock = shock
+
+        side = Side.BUY if target > 0 else Side.SELL
+        self.active_signal = CSignal(
+            side=side,
+            target=abs(target),
+            thesis="earnings",
+            strength=abs(delta),
+            tick=tick,
+            ts=self.now(),
+            description="earnings_shock_long_C" if side == Side.BUY else "earnings_shock_short_C",
+        )
+        self.last_c_signal_ts = self.now()
+        self.c_thesis = "earnings_shock" if self.pos.get(C_SYMBOL, 0) != 0 else self.c_thesis
+        logger.info(
+            "C earnings shock: tick=%d old=%.4f new=%.4f delta=%+.4f side=%s target=%d fair_before=%s fair_after=%.2f ref_mid=%.2f edge=%+.2f fair_change=%s",
+            tick,
+            old_eps,
+            new_eps,
+            delta,
+            self.side_name(side),
+            abs(target),
+            "na" if fair_before is None else f"{fair_before:.2f}",
+            fair_after,
+            reference_mid,
+            edge,
+            "na" if fair_change is None else f"{fair_change:+.2f}",
+        )
+        self.log_csv(
+            "earnings_signal",
+            tick=tick,
+            side=self.side_name(side),
+            qty=abs(target),
+            message=f"old={old_eps:.6f} new={new_eps:.6f} delta={delta:+.6f} edge={edge:+.4f} fair_change={'' if fair_change is None else f'{fair_change:+.4f}'}",
+            shock_mode=shock.mode,
+            shock_target=target,
+            shock_original_target=target,
+            shock_direction=direction,
+            shock_reference_mid=f"{reference_mid:.4f}",
+            shock_edge=f"{edge:.4f}",
+            shock_fair_before="" if fair_before is None else f"{fair_before:.4f}",
+            shock_fair_after=f"{fair_after:.4f}",
+            shock_intent="start",
+        )
+
+    def c_exit_profile(self) -> Tuple[float, float, float, float, float, float]:
+        sig = self.active_signal
+        if self.c_thesis == "earnings":
+            strength = sig.strength if sig is not None and sig.thesis == "earnings" else EARNINGS_MEDIUM_DELTA
+            if strength < EARNINGS_SMALL_DELTA:
+                return (
+                    EARNINGS_WEAK_PROFIT_1_TICKS,
+                    EARNINGS_WEAK_PROFIT_2_TICKS,
+                    EARNINGS_WEAK_PROFIT_FULL_TICKS,
+                    EARNINGS_WEAK_TRAIL_START_TICKS,
+                    EARNINGS_WEAK_TRAIL_GIVEBACK_TICKS,
+                    EARNINGS_WEAK_ADVERSE_FLATTEN_TICKS,
+                )
+            if strength < EARNINGS_MEDIUM_DELTA:
+                return (
+                    EARNINGS_MEDIUM_PROFIT_1_TICKS,
+                    EARNINGS_MEDIUM_PROFIT_2_TICKS,
+                    EARNINGS_MEDIUM_PROFIT_FULL_TICKS,
+                    EARNINGS_MEDIUM_TRAIL_START_TICKS,
+                    EARNINGS_MEDIUM_TRAIL_GIVEBACK_TICKS,
+                    EARNINGS_MEDIUM_ADVERSE_FLATTEN_TICKS,
+                )
+            return (
+                EARNINGS_PROFIT_1_TICKS,
+                EARNINGS_PROFIT_2_TICKS,
+                EARNINGS_PROFIT_FULL_TICKS,
+                EARNINGS_TRAIL_START_TICKS,
+                EARNINGS_TRAIL_GIVEBACK_TICKS,
+                EARNINGS_ADVERSE_FLATTEN_TICKS,
+            )
+        if self.c_thesis == "cpi":
+            return (
+                CPI_PROFIT_1_TICKS,
+                CPI_PROFIT_2_TICKS,
+                CPI_PROFIT_FULL_TICKS,
+                CPI_TRAIL_START_TICKS,
+                CPI_TRAIL_GIVEBACK_TICKS,
+                CPI_ADVERSE_FLATTEN_TICKS,
+            )
+        if self.c_thesis == "macro":
+            return (
+                MACRO_PROFIT_1_TICKS,
+                MACRO_PROFIT_2_TICKS,
+                MACRO_PROFIT_FULL_TICKS,
+                MACRO_TRAIL_START_TICKS,
+                MACRO_TRAIL_GIVEBACK_TICKS,
+                MACRO_ADVERSE_FLATTEN_TICKS,
+            )
+        return (
+            DEFAULT_PROFIT_1_TICKS,
+            DEFAULT_PROFIT_2_TICKS,
+            DEFAULT_PROFIT_FULL_TICKS,
+            DEFAULT_TRAIL_START_TICKS,
+            DEFAULT_TRAIL_GIVEBACK_TICKS,
+            DEFAULT_ADVERSE_FLATTEN_TICKS,
+        )
+
+    def c_target_for_macro_score(self, score: float) -> int:
+        abs_score = abs(score)
+        if abs_score < MACRO_HEADLINE_MIN_SCORE:
+            return 0
+        if abs_score >= MACRO_HEADLINE_VERY_STRONG_SCORE:
+            return 160
+        if abs_score >= MACRO_HEADLINE_STRONG_SCORE:
+            return 120
+        return 80
+
+    def c_earnings_trend(self) -> float:
+        return sum(self.recent_c_earnings_deltas)
+
+    def macro_block_reason(self, side: Side) -> str:
+        if not self.have_real_eps_c:
+            return "no_real_c_baseline"
+        if len(self.recent_c_earnings_deltas) < 2:
+            return ""
+        trend = self.c_earnings_trend()
+        if side == Side.BUY and trend < -MACRO_EARNINGS_TREND_BLOCK:
+            return f"earnings_trend_conflict_{trend:+.4f}"
+        if side == Side.SELL and trend > MACRO_EARNINGS_TREND_BLOCK:
+            return f"earnings_trend_conflict_{trend:+.4f}"
+        return ""
+
+    def earnings_reversal_block_reason(self, side: Side, delta: float) -> str:
+        if len(self.recent_c_earnings_deltas) < 3:
+            return ""
+        previous_trend = sum(list(self.recent_c_earnings_deltas)[:-1])
+        if abs(delta) >= EARNINGS_SMALL_DELTA:
+            return ""
+        if side == Side.BUY and previous_trend < -REVERSAL_TREND_MIN_ABS:
+            return f"weak_buy_against_earnings_trend_{previous_trend:+.4f}"
+        if side == Side.SELL and previous_trend > REVERSAL_TREND_MIN_ABS:
+            return f"weak_sell_against_earnings_trend_{previous_trend:+.4f}"
+        return ""
+
+    def set_cpi_signal(self, actual: float, forecast: float, tick: int, raw_news: object = "") -> None:
+        surprise = actual - forecast
+        target = self.c_target_for_cpi_surprise(surprise)
+        self.last_cpi_surprise = surprise
+        self.last_cpi_bias_bp = self.clip(surprise * CPI_TO_RATE_BP, -MAX_CPI_RATE_BIAS_BP, MAX_CPI_RATE_BIAS_BP)
+        self.last_cpi_ts = self.now()
+        self.last_rate_bias_ttl = CPI_SIGNAL_TTL_SECONDS
+
+        if target == 0:
+            self.active_signal = None
+            logger.info(
+                "CPI inside deadband: tick=%d actual=%.6f forecast=%.6f surprise=%+.6f",
+                tick,
+                actual,
+                forecast,
+                surprise,
+            )
+            self.log_csv(
+                "cpi_deadband",
+                tick=tick,
+                cpi_actual=f"{actual:.6f}",
+                cpi_forecast=f"{forecast:.6f}",
+                message=f"actual={actual:.6f} forecast={forecast:.6f} surprise={surprise:+.6f}",
+                raw_news=raw_news,
+            )
+            return
+
+        if not self.have_real_eps_c:
+            self.active_signal = None
+            logger.info(
+                "CPI signal blocked before real C baseline: tick=%d actual=%.6f forecast=%.6f surprise=%+.6f",
+                tick,
+                actual,
+                forecast,
+                surprise,
+            )
+            self.log_csv(
+                "cpi_blocked",
+                tick=tick,
+                side=self.side_name(Side.SELL if surprise > 0 else Side.BUY),
+                qty=target,
+                reason="no_real_c_baseline",
+                cpi_actual=f"{actual:.6f}",
+                cpi_forecast=f"{forecast:.6f}",
+                message=f"actual={actual:.6f} forecast={forecast:.6f} surprise={surprise:+.6f}",
+                raw_news=raw_news,
+            )
+            return
+
+        side = Side.SELL if surprise > 0 else Side.BUY
+        direction = "hot_short_C" if side == Side.SELL else "cool_long_C"
+        self.active_signal = CSignal(
+            side=side,
+            target=target,
+            thesis="cpi",
+            strength=abs(surprise),
+            tick=tick,
+            ts=self.now(),
+            description=direction,
+        )
+        self.last_c_signal_ts = self.now()
+        logger.info(
+            "CPI C signal: tick=%d actual=%.6f forecast=%.6f surprise=%+.6f side=%s target=%d bias_bp=%+.2f",
+            tick,
+            actual,
+            forecast,
+            surprise,
+            self.side_name(side),
+            target,
+            self.last_cpi_bias_bp,
+        )
+        self.log_csv(
+            "cpi_signal",
+            tick=tick,
+            side=self.side_name(side),
+            qty=target,
+            cpi_actual=f"{actual:.6f}",
+            cpi_forecast=f"{forecast:.6f}",
+            message=f"actual={actual:.6f} forecast={forecast:.6f} surprise={surprise:+.6f}",
+            raw_news=raw_news,
+        )
+
+    def set_macro_headline_signal(self, score: float, text: str, tick: int, raw_news: object = "") -> bool:
+        target = self.c_target_for_macro_score(score)
+        if target == 0:
+            return False
+
+        side = Side.SELL if score > 0 else Side.BUY
+        direction = "SELL" if side == Side.SELL else "BUY"
+
+        existing = self.active_signal
+        if existing is not None and existing.thesis == "earnings" and existing.side == side and self.c_signal_is_fresh():
+            existing.target = max(existing.target, target)
+            existing.ts = self.now()
+            if "macro_confirm" not in existing.description:
+                existing.description = f"{existing.description}|macro_confirm"
+            self.last_cpi_surprise = 0.0
+            self.last_cpi_bias_bp = self.clip(score * MACRO_TO_RATE_BP, -MAX_CPI_RATE_BIAS_BP, MAX_CPI_RATE_BIAS_BP)
+            self.last_cpi_ts = self.now()
+            self.last_rate_bias_ttl = MACRO_SIGNAL_TTL_SECONDS
+            logger.info(
+                "Macro confirms fresh earnings C signal: tick=%d score=%+.2f side=%s target=%d kept_thesis=earnings headline=%s",
+                tick,
+                score,
+                direction,
+                existing.target,
+                text,
+            )
+            self.log_csv(
+                "macro_signal",
+                tick=tick,
+                side=self.side_name(side),
+                qty=existing.target,
+                reason="confirmed_earnings_signal",
+                message=f"score={score:+.2f} headline={text[:180]}",
+                macro_score=f"{score:.4f}",
+                macro_target=existing.target,
+                macro_direction=self.side_name(side),
+                earnings_trend=f"{self.c_earnings_trend():+.6f}",
+                raw_news=raw_news,
+            )
+            return True
+
+        flat_cap_applied = self.pos.get(C_SYMBOL, 0) == 0 and target > MACRO_FLAT_TARGET_CAP
+        if flat_cap_applied:
+            target = MACRO_FLAT_TARGET_CAP
+
+        block_reason = self.macro_block_reason(side)
+        if target >= 160 and block_reason.startswith("earnings_trend_conflict"):
+            block_reason = ""
+        if block_reason:
+            logger.info(
+                "Macro signal blocked: tick=%d score=%+.2f side=%s target=%d reason=%s headline=%s",
+                tick,
+                score,
+                direction,
+                target,
+                block_reason,
+                text,
+            )
+            self.log_csv(
+                "macro_blocked",
+                tick=tick,
+                side=direction,
+                qty=target,
+                reason=block_reason,
+                message=f"score={score:+.2f} flat_cap={flat_cap_applied} headline={text[:180]}",
+                macro_score=f"{score:.4f}",
+                macro_target=target,
+                macro_direction=direction,
+                earnings_trend=f"{self.c_earnings_trend():+.6f}",
+                raw_news=raw_news,
+            )
+            return False
+
+        direction = "hawkish_macro_short_C" if side == Side.SELL else "dovish_macro_long_C"
+        self.last_cpi_surprise = 0.0
+        self.last_cpi_bias_bp = self.clip(score * MACRO_TO_RATE_BP, -MAX_CPI_RATE_BIAS_BP, MAX_CPI_RATE_BIAS_BP)
+        self.last_cpi_ts = self.now()
+        self.last_rate_bias_ttl = MACRO_SIGNAL_TTL_SECONDS
+        self.active_signal = CSignal(
+            side=side,
+            target=target,
+            thesis="macro",
+            strength=abs(score),
+            tick=tick,
+            ts=self.now(),
+            description=direction,
+        )
+        self.last_c_signal_ts = self.now()
+        logger.info(
+            "Macro C signal: tick=%d score=%+.2f side=%s target=%d bias_bp=%+.2f headline=%s",
+            tick,
+            score,
+            self.side_name(side),
+            target,
+            self.last_cpi_bias_bp,
+            text,
+        )
+        self.log_csv(
+            "macro_signal",
+            tick=tick,
+            side=self.side_name(side),
+            qty=target,
+            reason="flat_macro_cap" if flat_cap_applied else "",
+            message=f"score={score:+.2f} flat_cap={flat_cap_applied} headline={text[:180]}",
+            macro_score=f"{score:.4f}",
+            macro_target=target,
+            macro_direction=self.side_name(side),
+            earnings_trend=f"{self.c_earnings_trend():+.6f}",
+            raw_news=raw_news,
+        )
+        return True
+
+    def score_macro_headline_for_c(self, text: str) -> float:
+        lower = text.lower()
+        score = 0.0
+
+        # Positive score is hawkish / rates-up pressure, which should push C lower.
+        hawkish_phrases = {
+            "push back on market expectations for near-term cuts": 5.0,
+            "discomfort with above-target inflation": 4.5,
+            "progress on inflation has stalled": 5.0,
+            "inflation has stalled": 4.0,
+            "not fast enough": 3.0,
+            "returning inflation to target": 2.5,
+            "even at cost to growth": 3.0,
+            "undermines the case for policy easing": 5.0,
+            "financial conditions have loosened": 3.0,
+            "stoking demand": 3.0,
+            "underlying inflation elevated": 4.0,
+            "inflation elevated": 3.0,
+            "core services keep": 2.5,
+            "above-target inflation": 3.5,
+            "persistent inflation": 3.5,
+            "inflation risks": 3.0,
+            "additional tightening": 3.0,
+            "upside inflation": 3.0,
+            "wage growth and persistent inflation": 4.5,
+            "wage growth": 1.5,
+            "strong gdp": 1.0,
+            "restrictive stance": 1.0,
+            "tightening": 1.5,
+        }
+        dovish_phrases = {
+            "restrictive stance may no longer be needed": -4.5,
+            "may no longer be needed": -3.5,
+            "preemptive cut": -4.0,
+            "safeguard growth": -2.0,
+            "rate relief": -3.5,
+            "do not want to keep rates elevated longer than necessary": -4.0,
+            "keep rates elevated longer than necessary": -3.0,
+            "real rates are well above neutral": -3.0,
+            "wage growth decelerating": -3.5,
+            "progress on inflation": -2.0,
+            "falling inflation": -2.5,
+            "cooling labor": -2.5,
+            "next move is more likely a cut than a hike": -4.5,
+            "more likely a cut than a hike": -4.0,
+            "markets lean toward cuts": -3.5,
+            "lean toward cuts": -3.0,
+            "shift toward accommodation": -4.0,
+            "favoring a shift toward accommodation": -4.5,
+            "how long the fed can hold steady": -2.5,
+            "slowing gdp growth": -2.0,
+            "unemployment claims": -2.0,
+            "economic softening": -0.75,
+            "manufacturing contraction": -0.75,
+            "softening data": -2.0,
+            "growth risks": -1.5,
+            "easing a key concern": -2.0,
+            "policy easing": -2.0,
+            "opts to hold steady": -2.5,
+            "assess cumulative tightening effects": -3.5,
+            "cumulative tightening effects": -3.0,
+        }
+
+        for phrase, weight in hawkish_phrases.items():
+            if phrase in lower:
+                score += weight
+        for phrase, weight in dovish_phrases.items():
+            if phrase in lower:
+                score += weight
+
+        # Generic "near-term cuts" is dovish unless the headline says the Fed is rejecting that view.
+        if "near-term cuts" in lower and "push back" not in lower:
+            score -= 2.0
+        if "rate cuts" in lower and "push back" not in lower:
+            score -= 1.5
+
+        neutral_or_mixed = [
+            "mixed",
+            "unclear",
+            "no clear signal",
+            "questions than answers",
+            "data dependence",
+            "await upcoming data",
+            "cautious",
+            "different directions",
+            "conflict",
+            "complicates",
+            "hawks and doves",
+            "both upside and downside",
+            "no consensus",
+            "uncertain outlook",
+            "uncertainties",
+            "declines to commit",
+            "options open",
+        ]
+        if any(phrase in lower for phrase in neutral_or_mixed):
+            score *= 0.35
+
+        return score
+
+    def set_c_earnings_signal(self, value: float, tick: int) -> None:
+        if not self.have_real_eps_c:
+            self.have_real_eps_c = True
+            self.current_eps_c = value
+            self.baseline_eps_c = value
+            self.last_c_earnings_delta = 0.0
+            self.active_signal = None
+            self.maybe_initialize_anchor(force=True)
+            logger.info("First C earnings baseline adopted: tick=%d eps=%.4f no_trade=True", tick, value)
+            self.log_csv("earnings_baseline", tick=tick, message=f"eps={value:.6f}")
+            return
+
+        self.maybe_initialize_anchor()
+        old_eps = self.current_eps_c
+        fair_before = self.fair_value_c()
+        reference_mid = self.mid(C_SYMBOL)
+        delta = value - old_eps
+        self.current_eps_c = value
+        self.last_c_earnings_delta = delta
+        self.recent_c_earnings_deltas.append(delta)
+        fair_after = self.fair_value_c()
+        self.start_c_earnings_shock(
+            tick=tick,
+            old_eps=old_eps,
+            new_eps=value,
+            delta=delta,
+            fair_before=fair_before,
+            fair_after=fair_after,
+            reference_mid=reference_mid,
+        )
+
+    def parse_cpi_from_news(self, news_release: dict) -> Tuple[Optional[float], Optional[float]]:
+        kind = str(news_release.get("kind") or "").lower()
+        new_data_obj = news_release.get("new_data", {}) or {}
+        new_data = new_data_obj if isinstance(new_data_obj, dict) else {}
+        subtype = str(new_data.get("structured_subtype") or news_release.get("structured_subtype") or "").lower()
+        tick = int(news_release.get("tick") or news_release.get("timestamp") or 0)
+
+        for container in (new_data, news_release):
+            if not isinstance(container, dict):
+                continue
+            actual_value = container.get("actual", container.get("cpi_actual"))
+            forecast_value = container.get("forecast", container.get("cpi_forecast"))
+            if actual_value is not None and forecast_value is not None:
+                return float(actual_value), float(forecast_value)
+
+        if (
+            tick in CPI_PRINT_FALLBACKS_BY_TICK
+            and kind == "structured"
+            and subtype == "petition"
+            and int(new_data.get("new_signatures") or 0) == 0
+            and int(new_data.get("cumulative") or 0) == 0
+        ):
+            return CPI_PRINT_FALLBACKS_BY_TICK[tick]
+
+        text = str(new_data.get("content") or news_release.get("content") or news_release)
+        lower = text.lower()
+        looks_like_cpi = any(token in kind for token in ("cpi", "inflation")) or any(
+            token in subtype for token in ("cpi", "inflation")
+        )
+        has_actual_forecast_words = "actual" in lower and "forecast" in lower
+        if not looks_like_cpi and not has_actual_forecast_words:
+            return None, None
+
+        actual_match = re.search(r"actual\s*(?:[:=]|is|was|of|at)?\s*(%s)" % FLOAT_RE, text, flags=re.IGNORECASE)
+        forecast_match = re.search(r"forecast\s*(?:[:=]|is|was|of|at)?\s*(%s)" % FLOAT_RE, text, flags=re.IGNORECASE)
+        if actual_match and forecast_match:
+            return float(actual_match.group(1)), float(forecast_match.group(1))
+
+        nums = [float(x) for x in re.findall(FLOAT_RE, text)]
+        if len(nums) >= 2:
+            return nums[0], nums[1]
+        return None, None
+
+    def parse_c_earnings_from_news(self, news_release: dict) -> Optional[float]:
+        kind = str(news_release.get("kind") or "").lower()
+        new_data_obj = news_release.get("new_data", {}) or {}
+        new_data = new_data_obj if isinstance(new_data_obj, dict) else {}
+        subtype = str(new_data.get("structured_subtype") or news_release.get("structured_subtype") or "").lower()
+        asset = str(new_data.get("asset") or news_release.get("asset") or "").upper()
+        value = new_data.get("value", news_release.get("value"))
+        if "earnings" in subtype and asset == C_SYMBOL and value is not None:
+            return float(value)
+
+        text = str(new_data.get("content") or news_release.get("content") or (new_data_obj if not isinstance(new_data_obj, dict) else ""))
+        lower = text.lower()
+        if "earnings" not in kind and "earnings" not in lower:
+            return None
+        match = re.search(r"\bC\s+earnings\s+released\s*:?\s*(%s)" % FLOAT_RE, text, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1))
+        return None
+
+    def describe_news_release(self, news_release: dict) -> str:
+        new_data_obj = news_release.get("new_data", {}) or {}
+        new_data = new_data_obj if isinstance(new_data_obj, dict) else {}
+        text = str(new_data.get("content") or news_release.get("content") or "")
+        if text:
+            return text[:180]
+
+        subtype = str(new_data.get("structured_subtype") or news_release.get("structured_subtype") or "").lower()
+        asset = str(new_data.get("asset") or news_release.get("asset") or "")
+        if subtype == "earnings":
+            value = new_data.get("value", news_release.get("value"))
+            return f"{asset or 'unknown'} earnings value={value}"
+        if subtype == "petition":
+            new_signatures = new_data.get("new_signatures", "")
+            cumulative = new_data.get("cumulative", "")
+            return f"petition new_signatures={new_signatures} cumulative={cumulative}"
+        if new_data:
+            return str(new_data)[:180]
+        return str(news_release)[:180]
+
+    def mark_c_unrealized(self) -> Tuple[float, str]:
+        pos = self.pos.get(C_SYMBOL, 0)
+        if pos == 0 or self.c_avg_entry is None:
+            self.c_unrealized_pnl = 0.0
+            self.c_total_pnl = self.c_realized_pnl
+            self.c_peak_total_pnl = max(self.c_peak_total_pnl, self.c_total_pnl)
+            return 0.0, "flat"
+
+        bid, ask = self.book_top(C_SYMBOL)
+        mark_source = "book"
+        if pos > 0:
+            if bid is not None:
+                mark = float(bid)
+            else:
+                mark = self.mid(C_SYMBOL)
+                mark_source = "fallback"
+            if mark is None:
+                mark = float(self.c_last_fill_price or self.c_avg_entry)
+                mark_source = "fallback"
+            unrealized = (mark - self.c_avg_entry) * pos
+        else:
+            if ask is not None:
+                mark = float(ask)
+            else:
+                mark = self.mid(C_SYMBOL)
+                mark_source = "fallback"
+            if mark is None:
+                mark = float(self.c_last_fill_price or self.c_avg_entry)
+                mark_source = "fallback"
+            unrealized = (self.c_avg_entry - mark) * abs(pos)
+
+        self.c_unrealized_pnl = unrealized
+        self.c_total_pnl = self.c_realized_pnl + self.c_unrealized_pnl
+        self.c_peak_total_pnl = max(self.c_peak_total_pnl, self.c_total_pnl)
+        return unrealized, mark_source
+
+    def c_profit_lock_triggered(self) -> bool:
+        if self.c_peak_total_pnl < C_SESSION_PROFIT_LOCK_START:
+            return False
+        return self.c_total_pnl <= self.c_peak_total_pnl - C_SESSION_PROFIT_LOCK_GIVEBACK
+
+    def update_c_pnl_from_fill(self, old_pos: int, new_pos: int, signed_qty: int, price: int) -> None:
+        fill_abs = abs(signed_qty)
+        if fill_abs == 0:
+            return
+
+        if old_pos == 0 or self.c_avg_entry is None:
+            self.c_avg_entry = float(price) if new_pos != 0 else None
+            self.c_peak_abs = abs(new_pos)
+            self.c_exit_stage = 0
+            self.c_best_profit_ticks = 0.0
+            self.c_regime_started_at = self.now() if new_pos != 0 else 0.0
+            return
+
+        if self.sign(old_pos) == self.sign(signed_qty):
+            old_abs = abs(old_pos)
+            new_abs = old_abs + fill_abs
+            self.c_avg_entry = (self.c_avg_entry * old_abs + price * fill_abs) / new_abs
+            self.c_peak_abs = max(self.c_peak_abs, abs(new_pos))
+            self.c_exit_stage = 0
+            return
+
+        closed_qty = min(abs(old_pos), fill_abs)
+        if old_pos > 0:
+            self.c_realized_pnl += (price - self.c_avg_entry) * closed_qty
+        else:
+            self.c_realized_pnl += (self.c_avg_entry - price) * closed_qty
+
+        if new_pos == 0:
+            self.c_avg_entry = None
+            self.c_peak_abs = 0
+            self.c_exit_stage = 0
+            self.c_best_profit_ticks = 0.0
+            self.c_thesis = "flat"
+            self.c_regime_started_at = 0.0
+            self.active_signal = None
+        elif self.sign(old_pos) != self.sign(new_pos):
+            residual = fill_abs - closed_qty
+            self.c_avg_entry = float(price)
+            self.c_peak_abs = residual
+            self.c_exit_stage = 0
+            self.c_best_profit_ticks = 0.0
+            self.c_regime_started_at = self.now()
+
+    def current_mtm(self) -> float:
+        pos = self.pos.get(C_SYMBOL, 0)
+        mid_c = self.mid(C_SYMBOL)
+        c_mark = 0.0 if mid_c is None else pos * mid_c
+        return self.cash + c_mark
+
+    async def send_c_order(self, side: Side, qty: int, px: int, tag: str) -> bool:
+        symbol = C_SYMBOL
+        is_entry_order = tag.endswith("_entry")
+        is_mm_order = self.is_mm_tag(tag)
+        if self.kill_switch and tag not in {"risk_flatten", "profit_lock"}:
+            return False
+        if is_entry_order and self.now() < self.symbol_cooldown_until[symbol]:
+            return False
+        if is_mm_order:
+            if self.has_live_non_mm_order(symbol) or self.live_c_order(side, mm_only=True, include_pending=True) is not None:
+                return False
+        elif self.has_live_order(symbol):
+            return False
+
+        qty = self.order_qty(symbol, side, qty)
+        if qty <= 0:
+            return False
+
+        px = self.clamp_price(px)
+        try:
+            oid = str(await self.place_order(symbol, qty, side, px))
+        except Exception as e:
+            logger.exception("place_order failed: symbol=%s side=%s qty=%d px=%d error=%s", symbol, self.side_name(side), qty, px, e)
+            return False
+
+        self.live_orders[oid] = OrderRef(
+            order_id=oid,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=px,
+            tag=tag,
+            ts=self.now(),
+        )
+        if side == Side.BUY:
+            self.pending_buy[symbol] += qty
+        else:
+            self.pending_sell[symbol] += qty
+        self.symbol_cooldown_until[symbol] = max(
+            self.symbol_cooldown_until[symbol],
+            self.now() + C_SYMBOL_COOLDOWN_SECONDS,
+        )
+        logger.info(
+            "Placed C order: tag=%s side=%s qty=%d price=%d pos_C=%d avg_C=%s realized=%.2f unrealized=%.2f total_pnl=%.2f",
+            tag,
+            self.side_name(side),
+            qty,
+            px,
+            self.pos[C_SYMBOL],
+            "na" if self.c_avg_entry is None else f"{self.c_avg_entry:.2f}",
+            self.c_realized_pnl,
+            self.c_unrealized_pnl,
+            self.c_total_pnl,
+        )
+        self.log_csv(
+            "order_placed",
+            symbol=symbol,
+            side=self.side_name(side),
+            qty=qty,
+            price=px,
+            order_id=oid,
+            tag=tag,
+        )
+        return True
+
+    async def request_cancel_order(self, oid: str) -> bool:
+        if oid in self.pending_cancels:
+            return False
+        self.pending_cancels.add(oid)
+        try:
+            await self.cancel_order(oid)
+            return True
+        except Exception:
+            self.pending_cancels.discard(oid)
+            return False
+
+    async def cancel_stale_orders(self) -> None:
+        now = self.now()
+        for oid, ref in list(self.live_orders.items()):
+            if oid in self.pending_cancels:
+                continue
+            if self.is_mm_tag(ref.tag):
+                continue
+            if now - ref.ts < ORDER_REPRICE_SECONDS:
+                continue
+            await self.request_cancel_order(oid)
+
+    async def cancel_c_mm_orders(self, reason: str) -> bool:
+        had_mm = False
+        for oid, ref in list(self.live_orders.items()):
+            if ref.symbol != C_SYMBOL or not self.is_mm_tag(ref.tag):
+                continue
+            had_mm = True
+            if oid in self.pending_cancels:
+                continue
+            if await self.request_cancel_order(oid):
+                logger.info("Cancelling C MM order %s because %s", oid, reason)
+        return had_mm
+
+    async def flatten_c(self, reason: str, qty: Optional[int] = None) -> bool:
+        pos = self.pos.get(C_SYMBOL, 0)
+        if pos == 0 or self.has_live_order(C_SYMBOL):
+            return False
+        side = Side.SELL if pos > 0 else Side.BUY
+        px = self.best_price_for_cross(C_SYMBOL, side)
+        if px is None:
+            return False
+        exit_qty = min(abs(pos), ORDER_LIMIT if qty is None else qty)
+        placed = await self.send_c_order(side, exit_qty, px, reason)
+        if placed:
+            if reason in {
+                "gap_compress",
+                "max_hold",
+                "stop_loss",
+                "profit_trail",
+                "risk_flatten",
+                "profit_lock",
+                "contradict_signal",
+                "fast_harvest",
+                "fast_timeout",
+            }:
+                self.c_exit_stage = max(self.c_exit_stage, 3)
+            logger.info("C exit trigger: %s pos_C=%d qty=%d", reason, pos, exit_qty)
+            self.log_csv("exit_trigger", reason=reason, qty=exit_qty, tag=reason)
+        return placed
+
+    def entry_blocked_by_risk(self, side: Side) -> Tuple[bool, str]:
+        if self.profit_lock_engaged:
+            return True, "profit_lock"
+        if self.kill_switch:
+            return True, "kill_switch"
+        spread = self.spread(C_SYMBOL)
+        if spread is None:
+            return True, "missing_C_book"
+        if spread > MAX_C_SPREAD:
+            return True, f"wide_spread_{spread}"
+        if self.has_live_order(C_SYMBOL):
+            return True, "live_order"
+
+        pos = self.pos.get(C_SYMBOL, 0)
+        if pos != 0 and self.c_avg_entry is not None:
+            bid, ask = self.book_top(C_SYMBOL)
+            if pos > 0 and bid is not None and self.c_avg_entry - bid >= ADVERSE_STOP_ADD_TICKS:
+                return True, "adverse_stop_add"
+            if pos < 0 and ask is not None and ask - self.c_avg_entry >= ADVERSE_STOP_ADD_TICKS:
+                return True, "adverse_stop_add"
+
+        fair = self.fair_value_c()
+        sig = self.active_signal
+        allow_guard_override = sig is not None and (
+            (sig.thesis == "cpi" and sig.target >= 160)
+            or (sig.thesis == "earnings" and sig.target >= 160)
+            or (sig.thesis == "macro" and sig.target >= 160)
+        )
+        if fair is not None and not allow_guard_override:
+            px = self.best_price_for_cross(C_SYMBOL, side)
+            if px is None:
+                return True, "missing_C_book"
+            guard = FAIR_VALUE_GUARD_TICKS
+            if sig is not None and sig.thesis == "macro":
+                guard = MACRO_FAIR_VALUE_GUARD_TICKS
+            elif sig is not None and sig.thesis == "earnings":
+                if sig.strength >= EARNINGS_EXTREME_DELTA or sig.target >= 200:
+                    guard = EARNINGS_EXTREME_FAIR_VALUE_GUARD_TICKS
+                elif sig.strength >= EARNINGS_MEDIUM_DELTA:
+                    guard = EARNINGS_STRONG_FAIR_VALUE_GUARD_TICKS
+                else:
+                    guard = EARNINGS_WEAK_FAIR_VALUE_GUARD_TICKS
+            if side == Side.BUY and px > fair + guard:
+                return True, f"buy_over_fair_px_{px}_fair_{fair:.1f}"
+            if side == Side.SELL and px < fair - guard:
+                return True, f"sell_under_fair_px_{px}_fair_{fair:.1f}"
+        return False, "ok"
+
+    def c_mm_allowed_size(self) -> Tuple[int, int]:
+        pos = int(self.pos.get(C_SYMBOL, 0))
+        buy_pending = int(self.pending_buy.get(C_SYMBOL, 0))
+        sell_pending = int(self.pending_sell.get(C_SYMBOL, 0))
+        allowed_buy = max(0, C_MM_MAX_POSITION - (pos + buy_pending))
+        allowed_sell = max(0, C_MM_MAX_POSITION + pos - sell_pending)
+        return allowed_buy, allowed_sell
+
+    def c_mm_passive_qty(self, side: Side, allowed: int) -> int:
+        if allowed <= 0:
+            return 0
+        pos = int(self.pos.get(C_SYMBOL, 0))
+        base_qty = min(C_MM_QUOTE_SIZE, allowed)
+        worsening_side = (pos > 0 and side == Side.BUY) or (pos < 0 and side == Side.SELL)
+        if not worsening_side:
+            return base_qty
+        abs_pos = abs(pos)
+        if abs_pos >= C_MM_REDUCE_ONLY_POSITION:
+            return 0
+        if abs_pos >= C_MM_PASSIVE_REDUCE_FULL:
+            return min(1, allowed)
+        if abs_pos >= C_MM_PASSIVE_REDUCE_START:
+            return min(max(1, C_MM_QUOTE_SIZE - 1), allowed)
+        return base_qty
+
+    def c_mm_desired_quotes(self) -> Dict[Side, Tuple[int, int]]:
+        if not C_MM_ENABLED or self.kill_switch or self.profit_lock_engaged:
+            return {}
+        if self.active_signal is not None and self.c_signal_is_fresh():
+            return {}
+        if self.now() - self.last_c_signal_ts < C_MM_NEWS_COOLDOWN_SECONDS:
+            return {}
+        pos = int(self.pos.get(C_SYMBOL, 0))
+        if pos != 0 and self.c_thesis not in {"flat", "mm"}:
+            return {}
+        fair = self.fair_value_c()
+        bid, ask = self.book_top(C_SYMBOL)
+        spread = self.spread(C_SYMBOL)
+        if fair is None or bid is None or ask is None or spread is None:
+            return {}
+        if spread < C_MM_MIN_BOOK_SPREAD or spread > MAX_C_SPREAD:
+            return {}
+
+        reservation = fair - (C_MM_INVENTORY_SKEW * pos)
+        bid_px = int(math.floor(reservation - C_MM_HALF_SPREAD_TICKS))
+        ask_px = int(math.ceil(reservation + C_MM_HALF_SPREAD_TICKS))
+        bid_px = min(bid_px, ask - 1)
+        ask_px = max(ask_px, bid + 1)
+        if bid_px >= ask_px:
+            bid_px = ask_px - 1
+        bid_px = self.clamp_price(bid_px)
+        ask_px = self.clamp_price(ask_px)
+
+        allowed_buy, allowed_sell = self.c_mm_allowed_size()
+        bid_qty = self.c_mm_passive_qty(Side.BUY, allowed_buy)
+        ask_qty = self.c_mm_passive_qty(Side.SELL, allowed_sell)
+        desired: Dict[Side, Tuple[int, int]] = {}
+        if bid_qty > 0:
+            desired[Side.BUY] = (bid_px, bid_qty)
+        if ask_qty > 0:
+            desired[Side.SELL] = (ask_px, ask_qty)
+        return desired
+
+    async def sync_c_market_maker(self) -> bool:
+        if self.has_live_non_mm_order(C_SYMBOL):
+            return False
+        desired = self.c_mm_desired_quotes()
+        now = self.now()
+        acted = False
+
+        for side in (Side.BUY, Side.SELL):
+            live = self.live_c_order(side, mm_only=True, include_pending=True)
+            desired_quote = desired.get(side)
+            if live is None:
+                continue
+            if desired_quote is None:
+                if await self.request_cancel_order(live.order_id):
+                    logger.info("Cancelling C MM %s because desired quote removed", live.order_id)
+                    acted = True
+                continue
+            desired_px, desired_qty = desired_quote
+            price_gap = abs(live.price - desired_px)
+            stale = now - live.ts >= C_MM_QUOTE_TTL_SECONDS
+            qty_changed = live.qty != desired_qty
+            if qty_changed or stale or price_gap >= C_MM_REPRICE_THRESHOLD_TICKS:
+                if await self.request_cancel_order(live.order_id):
+                    logger.info(
+                        "Cancelling C MM %s for reprice: side=%s live=%d/%d desired=%d/%d gap=%d stale=%s",
+                        live.order_id,
+                        self.side_name(side),
+                        live.price,
+                        live.qty,
+                        desired_px,
+                        desired_qty,
+                        price_gap,
+                        stale,
+                    )
+                    acted = True
+
+        if acted:
+            return True
+
+        for side in (Side.BUY, Side.SELL):
+            if self.live_c_order(side, mm_only=True, include_pending=True) is not None:
+                continue
+            desired_quote = desired.get(side)
+            if desired_quote is None:
+                continue
+            px, qty = desired_quote
+            tag = "mm_bid" if side == Side.BUY else "mm_ask"
+            if await self.send_c_order(side, qty, px, tag):
+                self.c_thesis = "mm" if self.pos.get(C_SYMBOL, 0) != 0 else self.c_thesis
+                self.last_c_action_ts = now
+                acted = True
+
+        if acted:
+            fair = self.fair_value_c()
+            bid, ask = self.book_top(C_SYMBOL)
+            logger.info(
+                "C MM sync: pos=%d fair=%s book=%s/%s desired=%s",
+                self.pos.get(C_SYMBOL, 0),
+                "na" if fair is None else f"{fair:.2f}",
+                bid if bid is not None else "na",
+                ask if ask is not None else "na",
+                {self.side_name(side): quote for side, quote in desired.items()},
+            )
+            self.log_csv("mm_sync", tag="market_making", message=str({self.side_name(side): quote for side, quote in desired.items()}))
+        return acted
+
+    async def sync_c_shock_child_order(self, side: Side, desired_qty: int, px: int, tag: str) -> bool:
+        desired_qty = max(0, int(desired_qty))
+        if desired_qty <= 0:
+            return False
+
+        live = self.live_c_order(mm_only=False, include_pending=True)
+        if live is not None:
+            age = self.now() - live.ts
+            same_order = live.side == side and live.tag == tag and live.price == px and live.qty <= desired_qty + 1
+            if same_order:
+                return False
+            if age < C_SHOCK_MIN_ORDER_LIVE_SECONDS:
+                return False
+            if await self.request_cancel_order(live.order_id):
+                logger.info(
+                    "Cancelling C shock child for replace: live=%s %s %d@%d desired=%s %d@%d tag=%s",
+                    live.tag,
+                    self.side_name(live.side),
+                    live.qty,
+                    live.price,
+                    self.side_name(side),
+                    desired_qty,
+                    px,
+                    tag,
+                )
+                self.log_csv(
+                    "shock_order_replace",
+                    symbol=C_SYMBOL,
+                    side=self.side_name(side),
+                    qty=desired_qty,
+                    price=px,
+                    tag=tag,
+                    reason="replace",
+                    shock_intent=tag,
+                )
+                self.last_c_action_ts = self.now()
+                return True
+            return False
+
+        slice_qty = self.c_shock_next_slice_qty(desired_qty)
+        if slice_qty <= 0:
+            return False
+        placed = await self.send_c_order(side, slice_qty, px, tag)
+        if placed:
+            self.c_thesis = "earnings_shock" if self.c_earnings_shock.mode == "SHOCK" else "earnings_unwind"
+            self.last_c_action_ts = self.now()
+            self.log_csv(
+                "shock_child_order",
+                symbol=C_SYMBOL,
+                side=self.side_name(side),
+                qty=slice_qty,
+                price=px,
+                tag=tag,
+                shock_intent=tag,
+            )
+        return placed
+
+    async def sync_c_shock_to_target(self, target_inventory: int, tag: str) -> bool:
+        pos = self.pos.get(C_SYMBOL, 0)
+        delta = int(target_inventory) - int(pos)
+        if delta == 0:
+            return False
+        side = Side.BUY if delta > 0 else Side.SELL
+        px = self.best_price_for_cross(C_SYMBOL, side)
+        if px is None:
+            self.log_csv("shock_blocked", reason="missing_C_book", tag=tag, shock_intent=tag)
+            return False
+        return await self.sync_c_shock_child_order(side, abs(delta), px, tag)
+
+    async def maybe_trade_earnings_shock(self) -> bool:
+        shock = self.c_earnings_shock
+        if shock.mode not in {"SHOCK", "UNWIND"}:
+            return False
+
+        self.mark_c_unrealized()
+        if self.c_total_pnl <= C_TOTAL_PNL_HARD_STOP:
+            self.kill_switch = True
+            shock.mode = "UNWIND"
+            shock.target_inventory = 0
+            return await self.sync_c_shock_to_target(0, "risk_flatten")
+        if self.c_profit_lock_triggered():
+            self.profit_lock_engaged = True
+            self.kill_switch = True
+            shock.mode = "UNWIND"
+            shock.target_inventory = 0
+            return await self.sync_c_shock_to_target(0, "profit_lock")
+
+        self.record_c_shock_mid()
+        self.update_c_shock_peak_and_ratchet()
+        pos = self.pos.get(C_SYMBOL, 0)
+
+        if shock.mode == "UNWIND":
+            if pos == 0:
+                logger.info("C earnings shock flattened: signal_id=%d", shock.signal_id)
+                self.log_csv("shock_flat", tag="earnings_unwind", shock_intent="flat")
+                self.reset_c_earnings_shock()
+                self.active_signal = None
+                self.c_thesis = "flat"
+                return False
+            return await self.sync_c_shock_to_target(0, "earnings_unwind")
+
+        if self.c_shock_should_emergency_dump():
+            shock.mode = "UNWIND"
+            shock.target_inventory = 0
+            shock.equilibrium_reached_ts = None
+            shock.overshoot_active = False
+            logger.info("C earnings shock emergency dump: pos=%d ref=%s mid=%s", pos, shock.reference_mid, self.mid(C_SYMBOL))
+            self.log_csv("shock_emergency_dump", tag="earnings_emergency_dump", reason="wrong_way_move", shock_intent="earnings_emergency_dump")
+            return await self.sync_c_shock_to_target(0, "earnings_emergency_dump")
+
+        if self.c_shock_should_force_time_flatten():
+            shock.mode = "UNWIND"
+            shock.target_inventory = 0
+            shock.equilibrium_reached_ts = None
+            shock.overshoot_active = False
+            logger.info("C earnings shock max hold reached: pos=%d elapsed=%.2f", pos, self.now() - shock.started_ts)
+            self.log_csv("shock_max_hold", tag="earnings_max_hold", reason="max_hold", shock_intent="earnings_max_hold")
+            return await self.sync_c_shock_to_target(0, "earnings_max_hold")
+
+        overshoot_order = self.maybe_build_c_overshoot_trim()
+        if overshoot_order is not None:
+            side, qty, px, tag = overshoot_order
+            self.log_csv("shock_overshoot_trim", symbol=C_SYMBOL, side=self.side_name(side), qty=qty, price=px, tag=tag, shock_intent=tag)
+            return await self.sync_c_shock_child_order(side, qty, px, tag)
+
+        if self.c_shock_equilibrium_reached():
+            shock.mode = "UNWIND"
+            shock.target_inventory = 0
+            shock.equilibrium_reached_ts = self.now()
+            shock.overshoot_active = False
+            logger.info("C earnings shock equilibrium reached: pos=%d fair=%s mid=%s", pos, shock.fair_after, self.mid(C_SYMBOL))
+            self.log_csv("shock_equilibrium", tag="earnings_unwind", reason="equilibrium", shock_intent="earnings_unwind")
+            return await self.sync_c_shock_to_target(0, "earnings_unwind")
+
+        before_target = shock.target_inventory
+        decay_applied = self.maybe_apply_c_shock_decay()
+        tag = "earnings_decay_trim" if decay_applied and abs(pos) > abs(shock.target_inventory) else "earnings_shock_take"
+        if decay_applied:
+            logger.info("C earnings shock decay: target %d -> %d", before_target, shock.target_inventory)
+            self.log_csv("shock_decay", tag=tag, reason="stalled_decay", shock_intent=tag)
+
+        return await self.sync_c_shock_to_target(shock.target_inventory, tag)
+
+    async def maybe_exit_c(self) -> bool:
+        pos = self.pos.get(C_SYMBOL, 0)
+        if pos == 0:
+            return False
+        if self.c_earnings_shock_active():
+            return False
+        if self.has_live_order(C_SYMBOL):
+            return False
+
+        self.mark_c_unrealized()
+        if self.c_total_pnl <= C_TOTAL_PNL_HARD_STOP:
+            self.kill_switch = True
+            return await self.flatten_c("risk_flatten")
+        if self.c_profit_lock_triggered():
+            self.profit_lock_engaged = True
+            self.kill_switch = True
+            return await self.flatten_c("profit_lock")
+
+        bid, ask = self.book_top(C_SYMBOL)
+        gap = self.fair_gap()
+        spread = self.spread(C_SYMBOL)
+        favorable_gap = None if gap is None else (gap if pos > 0 else -gap)
+        regime_age = 0.0 if self.c_regime_started_at <= 0.0 else self.now() - self.c_regime_started_at
+        observed_profit = None
+        (
+            profit_1_ticks,
+            profit_2_ticks,
+            profit_full_ticks,
+            trail_start_ticks,
+            trail_giveback_ticks,
+            adverse_flatten_ticks,
+        ) = self.c_exit_profile()
+        if self.c_avg_entry is not None:
+            if pos > 0 and bid is not None:
+                adverse = self.c_avg_entry - bid
+                profit = bid - self.c_avg_entry
+                if adverse >= adverse_flatten_ticks:
+                    return await self.flatten_c("stop_loss")
+                self.c_best_profit_ticks = max(self.c_best_profit_ticks, profit)
+                observed_profit = profit
+                if self.c_best_profit_ticks >= trail_start_ticks and profit <= self.c_best_profit_ticks - trail_giveback_ticks:
+                    return await self.flatten_c("profit_trail")
+                if profit >= profit_full_ticks:
+                    return await self.flatten_c("long_profit_full")
+                if profit >= profit_2_ticks and self.c_exit_stage < 2:
+                    placed = await self.flatten_c("long_profit_2", ORDER_LIMIT)
+                    if placed:
+                        self.c_exit_stage = 2
+                    return placed
+                if profit >= profit_1_ticks and self.c_exit_stage < 1:
+                    placed = await self.flatten_c("long_profit_1", ORDER_LIMIT)
+                    if placed:
+                        self.c_exit_stage = 1
+                    return placed
+            elif pos < 0 and ask is not None:
+                adverse = ask - self.c_avg_entry
+                profit = self.c_avg_entry - ask
+                if adverse >= adverse_flatten_ticks:
+                    return await self.flatten_c("stop_loss")
+                self.c_best_profit_ticks = max(self.c_best_profit_ticks, profit)
+                observed_profit = profit
+                if self.c_best_profit_ticks >= trail_start_ticks and profit <= self.c_best_profit_ticks - trail_giveback_ticks:
+                    return await self.flatten_c("profit_trail")
+                if profit >= profit_full_ticks:
+                    return await self.flatten_c("short_profit_full")
+                if profit >= profit_2_ticks and self.c_exit_stage < 2:
+                    placed = await self.flatten_c("short_profit_2", ORDER_LIMIT)
+                    if placed:
+                        self.c_exit_stage = 2
+                    return placed
+                if profit >= profit_1_ticks and self.c_exit_stage < 1:
+                    placed = await self.flatten_c("short_profit_1", ORDER_LIMIT)
+                    if placed:
+                        self.c_exit_stage = 1
+                    return placed
+
+        if self.c_thesis == "earnings":
+            if observed_profit is None and regime_age >= EARNINGS_FAST_TIMEOUT_SECONDS:
+                return await self.flatten_c("fast_timeout", ORDER_LIMIT)
+            if observed_profit is not None:
+                if regime_age >= EARNINGS_FAST_HARVEST_SECONDS and (
+                    self.c_exit_stage > 0 or observed_profit >= EARNINGS_FAST_HARVEST_MIN_TICKS
+                ):
+                    return await self.flatten_c("fast_harvest", ORDER_LIMIT)
+                if regime_age >= EARNINGS_FAST_TIMEOUT_SECONDS and observed_profit <= 0:
+                    return await self.flatten_c("fast_timeout", ORDER_LIMIT)
+
+        sig = self.active_signal
+        if sig is not None and self.c_signal_is_fresh():
+            desired_sign = 1 if sig.side == Side.BUY else -1
+            if self.sign(pos) != desired_sign:
+                return await self.flatten_c("contradict_signal")
+
+        if regime_age >= self.c_signal_max_hold():
+            if favorable_gap is None or favorable_gap <= STRONG_FAIR_GAP_HOLD_TICKS:
+                return await self.flatten_c("max_hold")
+            if self.c_best_profit_ticks > 0 and self.c_exit_stage < 1:
+                placed = await self.flatten_c("max_hold_profit_trim", ORDER_LIMIT)
+                if placed:
+                    self.c_exit_stage = 1
+                return placed
+
+        if self.c_thesis == "macro" and gap is not None and spread is not None and regime_age >= 2.0:
+            if favorable_gap <= max(4.0, float(spread)):
+                return await self.flatten_c("gap_compress")
+
+        return False
+
+    async def maybe_enter_or_add_c(self) -> bool:
+        if self.c_earnings_shock_active():
+            return False
+        sig = self.active_signal
+        if sig is None or not self.c_signal_is_fresh():
+            return False
+        if self.now() - self.last_c_action_ts < C_ACTION_COOLDOWN_SECONDS:
+            return False
+        if self.c_exit_stage > 0:
+            return False
+
+        pos = self.pos.get(C_SYMBOL, 0)
+        desired_sign = 1 if sig.side == Side.BUY else -1
+        if pos != 0 and self.sign(pos) != desired_sign:
+            return False
+        if abs(pos) >= sig.target:
+            return False
+
+        blocked, reason = self.entry_blocked_by_risk(sig.side)
+        if blocked:
+            block_key = f"{reason}:{sig.thesis}:{sig.target}:{pos}"
+            if block_key != self.last_entry_block_key or self.now() - self.last_entry_block_log_ts >= 1.5:
+                logger.info("C entry blocked: reason=%s thesis=%s target=%d pos_C=%d", reason, sig.thesis, sig.target, pos)
+                self.log_csv("entry_blocked", reason=reason, tag=sig.thesis, qty=sig.target)
+                self.last_entry_block_key = block_key
+                self.last_entry_block_log_ts = self.now()
+            return False
+
+        px = self.best_price_for_cross(C_SYMBOL, sig.side)
+        if px is None:
+            return False
+
+        qty = min(ORDER_LIMIT, sig.target - abs(pos))
+        qty = self.order_qty(C_SYMBOL, sig.side, qty)
+        if qty <= 0:
+            return False
+
+        placed = await self.send_c_order(sig.side, qty, px, f"{sig.thesis}_entry")
+        if placed:
+            self.last_c_action_ts = self.now()
+            self.c_thesis = sig.thesis
+            if self.c_regime_started_at <= 0.0:
+                self.c_regime_started_at = self.now()
+            fair = self.fair_value_c()
+            mid_c = self.mid(C_SYMBOL)
+            logger.info(
+                "C entry: thesis=%s side=%s qty=%d strength=%.6f target=%d fair=%s mid=%s",
+                sig.thesis,
+                self.side_name(sig.side),
+                qty,
+                sig.strength,
+                sig.target,
+                "na" if fair is None else f"{fair:.2f}",
+                "na" if mid_c is None else f"{mid_c:.2f}",
+            )
+            self.log_csv(
+                "entry_decision",
+                symbol=C_SYMBOL,
+                side=self.side_name(sig.side),
+                qty=qty,
+                price=px,
+                tag=sig.thesis,
+                message=f"strength={sig.strength:.6f} target={sig.target}",
+            )
+        return placed
+
+    async def maybe_trade(self) -> None:
+        if self.decision_lock.locked():
+            return
+        async with self.decision_lock:
+            self.maybe_initialize_anchor()
+            self.mark_c_unrealized()
+            await self.cancel_stale_orders()
+            if self.active_signal is not None and self.c_signal_is_fresh():
+                if await self.cancel_c_mm_orders("fresh directional C signal"):
+                    self.log_heartbeat(force=True)
+                    return
+            if self.pos.get(C_SYMBOL, 0) != 0 and self.c_thesis not in {"flat", "mm"}:
+                if await self.cancel_c_mm_orders("directional C inventory active"):
+                    self.log_heartbeat(force=True)
+                    return
+            if self.c_earnings_shock_active():
+                if await self.cancel_c_mm_orders("earnings shock active"):
+                    self.log_heartbeat(force=True)
+                    return
+                if await self.maybe_trade_earnings_shock():
+                    self.log_heartbeat(force=True)
+                    return
+                self.log_heartbeat()
+                return
+            if await self.maybe_exit_c():
+                self.log_heartbeat(force=True)
+                return
+            if await self.maybe_enter_or_add_c():
+                self.log_heartbeat(force=True)
+                return
+            if await self.sync_c_market_maker():
+                self.log_heartbeat(force=True)
+                return
+            self.log_heartbeat()
+
+    def handle_position_snapshot(self, msg) -> None:
+        super().handle_position_snapshot(msg)
+        for symbol in self.pos:
+            self.pos[symbol] = int(self.positions.get(symbol, 0))
+        self.cash = float(self.positions.get("cash", 0))
+        if self.session_start_cash is None:
+            self.session_start_cash = self.cash
+            self.session_start_mtm = self.current_mtm()
+        if self.pos[C_SYMBOL] == 0:
+            self.c_avg_entry = None
+            self.c_peak_abs = 0
+            self.c_thesis = "flat"
+            self.reset_c_earnings_shock()
+        elif self.c_avg_entry is None:
+            inherited_mark = self.mid(C_SYMBOL) or float(self.c_last_fill_price or 0)
+            if inherited_mark > 0:
+                self.c_avg_entry = float(inherited_mark)
+                self.c_peak_abs = abs(self.pos[C_SYMBOL])
+                self.c_thesis = "inherited"
+                self.c_regime_started_at = self.now()
+        self.mark_c_unrealized()
+        logger.info(
+            "Startup C-only mode: C=%d H=%d HOLD=%d CUT=%d cash=%.2f inherited_PM_no_trade=True",
+            self.pos[C_SYMBOL],
+            self.pos[R_HIKE],
+            self.pos[R_HOLD],
+            self.pos[R_CUT],
+            self.cash,
+        )
+        self.log_csv("startup", message="C-only mode; PM read-only")
+
+    async def handle_order_fill(self, msg) -> None:
+        order_info = self.open_orders.get(msg.id)
+        if order_info is None:
+            logger.warning(
+                "Ignoring fill for unknown/stale order_id=%s qty=%d price=%d",
+                msg.id,
+                msg.qty,
+                msg.px,
+            )
+            return
+
+        request = order_info[0]
+        symbol = request.symbol
+        fill_qty = int(msg.qty)
+        fill_price = int(msg.px)
+        is_buy = int(request.side) == 1
+
+        self.positions[symbol] += fill_qty * (1 if is_buy else -1)
+        self.positions["cash"] += fill_qty * fill_price * (-1 if is_buy else 1)
+
+        order_info[1] -= fill_qty
+        if order_info[1] <= 0 and not order_info[2]:
+            self.open_orders.pop(msg.id, None)
+
+        await self.bot_handle_order_fill(msg.id, fill_qty, fill_price)
+
+    async def handle_order_rejected(self, msg) -> None:
+        await self.bot_handle_order_rejected(msg.id, msg.reason)
+        self.open_orders.pop(msg.id, None)
+
+    async def handle_cancel_response(self, msg) -> None:
+        result_type = msg.WhichOneof("result")
+        if result_type == "ok":
+            await self.bot_handle_cancel_response(msg.id, True, None)
+            self.open_orders.pop(msg.id, None)
+        else:
+            await self.bot_handle_cancel_response(msg.id, False, msg.error)
+
+    async def bot_handle_cancel_response(self, order_id: str, success: bool, error: Optional[str] = None) -> None:
+        oid = str(order_id)
+        self.pending_cancels.discard(oid)
+        ref = self.live_orders.pop(oid, None)
+        if ref is not None:
+            if ref.side == Side.BUY:
+                self.pending_buy[ref.symbol] = max(0, self.pending_buy[ref.symbol] - ref.qty)
+            else:
+                self.pending_sell[ref.symbol] = max(0, self.pending_sell[ref.symbol] - ref.qty)
+            self.symbol_cooldown_until[ref.symbol] = max(
+                self.symbol_cooldown_until[ref.symbol],
+                self.now() + C_SYMBOL_COOLDOWN_SECONDS,
+            )
+        logger.info("Cancel acknowledged: order_id=%s success=%s error=%s", oid, success, error)
+        self.log_csv(
+            "cancel_response",
+            order_id=oid,
+            symbol="" if ref is None else ref.symbol,
+            side="" if ref is None else self.side_name(ref.side),
+            qty="" if ref is None else ref.qty,
+            price="" if ref is None else ref.price,
+            tag="" if ref is None else ref.tag,
+            message=f"success={success} error={error}",
+        )
+
+    async def bot_handle_order_fill(self, order_id: str, qty: int, price: int):
+        oid = str(order_id)
+        ref = self.live_orders.get(oid)
+        if ref is None:
+            await self.maybe_trade()
+            return
+
+        old_pos = self.pos.get(ref.symbol, 0)
+        signed = qty if ref.side == Side.BUY else -qty
+        self.pos[ref.symbol] = old_pos + signed
+        self.cash -= signed * price
+        self.c_last_fill_price = price if ref.symbol == C_SYMBOL else self.c_last_fill_price
+
+        if ref.side == Side.BUY:
+            self.pending_buy[ref.symbol] = max(0, self.pending_buy[ref.symbol] - qty)
+        else:
+            self.pending_sell[ref.symbol] = max(0, self.pending_sell[ref.symbol] - qty)
+
+        if ref.symbol == C_SYMBOL:
+            self.update_c_pnl_from_fill(old_pos, self.pos[ref.symbol], signed, price)
+            if self.is_mm_tag(ref.tag) and self.pos[ref.symbol] != 0 and self.active_signal is None:
+                self.c_thesis = "mm"
+            if self.pos[ref.symbol] == 0:
+                self.active_signal = None
+                if self.c_earnings_shock_active():
+                    self.reset_c_earnings_shock()
+
+        ref.qty -= qty
+        if ref.qty <= 0:
+            self.live_orders.pop(oid, None)
+
+        unrealized, mark_source = self.mark_c_unrealized()
+        fair = self.fair_value_c()
+        bid, ask = self.book_top(C_SYMBOL)
+        logger.info(
+            "Fill: order_id=%s symbol=%s qty=%d price=%d pos_C=%d avg_C=%s realized=%.2f unrealized=%.2f total_pnl=%.2f cash=%.2f session_mtm=%.2f thesis=%s fair=%s C=%s/%s mark=%s",
+            oid,
+            ref.symbol,
+            qty,
+            price,
+            self.pos[C_SYMBOL],
+            "na" if self.c_avg_entry is None else f"{self.c_avg_entry:.2f}",
+            self.c_realized_pnl,
+            unrealized,
+            self.c_total_pnl,
+            self.cash,
+            self.c_total_pnl,
+            self.c_thesis,
+            "na" if fair is None else f"{fair:.2f}",
+            bid if bid is not None else "na",
+            ask if ask is not None else "na",
+            mark_source,
+        )
+        self.log_csv(
+            "fill",
+            order_id=oid,
+            symbol=ref.symbol,
+            side=self.side_name(ref.side),
+            qty=qty,
+            price=price,
+            tag=ref.tag,
+        )
+        await self.maybe_trade()
+
     async def bot_handle_order_rejected(self, order_id: str, reason: str) -> None:
-        tracked = self.order_manager.sync_rejected(order_id)
-        self.state.pending_cancels.discard(str(order_id))
-        reason_text = (reason or "").lower()
-        limit_rejection = "exceeds limits" in reason_text or "limit" in reason_text
-        if tracked is not None:
-            if tracked.engine == "c" and tracked.role == "entry":
-                self.state.c_blocked_side = tracked.side
-                cooldown = self.cfg.c_reentry_block_secs * (2.0 if limit_rejection else 1.0)
-                self.state.c_blocked_until = time.time() + cooldown
-            if tracked.engine == "rates" and tracked.role == "entry":
-                self.state.rates_blocked_direction = tracked.thesis
-                cooldown = self.cfg.rate_reentry_block_secs * (2.0 if limit_rejection else 1.0)
-                self.state.rates_blocked_until = time.time() + cooldown
-        LOGGER.warning("Order rejected: order_id=%s reason=%s", order_id, reason)
+        oid = str(order_id)
+        self.pending_cancels.discard(oid)
+        ref = self.live_orders.pop(oid, None)
+        if ref is not None:
+            if ref.side == Side.BUY:
+                self.pending_buy[ref.symbol] = max(0, self.pending_buy[ref.symbol] - ref.qty)
+            else:
+                self.pending_sell[ref.symbol] = max(0, self.pending_sell[ref.symbol] - ref.qty)
+            self.symbol_cooldown_until[ref.symbol] = max(
+                self.symbol_cooldown_until[ref.symbol],
+                self.now() + C_SYMBOL_COOLDOWN_SECONDS,
+            )
+
+        match = re.search(r"Order ID\s+(\d+)\s+exceeds limits", str(reason))
+        if match:
+            rejected_id = int(match.group(1))
+            self.order_id = max(int(getattr(self, "order_id", 0)), rejected_id + 1000, int(time.time() * 1000))
+            logger.info("Bumped order_id after exchange rejection: next_order_id=%d", self.order_id)
+
+        logger.info("Order rejected: order_id=%s reason=%s", oid, reason)
+        self.log_csv(
+            "order_rejected",
+            order_id=oid,
+            symbol="" if ref is None else ref.symbol,
+            side="" if ref is None else self.side_name(ref.side),
+            qty="" if ref is None else ref.qty,
+            price="" if ref is None else ref.price,
+            tag="" if ref is None else ref.tag,
+            reason=reason,
+        )
 
     async def bot_handle_trade_msg(self, symbol: str, price: int, qty: int):
-        if symbol in self.cfg.tracked_symbols:
-            self.state.last_trade_price[symbol] = int(price)
-            await self.evaluate()
+        if symbol == C_SYMBOL:
+            self.c_last_fill_price = price
+        if symbol == C_SYMBOL or symbol in PM_SYMBOLS:
+            await self.maybe_trade()
 
     async def bot_handle_book_update(self, symbol: str) -> None:
-        if symbol in self.cfg.tracked_symbols:
-            self.refresh_book(symbol)
-            await self.evaluate()
+        if symbol == C_SYMBOL or symbol in PM_SYMBOLS:
+            await self.maybe_trade()
 
     async def bot_handle_swap_response(self, swap: str, qty: int, success: bool):
-        LOGGER.info("Ignoring swap response: swap=%s qty=%s success=%s", swap, qty, success)
+        pass
 
     async def bot_handle_news(self, news_release: dict):
-        kind = news_release.get("kind")
-        new_data = news_release.get("new_data", {}) or {}
-        tick = news_release.get("tick")
+        tick = int(news_release.get("tick") or news_release.get("timestamp") or 0)
+        self.last_tick_seen = max(self.last_tick_seen, tick)
+        new_data_obj = news_release.get("new_data", {}) or {}
+        new_data = new_data_obj if isinstance(new_data_obj, dict) else {}
+        kind = str(news_release.get("kind") or "")
+        subtype = str(new_data.get("structured_subtype") or "").lower()
+        asset = str(new_data.get("asset") or "")
+        text = str(new_data.get("content") or news_release.get("content") or (new_data_obj if not isinstance(new_data_obj, dict) else ""))
+        news_summary = self.describe_news_release(news_release)
 
-        rate_snapshot = self.rates_signal_engine.snapshot()
+        actual, forecast = self.parse_cpi_from_news(news_release)
+        if actual is not None and forecast is not None:
+            self.set_cpi_signal(actual, forecast, tick, raw_news=news_release)
+            await self.maybe_trade()
+            return
 
-        if kind == "structured":
-            subtype = new_data.get("structured_subtype")
+        c_earnings = self.parse_c_earnings_from_news(news_release)
+        if c_earnings is not None:
+            self.set_c_earnings_signal(c_earnings, tick)
+            await self.maybe_trade()
+            return
 
-            if subtype == "earnings":
-                asset = str(new_data.get("asset", "")).upper()
-                value = float(new_data["value"])
-                if asset == self.cfg.symbol_c:
-                    previous_eps = self.state.current_eps_c
-                    had_real_eps = self.state.have_real_eps_c
-                    self.state.current_eps_c = value
-                    self.state.have_real_eps_c = True
-                    self.state.last_c_earnings_delta = 0.0 if not had_real_eps else value - previous_eps
-                    self.state.last_c_earnings_ts = time.time()
-                    self.state.last_c_earnings_is_initial = not had_real_eps
-
-                    earnings_delta = abs(self.state.last_c_earnings_delta)
-                    if not self.state.last_c_earnings_is_initial:
-                        if earnings_delta >= self.cfg.c_earnings_medium_delta:
-                            self.rates_signal_engine.mark_news_urgent(self.cfg.c_earnings_hold_secs + 0.75)
-                        elif earnings_delta >= self.cfg.c_earnings_small_delta:
-                            self.rates_signal_engine.mark_news_urgent(self.cfg.c_earnings_hold_secs)
-                        elif earnings_delta >= self.cfg.c_earnings_ignore_delta:
-                            self.rates_signal_engine.mark_news_urgent(1.50)
-                    else:
-                        self.rates_signal_engine.mark_news_urgent(self.cfg.c_earnings_hold_secs)
-
-                    self.c_fair_engine.maybe_refresh_anchor_after_first_real_eps(rate_snapshot)
-                    LOGGER.info(
-                        "C earnings update at tick %s: %.4f -> %.4f delta=%+.4f initial=%s",
-                        tick,
-                        previous_eps,
-                        value,
-                        self.state.last_c_earnings_delta,
-                        self.state.last_c_earnings_is_initial,
-                    )
-                else:
-                    LOGGER.info("Ignoring %s earnings in C-only mode at tick %s: value=%.4f", asset, tick, value)
-
-            elif subtype == "cpi_print":
-                forecast = float(new_data["forecast"])
-                actual = float(new_data["actual"])
-                surprise = actual - forecast
-                bias_bp = self.clip(
-                    surprise * self.cfg.cpi_to_rate_bp,
-                    -self.cfg.max_temp_rate_bias_bp,
-                    self.cfg.max_temp_rate_bias_bp,
+        if text:
+            macro_score = self.score_macro_headline_for_c(text)
+            macro_target = self.c_target_for_macro_score(macro_score)
+            macro_direction = "SELL" if macro_score > 0 else ("BUY" if macro_score < 0 else "")
+            macro_reason = "below_threshold"
+            if macro_target > 0:
+                block_reason = self.macro_block_reason(Side.SELL if macro_score > 0 else Side.BUY)
+                macro_reason = block_reason or "candidate"
+            if "cpi" in text.lower() or "inflation" in text.lower():
+                self.log_csv(
+                    "cpi_eval",
+                    tick=tick,
+                    side=macro_direction,
+                    qty=macro_target,
+                    reason="no_actual_forecast",
+                    message=f"no actual/forecast; score={macro_score:+.2f} headline={text[:180]}",
+                    macro_score=f"{macro_score:.4f}",
+                    macro_target=macro_target,
+                    macro_direction=macro_direction,
+                    earnings_trend=f"{self.c_earnings_trend():+.6f}",
+                    news_kind=kind,
+                    news_subtype=subtype,
+                    news_asset=asset,
+                    raw_news=news_release,
                 )
-                if abs(bias_bp) >= 0.25:
-                    self.rates_signal_engine.apply_temp_rate_bias(bias_bp, self.cfg.cpi_bias_ttl_secs, "cpi_print")
-                    LOGGER.info(
-                        "CPI surprise at tick %s: actual=%.6f forecast=%.6f bias_bp=%.2f",
-                        tick,
-                        actual,
-                        forecast,
-                        bias_bp,
-                    )
+            self.log_csv(
+                "macro_eval",
+                tick=tick,
+                side=macro_direction,
+                qty=macro_target,
+                reason=macro_reason,
+                message=f"score={macro_score:+.2f} headline={text[:180]}",
+                macro_score=f"{macro_score:.4f}",
+                macro_target=macro_target,
+                macro_direction=macro_direction,
+                earnings_trend=f"{self.c_earnings_trend():+.6f}",
+                news_kind=kind,
+                news_subtype=subtype,
+                news_asset=asset,
+                raw_news=news_release,
+            )
+            if macro_target > 0:
+                self.set_macro_headline_signal(macro_score, text, tick, raw_news=news_release)
+                await self.maybe_trade()
+                return
 
-        elif kind == "unstructured":
-            content = str(new_data.get("content", ""))
-            bias_bp = self.rates_signal_engine.headline_rate_bias_bp(content)
-            if abs(bias_bp) >= 0.25:
-                self.rates_signal_engine.apply_temp_rate_bias(bias_bp, self.cfg.headline_bias_ttl_secs, "headline")
-                LOGGER.info("Fed headline at tick %s: bias_bp=%.2f content=%s", tick, bias_bp, content)
+        if subtype == "earnings":
+            logger.info("Ignoring non-C earnings in C-only mode: asset=%s news=%s", asset, news_release)
+            self.log_csv(
+                "news_ignored",
+                tick=tick,
+                reason="non_C_earnings",
+                message=news_summary,
+                news_kind=kind,
+                news_subtype=subtype,
+                news_asset=asset,
+                raw_news=news_release,
+            )
+        elif text:
+            logger.info("Ignoring weak/non-macro news in C-only mode: score=%+.2f news=%s", macro_score, news_release)
+            self.log_csv(
+                "news_ignored",
+                tick=tick,
+                reason="weak_macro_news",
+                message=f"score={macro_score:+.2f} headline={news_summary}",
+                macro_score=f"{macro_score:.4f}",
+                macro_target=macro_target,
+                macro_direction=macro_direction,
+                earnings_trend=f"{self.c_earnings_trend():+.6f}",
+                news_kind=kind,
+                news_subtype=subtype,
+                news_asset=asset,
+                raw_news=news_release,
+            )
+        else:
+            logger.info("Ignoring non-CPI/non-C-earnings news in C-only mode: %s", news_release)
+            self.log_csv(
+                "news_ignored",
+                tick=tick,
+                reason="non_signal_news",
+                message=news_summary,
+                news_kind=kind,
+                news_subtype=subtype,
+                news_asset=asset,
+                raw_news=news_release,
+            )
+        await self.maybe_trade()
 
-        await self.evaluate()
+    def log_heartbeat(self, force: bool = False) -> None:
+        now = self.now()
+        if not force and now - self.last_heartbeat_log < HEARTBEAT_LOG_SECONDS:
+            return
+        self.last_heartbeat_log = now
+
+        unrealized, mark_source = self.mark_c_unrealized()
+        bid, ask = self.book_top(C_SYMBOL)
+        fair = self.fair_value_c()
+        rate = self.rate_context()
+        sig = self.active_signal
+        sig_text = "none"
+        if sig is not None:
+            sig_text = f"{sig.thesis}:{self.side_name(sig.side)}:{sig.target}:fresh={self.c_signal_is_fresh()}"
+        shock = self.c_earnings_shock
+        if shock.mode != "IDLE":
+            sig_text = f"{sig_text} shock={shock.mode}:{shock.target_inventory}:edge={shock.initial_edge:+.1f}"
+        pm_pos = (self.pos[R_HIKE], self.pos[R_HOLD], self.pos[R_CUT])
+        logger.info(
+            "State C-only: pos_C=%d avg_C=%s realized=%.2f unrealized=%.2f total_pnl=%.2f cash=%.2f session_mtm=%.2f thesis=%s signal=%s fair=%s C=%s/%s eps=%.4f cpi_surprise=%+.6f rate_bp=%s pm_pos=%d/%d/%d mark=%s kill=%s",
+            self.pos[C_SYMBOL],
+            "na" if self.c_avg_entry is None else f"{self.c_avg_entry:.2f}",
+            self.c_realized_pnl,
+            unrealized,
+            self.c_total_pnl,
+            self.cash,
+            self.c_total_pnl,
+            self.c_thesis,
+            sig_text,
+            "na" if fair is None else f"{fair:.2f}",
+            bid if bid is not None else "na",
+            ask if ask is not None else "na",
+            self.current_eps_c,
+            self.last_cpi_surprise,
+            "na" if rate is None else f"{rate.effective_rate_bp:.2f}",
+            pm_pos[0],
+            pm_pos[1],
+            pm_pos[2],
+            mark_source,
+            self.kill_switch,
+        )
+        self.log_csv("heartbeat" if not force else "heartbeat_forced")
 
     async def trade(self):
-        await asyncio.sleep(2.0)
+        """C-only CPI/earnings bot. Prediction markets are read-only context."""
+        await asyncio.sleep(1)
         while True:
-            try:
-                await self.evaluate()
-            except Exception as exc:
-                LOGGER.exception("trade loop error: %s", exc)
-            await asyncio.sleep(self.cfg.loop_sleep_secs)
+            await self.maybe_trade()
+            await asyncio.sleep(0.2)
 
     async def start(self):
         asyncio.create_task(self.trade())
         await self.connect()
 
 
-async def run_bot(host: str, username: str, password: str) -> None:
-    client = MyXchangeClient(host, username, password)
-    await client.start()
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="C + Fed event bot.")
-    parser.add_argument("--host", default="practice.uchicago.exchange:3333")
-    parser.add_argument("--username", default="uiuc")
-    parser.add_argument("--password", default="mesa-lynx-octopus")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    asyncio.run(run_bot(args.host, args.username, args.password))
+async def main():
+    SERVER = "practice.uchicago.exchange:3333"
+    my_client = MyXchangeClient(SERVER, "uiuc", "mesa-lynx-octopus")
+    await my_client.start()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
