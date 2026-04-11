@@ -1403,7 +1403,7 @@ class Coordinator:
 class NewPM1Client(XChangeClient):
     def __init__(self, host: str, username: str, password: str, cfg: Optional[BotConfig] = None):
         self.cfg = cfg or load_config()
-        super().__init__(host, username, password, silent=True, symbols=list(self.cfg.rate_symbols))
+        super().__init__(host, username, password, silent=False, symbols=list(self.cfg.rate_symbols))
         self.state = MarketState()
         self.current_tick: Optional[int] = None
         self._decision_lock = asyncio.Lock()
