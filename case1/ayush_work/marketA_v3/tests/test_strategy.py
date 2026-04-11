@@ -6,11 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from case1.ayush_work.marketA_v3.A_strategy import AStrategy
 from case1.ayush_work.marketA_v3.config import LoggerConfig, StrategyConfig
 from case1.ayush_work.marketA_v3.core.graphs import generate_run_graphs
 from case1.ayush_work.marketA_v3.core.logger import RunLogger
 from case1.ayush_work.marketA_v3.core.types import BookLevel, BookSnapshot, NewsEvent, StrategySnapshot
+from case1.ayush_work.marketA_v3.market_A_strategy import AStrategy
 
 
 def snapshot(
@@ -182,6 +182,43 @@ class StrategyTests(unittest.TestCase):
                 strategy.on_book(snapshot(now_ms=(4000 * offset) + 200 * sample_idx, bid=1099, ask=1101))
         self.assertEqual(strategy.structured_event_count, 3)
 
+    def test_new_structured_news_flattens_first_then_restarts_position_selection(self):
+        strategy = AStrategy(StrategyConfig(position_cap=40, max_absolute_position=40, shock_initial_clip=40))
+        strategy.trusted_multiplier = 1000.0
+        strategy.latest_earnings = 1.2
+        strategy.base_fair_value = 1200
+        strategy.fair_value = 1200
+        strategy.mode = "SHOCK"
+        strategy.active_signal_kind = "structured"
+        strategy.shock_target_inventory = 20
+        strategy.original_shock_target_inventory = 20
+        strategy.shock_direction = 1
+
+        flatten = strategy.on_news(
+            snapshot(now_ms=1_000, inventory=20, bid=1199, ask=1201),
+            NewsEvent(
+                now_ms=1_000,
+                tick=5,
+                kind="structured",
+                symbol="A",
+                structured_subtype="earnings",
+                asset="A",
+                value=0.8,
+                raw_payload={"kind": "structured"},
+            ),
+        )
+        self.assertEqual(flatten.mode, "UNWIND")
+        self.assertIsNotNone(flatten.desired_order)
+        self.assertEqual(flatten.desired_order.side, "SELL")
+        self.assertEqual(flatten.desired_order.qty, 20)
+
+        restart = strategy.on_book(snapshot(now_ms=1_200, inventory=0, bid=999, ask=1001))
+        self.assertEqual(restart.mode, "SHOCK")
+        self.assertIsNotNone(restart.desired_order)
+        self.assertEqual(restart.desired_order.side, "SELL")
+        self.assertLess(restart.target_inventory, 0)
+        self.assertEqual(strategy.active_signal_kind, "structured")
+
     def test_unwind_waits_for_equilibrium(self):
         strategy = AStrategy(StrategyConfig())
         for idx in range(10):
@@ -275,6 +312,41 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(decision.desired_order.side, "BUY")
         self.assertEqual(decision.desired_order.qty, 40)
         self.assertEqual(decision.target_inventory, 0)
+
+    def test_max_hold_time_forces_full_flatten_even_without_equilibrium(self):
+        strategy = AStrategy(
+            StrategyConfig(
+                position_cap=40,
+                max_absolute_position=40,
+                shock_initial_clip=40,
+                equilibrium_hold_ms=30_000,
+                equilibrium_min_samples=3,
+                equilibrium_min_elapsed_ms=30_000,
+                shock_max_hold_ms=12_500,
+                shock_decay_start_ms=30_000,
+            )
+        )
+        for idx in range(10):
+            strategy.on_book(snapshot(now_ms=idx * 200, bid=999, ask=1001))
+        strategy.on_news(
+            snapshot(now_ms=2200, bid=999, ask=1001),
+            NewsEvent(
+                now_ms=2200,
+                tick=11,
+                kind="structured",
+                symbol="A",
+                structured_subtype="earnings",
+                asset="A",
+                value=1.20,
+                raw_payload={"kind": "structured"},
+            ),
+        )
+        decision = strategy.on_book(snapshot(now_ms=14_700, inventory=20, bid=1118, ask=1122))
+        self.assertEqual(decision.mode, "UNWIND")
+        self.assertEqual(decision.target_inventory, 0)
+        self.assertIsNotNone(decision.desired_order)
+        self.assertEqual(decision.desired_order.side, "SELL")
+        self.assertEqual(decision.desired_order.qty, 20)
 
     def test_large_shock_inventory_decays_before_equilibrium(self):
         strategy = AStrategy(

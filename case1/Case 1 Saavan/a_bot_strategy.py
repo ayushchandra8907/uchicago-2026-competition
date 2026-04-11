@@ -7,14 +7,17 @@ import time
 from typing import Iterable, Literal
 
 from a_bot_config import AConfig, RiskConfig
+from a_news_sentiment import SentimentResult, score_a_unstructured_headline
 
 
 SideName = Literal["BUY", "SELL"]
-OverlayName = Literal["earnings", "mm"]
+OverlayName = Literal["earnings", "news", "mm"]
 ModeName = Literal[
     "OPENING_MICRO_MM",
     "POST_EARNINGS_SHOCK",
+    "POST_NEWS_SHOCK",
     "MULTIPLIER_DISCOVERY",
+    "NEWS_CONFIRMATION",
     "NEWS_CAUTIOUS_MM",
     "UNWIND",
     "STEADY_MM",
@@ -194,8 +197,24 @@ class NewsReaction:
     fair_value_updated: bool
     note: str | None = None
     earnings_value: float | None = None
+    news_sentiment_score: float | None = None
+    news_sentiment_bucket: str | None = None
     old_fair_value: int | None = None
     new_fair_value: int | None = None
+    base_fair_value: int | None = None
+    news_fair_value: int | None = None
+    news_target_inventory: int | None = None
+    pending_news_target_inventory: int | None = None
+    news_confirmation_state: str | None = None
+    active_news_signal_id: str | None = None
+    news_matched_phrases: tuple[str, ...] = ()
+    news_matched_unigrams: tuple[str, ...] = ()
+    news_matched_bigrams: tuple[str, ...] = ()
+    unknown_candidate_phrases: tuple[str, ...] = ()
+    unknown_candidate_unigrams: tuple[str, ...] = ()
+    unknown_candidate_bigrams: tuple[str, ...] = ()
+    resolved_news_text: str | None = None
+    resolved_news_text_source: str | None = None
     shock_direction: int = 0
     shock_threshold: int | None = None
     tick: int | None = None
@@ -1397,6 +1416,7 @@ class MarketAStrategy:
         self.order_manager = OrderManager(symbol="A", risk=risk)
         self.inventory = 0
         self.earnings_position = 0
+        self.news_position = 0
         self.mm_position = 0
         self.book = BookSnapshot()
         self.mode: ModeName = "OPENING_MICRO_MM"
@@ -1416,12 +1436,53 @@ class MarketAStrategy:
         self.recovery_active = False
         self.unwind_active = False
         self.unwind_aggressive_active = False
+        self.active_signal_kind: Literal["earnings", "news"] | None = None
+        self.base_fair_value: int | None = self.valuation.fair_value
+        self.news_fair_value: int | None = None
+        self.pe_frozen = False
         self.earnings_event_seq = 0
         self.news_event_seq = 0
         self.last_relevant_a_earnings_ms: int | None = None
         self.active_earnings_cycle_id: str | None = None
         self.current_earnings_signal_id: str | None = None
+        self.active_news_signal_id: str | None = None
         self.current_news_signal_id: str | None = None
+        self.pending_news_signal_id: str | None = None
+        self.pending_news_score: float | None = None
+        self.pending_news_bucket: str | None = None
+        self.pending_news_base_fair: int | None = None
+        self.pending_news_fair: int | None = None
+        self.pending_news_target_inventory: int | None = None
+        self.pending_news_direction = 0
+        self.pending_news_reference_mid: float | None = None
+        self.pending_news_reference_bid: int | None = None
+        self.pending_news_reference_ask: int | None = None
+        self.pending_news_reference_spread: int | None = None
+        self.news_confirmation_deadline_ms: int | None = None
+        self.news_confirmation_state = "inactive"
+        self.news_started_ms: int | None = None
+        self.news_target_inventory = 0
+        self.original_news_target_inventory = 0
+        self.news_peak_inventory_abs = 0
+        self.news_reference_mid: float | None = None
+        self.news_initial_edge = 0.0
+        self.news_equilibrium_reached_ms: int | None = None
+        self.news_unwind_started_ms: int | None = None
+        self.news_overshoot_stage_index = 0
+        self.news_overshoot_trimmed_qty_total = 0
+        self.news_overshoot_active = False
+        self.news_overshoot_trigger_ticks: int | None = None
+        self.news_overshoot_crossed_fair_ms: int | None = None
+        self.news_decay_steps_applied = 0
+        self.news_decay_trimmed_qty_total = 0
+        self.news_sentiment_score: float | None = None
+        self.news_sentiment_bucket: str | None = None
+        self.news_matched_phrases: tuple[str, ...] = ()
+        self.news_matched_unigrams: tuple[str, ...] = ()
+        self.news_matched_bigrams: tuple[str, ...] = ()
+        self.unknown_candidate_phrases: tuple[str, ...] = ()
+        self.unknown_candidate_unigrams: tuple[str, ...] = ()
+        self.unknown_candidate_bigrams: tuple[str, ...] = ()
 
         for order in restored_orders:
             self.order_manager.restore_order(order)
@@ -1431,6 +1492,8 @@ class MarketAStrategy:
 
     @property
     def fair_value(self) -> int | None:
+        if self.news_fair_value is not None and self.active_signal_kind == "news":
+            return self.news_fair_value
         return self.valuation.fair_value
 
     @property
@@ -1452,8 +1515,13 @@ class MarketAStrategy:
     def set_inventory(self, inventory: int) -> None:
         inventory = int(inventory)
         self.inventory = inventory
-        if self._earnings_cycle_owns_inventory():
+        if self._news_cycle_owns_inventory():
+            self.news_position = inventory
+            self.earnings_position = 0
+            self.mm_position = 0
+        elif self._earnings_cycle_owns_inventory():
             self.earnings_position = inventory
+            self.news_position = 0
             self.mm_position = 0
         elif (
             abs(inventory) >= self.a_config.unwind_entry_position
@@ -1462,10 +1530,12 @@ class MarketAStrategy:
             or self.mode in {"POST_EARNINGS_SHOCK", "UNWIND", "MULTIPLIER_DISCOVERY"}
         ):
             self.earnings_position = inventory
+            self.news_position = 0
             self.mm_position = 0
         else:
             self.mm_position = inventory
             self.earnings_position = 0
+            self.news_position = 0
         self._ensure_position_invariant()
         self._refresh_unwind_state()
         self._maybe_release_earnings_cycle(self._now_ms())
@@ -1479,13 +1549,20 @@ class MarketAStrategy:
             self._refresh_unwind_state()
             self._maybe_release_earnings_cycle(self._now_ms())
             return
-        if self._earnings_cycle_owns_inventory():
+        if self._news_cycle_owns_inventory():
+            self.news_position = inventory
+            self.earnings_position = 0
+            self.mm_position = 0
+        elif self._earnings_cycle_owns_inventory():
             self.earnings_position = inventory
+            self.news_position = 0
             self.mm_position = 0
         else:
             preferred_overlay = self._preferred_overlay_for_inventory_delta(inventory, delta)
             if preferred_overlay == "earnings":
                 self.earnings_position += delta
+            elif preferred_overlay == "news":
+                self.news_position += delta
             else:
                 self.mm_position += delta
         self._ensure_position_invariant()
@@ -1493,7 +1570,11 @@ class MarketAStrategy:
         self._maybe_release_earnings_cycle(self._now_ms())
 
     def overlay_position(self, overlay: OverlayName) -> int:
-        return self.earnings_position if overlay == "earnings" else self.mm_position
+        if overlay == "earnings":
+            return self.earnings_position
+        if overlay == "news":
+            return self.news_position
+        return self.mm_position
 
     def overlay_budgets(self, mode: ModeName | None = None) -> tuple[int, int, bool]:
         active_mode = self.mode if mode is None else mode
@@ -1537,8 +1618,360 @@ class MarketAStrategy:
             return False
         self.book = BookSnapshot.from_order_book(book, depth_levels=self.book_depth_levels)
         self._advance_discovery(now_ms)
+        self._advance_news_cycle(now_ms)
         self.mode = self._determine_mode(now_ms)
         return True
+
+    def _base_fair_for_unstructured(self) -> int | None:
+        if self.active_signal_kind != "news" and self.base_fair_value is not None:
+            return int(self.base_fair_value)
+        if self.valuation.fair_value is not None:
+            return int(self.valuation.fair_value)
+        if self.trusted_multiplier is not None and self.last_earnings_value is not None:
+            return self.valuation.fair_from_earnings(self.last_earnings_value, multiplier=self.trusted_multiplier)
+        if self.book.mid is not None:
+            return round(self.book.mid)
+        return None
+
+    @staticmethod
+    def _sentiment_sign(value: float | int | None) -> int:
+        if value is None:
+            return 0
+        if value > 0:
+            return 1
+        if value < 0:
+            return -1
+        return 0
+
+    def _scaled_news_target(self, edge: float, *, fair_change_ticks: float | None = None) -> int:
+        edge_abs = abs(edge)
+        min_edge = max(1, self.a_config.shock_take_min_edge)
+        if edge_abs < min_edge:
+            return 0
+        scaled_cap = max(0, self.a_config.total_position_limit)
+        confidence_span = max(1, 80 - min_edge)
+        confidence = min(1.0, max(0.0, (edge_abs - min_edge) / confidence_span))
+        base_target = max(4, round(scaled_cap * confidence))
+        scaled = max(base_target, round(edge_abs * 1.20))
+        target_abs = min(scaled_cap, scaled)
+
+        if fair_change_ticks is not None:
+            fair_change_abs = abs(fair_change_ticks)
+            change_confidence_span = max(1, 40 - min_edge)
+            change_confidence = min(1.0, max(0.0, fair_change_abs - min_edge) / change_confidence_span)
+            change_base_target = max(4, round(scaled_cap * change_confidence))
+            change_scaled_target = max(change_base_target, round(fair_change_abs * 0.75))
+            target_abs = max(target_abs, min(scaled_cap, change_scaled_target))
+
+        return self._sentiment_sign(edge) * target_abs
+
+    def _news_offset_ticks(self, score: float, bucket: str) -> int:
+        absolute = abs(score)
+        if absolute >= 5.0:
+            return self.a_config.news_very_extreme_offset_ticks
+        if bucket == "extreme":
+            return self.a_config.news_extreme_offset_ticks
+        if bucket == "strong":
+            return self.a_config.news_strong_offset_ticks
+        if bucket == "medium":
+            return self.a_config.news_medium_offset_ticks
+        if bucket == "light":
+            return self.a_config.news_light_offset_ticks
+        return 0
+
+    def _news_position_cap(self, score: float, bucket: str) -> int:
+        absolute = abs(score)
+        if absolute >= 5.0:
+            return self.a_config.news_very_extreme_position
+        if bucket == "extreme":
+            return self.a_config.news_extreme_position
+        if bucket == "strong":
+            return self.a_config.news_strong_position
+        if bucket == "medium":
+            return self.a_config.news_medium_position
+        if bucket == "light":
+            return self.a_config.news_light_position
+        return 0
+
+    def _news_target_inventory(self, *, news_fair: int, score: float, bucket: str) -> int:
+        direction = self._sentiment_sign(score)
+        if self.book.mid is None or direction == 0:
+            return 0
+        offset_ticks = float(self._news_offset_ticks(score, bucket))
+        news_edge_abs = abs(float(news_fair) - float(self.book.mid))
+        effective_edge = max(news_edge_abs, offset_ticks)
+        raw_target = abs(self._scaled_news_target(direction * effective_edge, fair_change_ticks=offset_ticks))
+        bucket_cap = self._news_position_cap(score, bucket)
+        capped_abs = min(raw_target, bucket_cap, self.a_config.total_position_limit)
+        if capped_abs <= self.a_config.news_zero_position_threshold:
+            return 0
+        return direction * capped_abs
+
+    def _clear_pending_news_state(self) -> None:
+        self.pending_news_signal_id = None
+        self.pending_news_score = None
+        self.pending_news_bucket = None
+        self.pending_news_base_fair = None
+        self.pending_news_fair = None
+        self.pending_news_target_inventory = None
+        self.pending_news_direction = 0
+        self.pending_news_reference_mid = None
+        self.pending_news_reference_bid = None
+        self.pending_news_reference_ask = None
+        self.pending_news_reference_spread = None
+        self.news_confirmation_deadline_ms = None
+        if self.news_confirmation_state != "active":
+            self.news_confirmation_state = "inactive"
+
+    def _clear_active_news_state(self, *, reset_caution: bool = False) -> None:
+        if self.active_signal_kind == "news" and self.base_fair_value is not None:
+            self.valuation.fair_value = self.base_fair_value
+        if self.active_signal_kind == "news":
+            self.active_signal_kind = None
+        self.news_fair_value = None
+        self.active_news_signal_id = None
+        self.current_news_signal_id = None
+        self.news_started_ms = None
+        self.news_target_inventory = 0
+        self.original_news_target_inventory = 0
+        self.news_peak_inventory_abs = 0
+        self.news_reference_mid = None
+        self.news_initial_edge = 0.0
+        self.news_equilibrium_reached_ms = None
+        self.news_unwind_started_ms = None
+        self.news_overshoot_stage_index = 0
+        self.news_overshoot_trimmed_qty_total = 0
+        self.news_overshoot_active = False
+        self.news_overshoot_trigger_ticks = None
+        self.news_overshoot_crossed_fair_ms = None
+        self.news_decay_steps_applied = 0
+        self.news_decay_trimmed_qty_total = 0
+        self.news_position = 0 if self.inventory == 0 else self.news_position
+        if reset_caution:
+            self.news_caution_until_ms = 0
+
+    def _record_news_sentiment(self, sentiment: SentimentResult) -> None:
+        self.news_sentiment_score = sentiment.score
+        self.news_sentiment_bucket = sentiment.bucket
+        self.news_matched_phrases = sentiment.matched_phrases
+        self.news_matched_unigrams = sentiment.matched_unigrams
+        self.news_matched_bigrams = sentiment.matched_bigrams
+        self.unknown_candidate_phrases = sentiment.unknown_candidate_phrases
+        self.unknown_candidate_unigrams = sentiment.unknown_candidate_unigrams
+        self.unknown_candidate_bigrams = sentiment.unknown_candidate_bigrams
+
+    @staticmethod
+    def _extract_unstructured_news_text(news_release: dict) -> tuple[str, str]:
+        new_data = news_release.get("new_data") or {}
+        candidates = (
+            ("new_data.content", new_data.get("content")),
+            ("raw_content", news_release.get("raw_content")),
+            ("content", news_release.get("content")),
+            ("headline", news_release.get("headline")),
+            ("text", news_release.get("text")),
+        )
+        for source, raw_value in candidates:
+            if raw_value is None:
+                continue
+            text = str(raw_value).strip()
+            if text:
+                return text, source
+        return "", "missing"
+
+    def _handle_unstructured_a_news(self, news_release: dict, now_ms: int) -> NewsReaction:
+        self.news_event_seq += 1
+        signal_id = f"a_news_{self.news_event_seq}"
+        self.current_news_signal_id = signal_id
+        self.pending_news_signal_id = signal_id
+        self.news_caution_until_ms = max(self.news_caution_until_ms, now_ms + self.a_config.news_caution_duration_ms)
+        if self.discovery_window is not None and self.discovery_window.invalidated_reason is None:
+            self.discovery_window.invalidated_reason = (
+                "calibration contaminated because unstructured A news arrived before the new multiplier locked"
+            )
+        if self.a_config.freeze_multiplier_after_unstructured_news:
+            self.pe_frozen = True
+
+        headline_text, headline_text_source = self._extract_unstructured_news_text(news_release)
+        sentiment = score_a_unstructured_headline(headline_text)
+        self._record_news_sentiment(sentiment)
+        base_fair = self._base_fair_for_unstructured()
+        news_fair = None if base_fair is None else base_fair + (self._news_offset_ticks(sentiment.score, sentiment.bucket) * sentiment.direction)
+        target_inventory = 0 if news_fair is None else self._news_target_inventory(news_fair=news_fair, score=sentiment.score, bucket=sentiment.bucket)
+
+        self.pending_news_score = sentiment.score
+        self.pending_news_bucket = sentiment.bucket
+        self.pending_news_base_fair = base_fair
+        self.pending_news_fair = news_fair
+        self.pending_news_target_inventory = target_inventory
+        self.pending_news_direction = self._sentiment_sign(target_inventory)
+        self.pending_news_reference_mid = self.book.mid
+        self.pending_news_reference_bid = None if self.book.best_bid is None else self.book.best_bid.px
+        self.pending_news_reference_ask = None if self.book.best_ask is None else self.book.best_ask.px
+        self.pending_news_reference_spread = self.book.spread
+
+        if base_fair is None:
+            self.news_confirmation_state = "caution"
+            return NewsReaction(
+                relevant=True,
+                fair_value_updated=False,
+                note="Detected A-tagged unstructured news, but there is no clean base fair yet; staying defensive.",
+                tick=news_release.get("tick"),
+                news_sentiment_score=sentiment.score,
+                news_sentiment_bucket=sentiment.bucket,
+                base_fair_value=base_fair,
+                news_fair_value=news_fair,
+                pending_news_target_inventory=target_inventory,
+                news_confirmation_state=self.news_confirmation_state,
+                active_news_signal_id=signal_id,
+                news_matched_phrases=sentiment.matched_phrases,
+                news_matched_unigrams=sentiment.matched_unigrams,
+                news_matched_bigrams=sentiment.matched_bigrams,
+                unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
+                unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
+                unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+                resolved_news_text=headline_text,
+                resolved_news_text_source=headline_text_source,
+            )
+
+        if not sentiment.matched_phrases or sentiment.direction == 0 or target_inventory == 0:
+            self.news_confirmation_state = "caution"
+            return NewsReaction(
+                relevant=True,
+                fair_value_updated=False,
+                note="Detected ambiguous or weak A-tagged unstructured news; using defensive caution instead of directional trading.",
+                tick=news_release.get("tick"),
+                news_sentiment_score=sentiment.score,
+                news_sentiment_bucket=sentiment.bucket,
+                base_fair_value=base_fair,
+                news_fair_value=news_fair,
+                pending_news_target_inventory=target_inventory,
+                news_confirmation_state=self.news_confirmation_state,
+                active_news_signal_id=signal_id,
+                news_matched_phrases=sentiment.matched_phrases,
+                news_matched_unigrams=sentiment.matched_unigrams,
+                news_matched_bigrams=sentiment.matched_bigrams,
+                unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
+                unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
+                unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+                resolved_news_text=headline_text,
+                resolved_news_text_source=headline_text_source,
+            )
+
+        immediate = sentiment.bucket in {"strong", "extreme"} or abs(sentiment.score) >= 5.0
+        if immediate:
+            self._activate_pending_unstructured_news(now_ms)
+            return NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                note="Detected tradable A-tagged unstructured news; activating directional news shock immediately.",
+                tick=news_release.get("tick"),
+                news_sentiment_score=sentiment.score,
+                news_sentiment_bucket=sentiment.bucket,
+                old_fair_value=base_fair,
+                new_fair_value=news_fair,
+                base_fair_value=base_fair,
+                news_fair_value=news_fair,
+                pending_news_target_inventory=target_inventory,
+                news_confirmation_state=self.news_confirmation_state,
+                active_news_signal_id=self.active_news_signal_id,
+                news_matched_phrases=sentiment.matched_phrases,
+                news_matched_unigrams=sentiment.matched_unigrams,
+                news_matched_bigrams=sentiment.matched_bigrams,
+                unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
+                unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
+                unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+                resolved_news_text=headline_text,
+                resolved_news_text_source=headline_text_source,
+            )
+
+        self.news_confirmation_deadline_ms = now_ms + self.a_config.news_confirmation_timeout_ms
+        self.news_confirmation_state = "pending"
+        return NewsReaction(
+            relevant=True,
+            fair_value_updated=False,
+            note="Detected medium/light A-tagged unstructured news; waiting for confirmation before taking inventory.",
+            tick=news_release.get("tick"),
+            news_sentiment_score=sentiment.score,
+            news_sentiment_bucket=sentiment.bucket,
+            base_fair_value=base_fair,
+            news_fair_value=news_fair,
+            pending_news_target_inventory=target_inventory,
+            news_confirmation_state=self.news_confirmation_state,
+            active_news_signal_id=signal_id,
+            news_matched_phrases=sentiment.matched_phrases,
+            news_matched_unigrams=sentiment.matched_unigrams,
+            news_matched_bigrams=sentiment.matched_bigrams,
+            unknown_candidate_phrases=sentiment.unknown_candidate_phrases,
+            unknown_candidate_unigrams=sentiment.unknown_candidate_unigrams,
+            unknown_candidate_bigrams=sentiment.unknown_candidate_bigrams,
+            resolved_news_text=headline_text,
+            resolved_news_text_source=headline_text_source,
+        )
+
+    def _activate_pending_unstructured_news(self, now_ms: int) -> None:
+        if self.pending_news_signal_id is None or self.pending_news_fair is None or self.pending_news_target_inventory is None:
+            return
+        self.active_signal_kind = "news"
+        self.active_news_signal_id = self.pending_news_signal_id
+        self.current_news_signal_id = self.pending_news_signal_id
+        self.active_earnings_cycle_id = None
+        self.current_earnings_signal_id = None
+        self.news_position = self.inventory
+        self.earnings_position = 0
+        self.mm_position = 0
+        self.base_fair_value = self.pending_news_base_fair
+        self.news_fair_value = self.pending_news_fair
+        self.valuation.fair_value = self.pending_news_fair
+        self.news_started_ms = now_ms
+        self.news_target_inventory = self.pending_news_target_inventory
+        self.original_news_target_inventory = self.pending_news_target_inventory
+        self.news_peak_inventory_abs = abs(self.inventory) if self._sentiment_sign(self.inventory) == self._sentiment_sign(self.pending_news_target_inventory) else 0
+        self.news_reference_mid = self.book.mid if self.book.mid is not None else float(self.pending_news_fair)
+        self.news_initial_edge = float(self.pending_news_fair) - float(self.news_reference_mid or self.pending_news_fair)
+        self.news_equilibrium_reached_ms = None
+        self.news_unwind_started_ms = None
+        self.news_overshoot_stage_index = 0
+        self.news_overshoot_trimmed_qty_total = 0
+        self.news_overshoot_active = False
+        self.news_overshoot_trigger_ticks = None
+        self.news_overshoot_crossed_fair_ms = None
+        self.news_decay_steps_applied = 0
+        self.news_decay_trimmed_qty_total = 0
+        self.news_confirmation_state = "active"
+        self._clear_pending_news_state()
+
+    def _news_confirmation_satisfied(self) -> bool:
+        if self.pending_news_direction == 0 or self.book.mid is None or self.pending_news_reference_mid is None:
+            return False
+        move = self.pending_news_direction * (float(self.book.mid) - float(self.pending_news_reference_mid))
+        if move >= self.a_config.news_confirmation_move_ticks:
+            return True
+
+        spread = max(1, int(self.pending_news_reference_spread or self.book.spread or 1))
+        if self.pending_news_direction > 0:
+            bid_confirm = (
+                self.pending_news_reference_bid is not None
+                and self.book.best_bid is not None
+                and self.book.best_bid.px >= self.pending_news_reference_bid + spread
+            )
+            ask_confirm = (
+                self.pending_news_reference_ask is not None
+                and self.book.best_ask is not None
+                and self.book.best_ask.px >= self.pending_news_reference_ask + spread
+            )
+            return bid_confirm or ask_confirm
+
+        ask_confirm = (
+            self.pending_news_reference_ask is not None
+            and self.book.best_ask is not None
+            and self.book.best_ask.px <= self.pending_news_reference_ask - spread
+        )
+        bid_confirm = (
+            self.pending_news_reference_bid is not None
+            and self.book.best_bid is not None
+            and self.book.best_bid.px <= self.pending_news_reference_bid - spread
+        )
+        return ask_confirm or bid_confirm
 
     def on_news(self, news_release: dict, now_ms: int) -> NewsReaction:
         tick = news_release.get("tick")
@@ -1546,44 +1979,39 @@ class MarketAStrategy:
             self.last_news_tick = tick
 
         if self._is_a_unstructured_news(news_release):
-            self.news_event_seq += 1
-            self.current_news_signal_id = f"a_news_{self.news_event_seq}"
-            self.news_caution_until_ms = max(
-                self.news_caution_until_ms,
-                now_ms + self.a_config.news_caution_duration_ms,
-            )
-            if self.discovery_window is not None and self.discovery_window.invalidated_reason is None:
-                self.discovery_window.invalidated_reason = (
-                    "calibration contaminated because unstructured A news arrived before the new multiplier locked"
-                )
+            reaction = self._handle_unstructured_a_news(news_release, now_ms)
             self.mode = self._determine_mode(now_ms)
-            return NewsReaction(
-                relevant=True,
-                fair_value_updated=False,
-                note="Detected unstructured A news; switching into cautious quoting for the configured decay window.",
-                tick=tick if isinstance(tick, int) else None,
-            )
+            return reaction
 
         if not self._handles_a_earnings(news_release):
             self.mode = self._determine_mode(now_ms)
             return NewsReaction(relevant=False, fair_value_updated=False, tick=tick if isinstance(tick, int) else None)
 
         earnings_value = float(news_release["new_data"]["value"])
+        self._clear_pending_news_state()
+        self._clear_active_news_state(reset_caution=True)
         self.earnings_event_seq += 1
         self.current_earnings_signal_id = f"a_eps_{self.earnings_event_seq}"
         self.active_earnings_cycle_id = self.current_earnings_signal_id
+        self.active_signal_kind = "earnings"
         self.last_relevant_a_earnings_ms = int(now_ms)
         self.earnings_position = self.inventory
+        self.news_position = 0
         self.mm_position = 0
         old_fair, new_fair = self.valuation.on_structured_earnings(earnings_value)
         self.news_caution_until_ms = 0
-        self.discovery_window = DiscoveryWindow(
-            started_ms=now_ms,
-            min_lock_ms=now_ms + self.a_config.calibration_min_delay_ms,
-            max_lock_ms=now_ms + self.a_config.calibration_max_delay_ms,
-            next_sample_ms=now_ms + self.a_config.calibration_min_delay_ms,
-            earnings_value=earnings_value,
-        )
+        self.current_news_signal_id = None
+        self.base_fair_value = new_fair if new_fair is not None else self.valuation.fair_value
+        if not self.pe_frozen:
+            self.discovery_window = DiscoveryWindow(
+                started_ms=now_ms,
+                min_lock_ms=now_ms + self.a_config.calibration_min_delay_ms,
+                max_lock_ms=now_ms + self.a_config.calibration_max_delay_ms,
+                next_sample_ms=now_ms + self.a_config.calibration_min_delay_ms,
+                earnings_value=earnings_value,
+            )
+        else:
+            self.discovery_window = None
 
         if new_fair is not None:
             reference_fair = old_fair
@@ -1620,6 +2048,7 @@ class MarketAStrategy:
             earnings_value=earnings_value,
             old_fair_value=old_fair,
             new_fair_value=new_fair,
+            base_fair_value=self.base_fair_value,
             shock_direction=self.shock_direction,
             shock_threshold=self.shock_threshold,
             tick=tick if isinstance(tick, int) else None,
@@ -1631,16 +2060,24 @@ class MarketAStrategy:
             return None
         signed_qty = qty if order.side == "BUY" else -qty
         self.inventory += signed_qty
-        if self._earnings_cycle_owns_inventory(now_ms=self._now_ms()):
+        if self._news_cycle_owns_inventory(now_ms=self._now_ms()):
+            self.news_position = self.inventory
+            self.earnings_position = 0
+            self.mm_position = 0
+        elif self._earnings_cycle_owns_inventory(now_ms=self._now_ms()):
             self.earnings_position = self.inventory
+            self.news_position = 0
             self.mm_position = 0
         elif order.overlay == "earnings":
             self.earnings_position += signed_qty
+        elif order.overlay == "news":
+            self.news_position += signed_qty
         else:
             self.mm_position += signed_qty
         self._ensure_position_invariant()
         self._refresh_unwind_state()
         self._maybe_release_earnings_cycle(self._now_ms())
+        self._maybe_release_news_cycle(self._now_ms())
         self.last_trade_px = int(price)
         self.last_trade_qty = int(qty)
         self.last_trade_ms = self._now_ms()
@@ -1689,7 +2126,9 @@ class MarketAStrategy:
         if now_ms is None:
             now_ms = self._now_ms()
         self._advance_discovery(now_ms)
+        self._advance_news_cycle(now_ms)
         self._maybe_release_earnings_cycle(now_ms)
+        self._maybe_release_news_cycle(now_ms)
         self.mode = self._determine_mode(now_ms)
         if self.recovery_active:
             return QuotePlan(
@@ -1701,9 +2140,10 @@ class MarketAStrategy:
                 reason="Waiting for recovered A orders to be cancelled.",
             )
 
+        news_plan = self._compute_news_overlay_plan(self.mode, now_ms)
         earnings_plan = self._compute_earnings_overlay_plan(self.mode, now_ms)
         mm_plan = self._compute_mm_overlay_plan(self.mode, now_ms)
-        return self._merge_overlay_plans(self.mode, earnings_plan, mm_plan)
+        return self._merge_overlay_plans(self.mode, news_plan, earnings_plan, mm_plan)
 
     def _empty_overlay_plan(self, overlay: OverlayName, reason: str) -> OverlayPlan:
         return OverlayPlan(overlay=overlay, bid=None, ask=None, aggressive_actions=(), reason=reason)
@@ -1762,21 +2202,15 @@ class MarketAStrategy:
             )
 
         if mode == "NEWS_CAUTIOUS_MM":
-            plan = self.quote_engine._cautious_quotes(
+            plan = self._news_caution_reduce_only_plan(
                 mode,
-                self.valuation.fair_value,
                 mm_inventory,
-                self.book,
-                mm_buy_exposure,
-                mm_sell_exposure,
-                overlay="mm",
-                max_position_override=min(self.a_config.news_caution_max_position, mm_budget),
-                quote_size_override=self.a_config.news_caution_quote_size,
-                half_spread_override=self.a_config.news_caution_half_spread_ticks,
+                allowed_buy=allowed_buy,
+                allowed_sell=allowed_sell,
             )
             return self._annotate_overlay_plan(
                 "mm",
-                self._clamp_overlay_plan("mm", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell),
+                plan,
             )
 
         if mode in {"STEADY_MM", "UNWIND"}:
@@ -1799,6 +2233,117 @@ class MarketAStrategy:
             )
 
         return self._empty_overlay_plan("mm", "MM overlay idle in earnings-handling mode.")
+
+    def _compute_news_overlay_plan(self, mode: ModeName, now_ms: int) -> OverlayPlan:
+        if mode not in {"NEWS_CONFIRMATION", "POST_NEWS_SHOCK"}:
+            return self._empty_overlay_plan("news", "news overlay idle outside tradable A-news modes")
+
+        news_inventory = self.news_position
+        news_buy_exposure, news_sell_exposure = self.overlay_exposures("news")
+        mode_cap = max(
+            0,
+            min(
+                self.a_config.total_position_limit,
+                self._news_position_cap(self.pending_news_score or self.news_sentiment_score or 0.0, self.pending_news_bucket or self.news_sentiment_bucket or "none")
+                if mode == "NEWS_CONFIRMATION"
+                else self._news_position_cap(self.news_sentiment_score or 0.0, self.news_sentiment_bucket or "none"),
+            )
+        )
+        allowed_buy, allowed_sell = self.overlay_allowed_size(
+            "news",
+            mode_cap=mode_cap or self.a_config.total_position_limit,
+            budget=self.a_config.total_position_limit,
+        )
+
+        if mode == "NEWS_CONFIRMATION":
+            if news_inventory == 0:
+                return self._empty_overlay_plan("news", "waiting for confirmation before directional A-news entry")
+            if self.valuation.fair_value is None and self.base_fair_value is None:
+                return self._empty_overlay_plan("news", "waiting for base fair while flattening into news confirmation")
+            confirmation_fair = self.pending_news_base_fair or self.base_fair_value or self.valuation.fair_value
+            if confirmation_fair is None:
+                return self._empty_overlay_plan("news", "waiting for base fair while flattening into news confirmation")
+            plan = self.quote_engine._unwind_quotes(
+                "NEWS_CONFIRMATION",
+                int(confirmation_fair),
+                news_inventory,
+                self.book,
+                news_buy_exposure,
+                news_sell_exposure,
+                aggressive_allowed=True,
+                overlay="news",
+                cap_override=self.a_config.total_position_limit,
+                quote_size_override=self.a_config.shock_quote_size,
+                aggressive_intent="news_takeover_flatten",
+                passive_intent="news_takeover_flatten",
+                passive_take_edge_override=self.a_config.news_medium_offset_ticks,
+            )
+            return self._annotate_overlay_plan(
+                "news",
+                self._clamp_overlay_plan("news", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell),
+            )
+
+        if self.news_fair_value is None:
+            return self._empty_overlay_plan("news", "waiting for an active A-news fair before trading")
+
+        target_inventory = self.news_target_inventory
+        direction = self._sentiment_sign(target_inventory or self.original_news_target_inventory or self.news_initial_edge)
+        threshold = max(
+            self.a_config.shock_take_min_edge,
+            round(
+                self.a_config.shock_take_fraction
+                * max(1.0, abs(float(self.news_fair_value) - float(self.base_fair_value or self.news_fair_value)))
+            ),
+        )
+
+        if target_inventory == 0 or (news_inventory != 0 and self._sentiment_sign(news_inventory) != self._sentiment_sign(target_inventory)):
+            plan = self.quote_engine._unwind_quotes(
+                "POST_NEWS_SHOCK",
+                self.news_fair_value,
+                news_inventory,
+                self.book,
+                news_buy_exposure,
+                news_sell_exposure,
+                aggressive_allowed=True,
+                overlay="news",
+                cap_override=self.a_config.total_position_limit,
+                quote_size_override=self.a_config.shock_quote_size,
+                aggressive_intent="news_takeover_flatten" if target_inventory != 0 else "news_unwind",
+                passive_intent="news_takeover_flatten" if target_inventory != 0 else "news_unwind",
+                passive_take_edge_override=self.a_config.news_equilibrium_residual_edge_ticks,
+            )
+            return self._annotate_overlay_plan(
+                "news",
+                self._clamp_overlay_plan("news", plan, allowed_buy=allowed_buy, allowed_sell=allowed_sell),
+            )
+
+        plan = self.quote_engine._shock_quotes(
+            "POST_NEWS_SHOCK",
+            self.news_fair_value,
+            news_inventory,
+            self.book,
+            news_buy_exposure,
+            news_sell_exposure,
+            shock_direction=direction,
+            shock_threshold=threshold,
+            overlay="news",
+            cap_override=mode_cap or self.a_config.total_position_limit,
+            quote_size_override=self.a_config.shock_quote_size,
+        )
+        adjusted = OverlayPlan(
+            overlay="news",
+            bid=replace(plan.bid, intent="news_unwind") if plan.bid is not None else None,
+            ask=replace(plan.ask, intent="news_unwind") if plan.ask is not None else None,
+            aggressive_actions=tuple(
+                replace(action, intent="news_take", reason="A-news directional take through stale book")
+                for action in plan.aggressive_actions
+            ),
+            reason=plan.reason,
+        )
+        return self._annotate_overlay_plan(
+            "news",
+            self._clamp_overlay_plan("news", adjusted, allowed_buy=allowed_buy, allowed_sell=allowed_sell),
+        )
 
     def _compute_earnings_overlay_plan(self, mode: ModeName, now_ms: int) -> OverlayPlan:
         earnings_budget, _, _ = self.overlay_budgets(mode)
@@ -1915,9 +2460,20 @@ class MarketAStrategy:
         )
 
     def _strategy_tag_for_order(self, order: DesiredOrder, overlay: OverlayName) -> StrategyTag:
-        strategy_family = "a_earnings" if overlay == "earnings" else "a_market_making"
+        if overlay == "earnings":
+            strategy_family = "a_earnings"
+        elif overlay == "news":
+            strategy_family = "a_news"
+        else:
+            strategy_family = "a_market_making"
         pnl_owner = strategy_family
-        if order.intent == "post_earnings_shock_take":
+        if order.intent == "news_take":
+            action_class = "news_take"
+        elif order.intent == "news_unwind":
+            action_class = "news_unwind"
+        elif order.intent == "news_takeover_flatten":
+            action_class = "news_takeover_flatten"
+        elif order.intent == "post_earnings_shock_take":
             action_class = "shock_take"
         elif order.intent in {"post_earnings_shock_unwind", "unwind"}:
             action_class = "shock_unwind"
@@ -1930,7 +2486,10 @@ class MarketAStrategy:
         else:
             action_class = "market_making"
 
-        if overlay == "earnings" or self.mode in {"POST_EARNINGS_SHOCK", "MULTIPLIER_DISCOVERY", "UNWIND"}:
+        if overlay == "news" or self.mode in {"POST_NEWS_SHOCK", "NEWS_CONFIRMATION"}:
+            signal_id = self.active_news_signal_id or self.pending_news_signal_id or self.current_news_signal_id or f"a_news_pending_{self.news_event_seq}"
+            trade_group_id = signal_id
+        elif overlay == "earnings" or self.mode in {"POST_EARNINGS_SHOCK", "MULTIPLIER_DISCOVERY", "UNWIND"}:
             signal_id = self.current_earnings_signal_id or f"a_eps_pending_{self.earnings_event_seq}"
             trade_group_id = signal_id
         elif self.mode == "NEWS_CAUTIOUS_MM":
@@ -1950,18 +2509,29 @@ class MarketAStrategy:
             leg_role="single",
         )
 
-    def _merge_overlay_plans(self, mode: ModeName, earnings_plan: OverlayPlan, mm_plan: OverlayPlan) -> QuotePlan:
+    def _merge_overlay_plans(
+        self,
+        mode: ModeName,
+        news_plan: OverlayPlan,
+        earnings_plan: OverlayPlan,
+        mm_plan: OverlayPlan,
+    ) -> QuotePlan:
         aggressive_by_side: dict[SideName, DesiredOrder] = {}
-        for action in earnings_plan.aggressive_actions:
+        for action in news_plan.aggressive_actions:
             aggressive_by_side[action.side] = action
+        for action in earnings_plan.aggressive_actions:
+            aggressive_by_side.setdefault(action.side, action)
         for action in mm_plan.aggressive_actions:
             aggressive_by_side.setdefault(action.side, action)
 
         def choose_passive(side: SideName) -> DesiredOrder | None:
             if side in aggressive_by_side:
                 return None
+            news_order = news_plan.bid if side == "BUY" else news_plan.ask
             earnings_order = earnings_plan.bid if side == "BUY" else earnings_plan.ask
             mm_order = mm_plan.bid if side == "BUY" else mm_plan.ask
+            if news_order is not None:
+                return news_order
             if earnings_order is not None and self._order_reduces_position(side, self.earnings_position):
                 return earnings_order
             if mm_order is not None:
@@ -1975,7 +2545,7 @@ class MarketAStrategy:
             for side in ("BUY", "SELL")
             if (action := aggressive_by_side.get(side)) is not None
         )
-        reason_parts = [part for part in (earnings_plan.reason, mm_plan.reason) if part]
+        reason_parts = [part for part in (news_plan.reason, earnings_plan.reason, mm_plan.reason) if part]
         return QuotePlan(
             mode=mode,
             bid=bid,
@@ -1984,6 +2554,71 @@ class MarketAStrategy:
             observe_only=False,
             reason=" | ".join(reason_parts) if reason_parts else mode.lower(),
         )
+
+    def _news_caution_reduce_only_plan(
+        self,
+        mode: ModeName,
+        mm_inventory: int,
+        *,
+        allowed_buy: int,
+        allowed_sell: int,
+    ) -> OverlayPlan:
+        anchor = self.book.mid
+        if anchor is None and self.valuation.fair_value is not None:
+            anchor = float(self.valuation.fair_value)
+        if anchor is None:
+            return self._empty_overlay_plan("mm", "missing_news_caution_anchor")
+
+        quote_size = max(0, int(self.a_config.news_caution_quote_size))
+        half_spread_ticks = max(0, int(self.a_config.news_caution_half_spread_ticks))
+
+        if mm_inventory > 0 and allowed_sell > 0:
+            ask_px = int(ceil(anchor + half_spread_ticks))
+            if self.book.best_bid is not None:
+                ask_px = max(ask_px, self.book.best_bid.px + 1)
+            if self.book.best_ask is not None:
+                ask_px = max(ask_px, self.book.best_ask.px)
+            return OverlayPlan(
+                overlay="mm",
+                bid=None,
+                ask=self.quote_engine._desired(
+                    side="SELL",
+                    px=ask_px,
+                    qty=min(quote_size, allowed_sell),
+                    overlay="mm",
+                    aggressive=False,
+                    reason="reduce-only ask while unstructured A news inventory is still elevated",
+                    intent="news_cautious_mm",
+                    mode=mode,
+                ),
+                aggressive_actions=(),
+                reason="news_caution_reduce_only_long_mm",
+            )
+
+        if mm_inventory < 0 and allowed_buy > 0:
+            bid_px = int(floor(anchor - half_spread_ticks))
+            if self.book.best_ask is not None:
+                bid_px = min(bid_px, self.book.best_ask.px - 1)
+            if self.book.best_bid is not None:
+                bid_px = min(bid_px, self.book.best_bid.px)
+            return OverlayPlan(
+                overlay="mm",
+                bid=self.quote_engine._desired(
+                    side="BUY",
+                    px=bid_px,
+                    qty=min(quote_size, allowed_buy),
+                    overlay="mm",
+                    aggressive=False,
+                    reason="reduce-only bid while unstructured A news inventory is still elevated",
+                    intent="news_cautious_mm",
+                    mode=mode,
+                ),
+                ask=None,
+                aggressive_actions=(),
+                reason="news_caution_reduce_only_short_mm",
+            )
+
+        return self._empty_overlay_plan("mm", "news_caution_observe_only_flat_mm")
 
     def trace_state(self, now_ms: int) -> dict[str, object]:
         mode = self.mode
@@ -2004,11 +2639,21 @@ class MarketAStrategy:
             }
         earnings_budget, mm_budget, budget_shift_active = self.overlay_budgets(mode)
         earnings_buy_exposure, earnings_sell_exposure = self.overlay_exposures("earnings")
+        news_buy_exposure, news_sell_exposure = self.overlay_exposures("news")
         mm_buy_exposure, mm_sell_exposure = self.overlay_exposures("mm")
         earnings_allowed_buy, earnings_allowed_sell = self.overlay_allowed_size(
             "earnings",
             mode_cap=self._earnings_mode_cap(mode, now_ms),
             budget=earnings_budget,
+        )
+        news_allowed_buy, news_allowed_sell = self.overlay_allowed_size(
+            "news",
+            mode_cap=max(
+                0,
+                self._news_position_cap(self.pending_news_score or self.news_sentiment_score or 0.0, self.pending_news_bucket or self.news_sentiment_bucket or "none"),
+            )
+            or self.a_config.total_position_limit,
+            budget=self.a_config.total_position_limit,
         )
         mm_mode_cap = self.a_config.steady_max_position
         if mode == "OPENING_MICRO_MM":
@@ -2035,7 +2680,7 @@ class MarketAStrategy:
             "symbol": "A",
             "market_key": "A",
             "mode": mode,
-            "fair_value": self.valuation.fair_value,
+            "fair_value": self.fair_value,
             "trusted_multiplier": self.valuation.trusted_multiplier,
             "multiplier_confidence": self.valuation.multiplier_confidence,
             "latest_earnings": self.valuation.last_earnings_value,
@@ -2049,7 +2694,26 @@ class MarketAStrategy:
             "news_caution_remaining_ms": max(0, self.news_caution_until_ms - now_ms),
             "inventory": self.inventory,
             "earnings_position": self.earnings_position,
+            "news_position": self.news_position,
             "mm_position": self.mm_position,
+            "active_signal_kind": self.active_signal_kind,
+            "base_fair_value": self.base_fair_value,
+            "news_fair_value": self.news_fair_value,
+            "news_sentiment_score": self.news_sentiment_score,
+            "news_sentiment_bucket": self.news_sentiment_bucket,
+            "news_confirmation_state": self.news_confirmation_state,
+            "news_target_inventory": self.news_target_inventory,
+            "pending_news_target_inventory": self.pending_news_target_inventory,
+            "pending_news_signal_id": self.pending_news_signal_id,
+            "active_news_signal_id": self.active_news_signal_id,
+            "news_started_ms": self.news_started_ms,
+            "pe_frozen": self.pe_frozen,
+            "news_matched_phrases": list(self.news_matched_phrases),
+            "news_matched_unigrams": list(self.news_matched_unigrams),
+            "news_matched_bigrams": list(self.news_matched_bigrams),
+            "unknown_candidate_phrases": list(self.unknown_candidate_phrases),
+            "unknown_candidate_unigrams": list(self.unknown_candidate_unigrams),
+            "unknown_candidate_bigrams": list(self.unknown_candidate_bigrams),
             "earnings_budget": earnings_budget,
             "mm_budget": mm_budget,
             "budget_shift_active": budget_shift_active,
@@ -2068,6 +2732,12 @@ class MarketAStrategy:
                     "sell": earnings_sell_exposure,
                     "allowed_buy": earnings_allowed_buy,
                     "allowed_sell": earnings_allowed_sell,
+                },
+                "news": {
+                    "buy": news_buy_exposure,
+                    "sell": news_sell_exposure,
+                    "allowed_buy": news_allowed_buy,
+                    "allowed_sell": news_allowed_sell,
                 },
                 "mm": {
                     "buy": mm_buy_exposure,
@@ -2194,7 +2864,13 @@ class MarketAStrategy:
         if self._shock_active(now_ms):
             return "POST_EARNINGS_SHOCK"
 
-        if now_ms < self.news_caution_until_ms:
+        if self.news_confirmation_state == "pending" and self.pending_news_signal_id is not None:
+            return "NEWS_CONFIRMATION"
+
+        if self.active_signal_kind == "news":
+            return "POST_NEWS_SHOCK"
+
+        if self._news_caution_cleanup_active(now_ms):
             return "NEWS_CAUTIOUS_MM"
 
         if self.discovery_window is not None:
@@ -2209,12 +2885,28 @@ class MarketAStrategy:
 
         return "STEADY_MM"
 
+    def _news_caution_cleanup_active(self, now_ms: int) -> bool:
+        if self.news_confirmation_state == "pending" or self.active_signal_kind == "news":
+            return False
+        if self.current_news_signal_id is None:
+            return False
+        if now_ms < self.news_caution_until_ms:
+            return True
+        if abs(self.mm_position) > 1:
+            return True
+        self.current_news_signal_id = None
+        return False
+
     def _shock_active(self, now_ms: int) -> bool:
         if self.shock_started_ms is None or self.shock_target_fair is None:
             return False
         return now_ms - self.shock_started_ms < self.a_config.shock_window_ms
 
     def _refresh_unwind_state(self) -> None:
+        if self.active_signal_kind == "news" or self.news_confirmation_state == "pending":
+            self.unwind_active = False
+            self.unwind_aggressive_active = False
+            return
         abs_inventory = abs(self.inventory if self._earnings_cycle_owns_inventory() else self.earnings_position)
         if self.unwind_active:
             if abs_inventory <= self.a_config.earnings_unwind_passive_exit:
@@ -2269,10 +2961,14 @@ class MarketAStrategy:
         return False
 
     def _preferred_overlay_for_inventory_delta(self, inventory: int, delta: int) -> OverlayName:
+        if self._news_cycle_owns_inventory():
+            return "news"
         if self._earnings_cycle_owns_inventory():
             return "earnings"
         if self.unwind_active or self.mode in {"POST_EARNINGS_SHOCK", "UNWIND", "MULTIPLIER_DISCOVERY"}:
             return "earnings"
+        if abs(self.news_position) > max(abs(self.earnings_position), abs(self.mm_position)):
+            return "news"
         if abs(self.earnings_position) > abs(self.mm_position):
             return "earnings"
         if abs(inventory) >= self.a_config.unwind_entry_position or abs(delta) >= self.a_config.shock_quote_size:
@@ -2280,12 +2976,15 @@ class MarketAStrategy:
         return "mm"
 
     def _ensure_position_invariant(self) -> None:
-        split_total = self.earnings_position + self.mm_position
+        split_total = self.earnings_position + self.news_position + self.mm_position
         if split_total == self.inventory:
             return
         correction = self.inventory - split_total
-        if self._preferred_overlay_for_inventory_delta(self.inventory, correction) == "earnings":
+        preferred_overlay = self._preferred_overlay_for_inventory_delta(self.inventory, correction)
+        if preferred_overlay == "earnings":
             self.earnings_position += correction
+        elif preferred_overlay == "news":
+            self.news_position += correction
         else:
             self.mm_position += correction
 
@@ -2301,10 +3000,15 @@ class MarketAStrategy:
             return False
         return current_ms - self.last_relevant_a_earnings_ms < self.a_config.post_earnings_mm_cooldown_ms
 
-    def _mm_dormant(self, now_ms: int, mode: ModeName) -> bool:
-        if mode in {"MULTIPLIER_DISCOVERY", "POST_EARNINGS_SHOCK", "UNWIND"}:
+    def _news_cycle_owns_inventory(self, now_ms: int | None = None) -> bool:
+        if self.active_signal_kind == "news":
             return True
-        return self._earnings_cycle_owns_inventory(now_ms)
+        return self.news_confirmation_state == "pending" and self.pending_news_signal_id is not None
+
+    def _mm_dormant(self, now_ms: int, mode: ModeName) -> bool:
+        if mode in {"MULTIPLIER_DISCOVERY", "POST_EARNINGS_SHOCK", "POST_NEWS_SHOCK", "NEWS_CONFIRMATION", "UNWIND"}:
+            return True
+        return self._earnings_cycle_owns_inventory(now_ms) or self._news_cycle_owns_inventory(now_ms)
 
     def _maybe_release_earnings_cycle(self, now_ms: int) -> None:
         if self.active_earnings_cycle_id is None or self.last_relevant_a_earnings_ms is None:
@@ -2317,6 +3021,134 @@ class MarketAStrategy:
         self.current_earnings_signal_id = None
         self.earnings_position = 0
         self.mm_position = self.inventory
+
+    def _maybe_release_news_cycle(self, now_ms: int) -> None:
+        if self.active_signal_kind != "news":
+            return
+        if abs(self.news_target_inventory) > self.a_config.unwind_flatten_threshold:
+            return
+        if abs(self.inventory) > self.a_config.unwind_flatten_threshold:
+            return
+        self.inventory = 0 if abs(self.inventory) <= self.a_config.unwind_flatten_threshold else self.inventory
+        self.news_position = 0
+        self._clear_active_news_state()
+        self.news_confirmation_state = "inactive"
+        self.current_news_signal_id = None
+        self.mm_position = self.inventory
+        self._ensure_position_invariant()
+
+    def _advance_news_cycle(self, now_ms: int) -> None:
+        if self.news_confirmation_state == "pending" and self.pending_news_signal_id is not None:
+            if self._news_confirmation_satisfied():
+                self._activate_pending_unstructured_news(now_ms)
+            elif self.news_confirmation_deadline_ms is not None and now_ms >= self.news_confirmation_deadline_ms:
+                self.news_confirmation_state = "failed"
+                self._clear_pending_news_state()
+            return
+
+        if self.active_signal_kind != "news":
+            return
+
+        self.news_peak_inventory_abs = max(self.news_peak_inventory_abs, abs(self.inventory))
+        if (
+            abs(self.inventory) <= self.a_config.unwind_flatten_threshold
+            and abs(self.news_target_inventory) <= self.a_config.unwind_flatten_threshold
+        ):
+            self._maybe_release_news_cycle(now_ms)
+            return
+
+        elapsed = 0 if self.news_started_ms is None else max(0, now_ms - self.news_started_ms)
+        mid = self.book.mid
+        if self.news_fair_value is None:
+            return
+
+        if elapsed >= self.a_config.news_max_hold_ms:
+            self.news_target_inventory = 0
+            if self.news_unwind_started_ms is None:
+                self.news_unwind_started_ms = now_ms
+
+        if mid is not None and self.base_fair_value is not None and abs(self.inventory) >= self.a_config.news_emergency_dump_min_inventory:
+            wrong_way_move = (
+                (self.original_news_target_inventory > 0 and mid <= self.base_fair_value - self.a_config.news_emergency_dump_ticks)
+                or (self.original_news_target_inventory < 0 and mid >= self.base_fair_value + self.a_config.news_emergency_dump_ticks)
+            )
+            if wrong_way_move and elapsed >= self.a_config.news_emergency_dump_min_elapsed_ms:
+                trimmed = max(
+                    1,
+                    round(abs(self.inventory) * self.a_config.news_emergency_dump_fraction),
+                )
+                self.news_target_inventory = self._sentiment_sign(self.inventory) * max(0, abs(self.inventory) - trimmed)
+                self.news_unwind_started_ms = self.news_unwind_started_ms or now_ms
+
+        if mid is not None:
+            edge_to_fair = abs(float(mid) - float(self.news_fair_value))
+            if elapsed >= self.a_config.news_equilibrium_min_elapsed_ms and edge_to_fair <= self.a_config.news_equilibrium_band_ticks:
+                if self.news_equilibrium_reached_ms is None:
+                    self.news_equilibrium_reached_ms = now_ms
+                elif now_ms - self.news_equilibrium_reached_ms >= self.a_config.news_equilibrium_hold_ms:
+                    self.news_target_inventory = 0
+                    self.news_unwind_started_ms = self.news_unwind_started_ms or now_ms
+            else:
+                self.news_equilibrium_reached_ms = None
+
+            direction = self._sentiment_sign(self.original_news_target_inventory)
+            overshoot = direction * (float(mid) - float(self.news_fair_value))
+            if (
+                direction != 0
+                and overshoot >= self.a_config.news_overshoot_band_ticks
+                and self.news_target_inventory != 0
+                and self.news_overshoot_stage_index == 0
+            ):
+                trim_fraction = (
+                    self.a_config.news_overshoot_large_position_stage1_fraction
+                    if abs(self.inventory) >= self.a_config.news_overshoot_large_position_threshold
+                    else self.a_config.news_overshoot_stage1_fraction
+                )
+                trim_qty = min(
+                    self.a_config.news_overshoot_stage_max_qty,
+                    max(
+                        self.a_config.news_overshoot_stage_min_qty,
+                        round(abs(self.news_target_inventory) * trim_fraction),
+                    ),
+                )
+                residual_floor = round(
+                    abs(self.original_news_target_inventory)
+                    * (
+                        self.a_config.news_overshoot_large_position_residual_fraction
+                        if abs(self.inventory) >= self.a_config.news_overshoot_large_position_threshold
+                        else self.a_config.news_overshoot_min_residual_fraction
+                    )
+                )
+                next_abs = max(residual_floor, abs(self.news_target_inventory) - trim_qty)
+                self.news_target_inventory = direction * next_abs
+                self.news_overshoot_stage_index = 1
+                self.news_overshoot_trimmed_qty_total += trim_qty
+
+            decay_due_ms = (
+                (self.news_started_ms or now_ms)
+                + self.a_config.news_decay_start_ms
+                + (self.news_decay_steps_applied * self.a_config.news_decay_interval_ms)
+            )
+            if (
+                elapsed >= self.a_config.news_decay_start_ms
+                and now_ms >= decay_due_ms
+                and abs(self.inventory) >= self.a_config.news_decay_min_inventory
+                and edge_to_fair <= self.a_config.news_decay_stall_threshold_ticks
+                and self.news_target_inventory != 0
+            ):
+                trim_qty = min(
+                    self.a_config.news_decay_max_qty,
+                    max(
+                        self.a_config.news_decay_min_qty,
+                        round(abs(self.news_target_inventory) * self.a_config.news_decay_fraction),
+                    ),
+                )
+                residual_floor = round(abs(self.original_news_target_inventory) * self.a_config.news_decay_min_residual_fraction)
+                next_abs = max(residual_floor, abs(self.news_target_inventory) - trim_qty)
+                if next_abs < abs(self.news_target_inventory):
+                    self.news_target_inventory = self._sentiment_sign(self.news_target_inventory) * next_abs
+                    self.news_decay_steps_applied += 1
+                    self.news_decay_trimmed_qty_total += trim_qty
 
     def _earnings_unwind_quote_size(self, abs_inventory: int) -> int:
         if abs_inventory >= self.a_config.unwind_fast_entry:
@@ -2343,11 +3175,8 @@ class MarketAStrategy:
     def _is_a_unstructured_news(news_release: dict) -> bool:
         if news_release.get("kind") == "structured":
             return False
-        symbol = str(news_release.get("symbol") or "").upper()
-        if symbol == "A":
-            return True
-        raw_content = str(news_release.get("raw_content") or news_release.get("content") or "").upper()
-        return " A " in f" {raw_content} "
+        symbol = str(news_release.get("symbol") or news_release.get("asset") or "").upper()
+        return symbol == "A"
 
     @staticmethod
     def _now_ms() -> int:

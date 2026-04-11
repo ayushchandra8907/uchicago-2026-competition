@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -53,6 +53,9 @@ class NewsEvent:
     asset: str | None = None
     value: float | None = None
     content: str | None = None
+    news_type: str | None = None
+    forecast: float | None = None
+    actual: float | None = None
     raw_payload: dict | None = None
 
     @property
@@ -68,6 +71,14 @@ class NewsEvent:
     def is_a_specific_unstructured(self) -> bool:
         return self.kind == "unstructured" and (self.asset or self.symbol or "").upper() == "A"
 
+    @property
+    def is_structured_cpi_print(self) -> bool:
+        return self.kind == "structured" and self.structured_subtype == "cpi_print" and self.forecast is not None and self.actual is not None
+
+    @property
+    def is_fed_speak_unstructured(self) -> bool:
+        return self.kind == "unstructured" and str(self.news_type or "").lower() == "fedspeak"
+
 
 @dataclass(frozen=True)
 class DesiredOrder:
@@ -77,6 +88,8 @@ class DesiredOrder:
     aggressive: bool = True
     intent: str = ""
     reason: str = ""
+    symbol: str = "A"
+    context_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,8 @@ class ManagedOrder:
     aggressive: bool
     intent: str
     reason: str
+    symbol: str = "A"
+    context_id: str | None = None
     cancel_pending: bool = False
 
     @property
@@ -126,3 +141,20 @@ class StrategySnapshot:
     open_orders: tuple[ManagedOrder, ...]
     last_trade_px: int | None = None
     message_index: int | None = None
+    books_by_symbol: dict[str, BookSnapshot] = field(default_factory=dict)
+    inventories_by_symbol: dict[str, int] = field(default_factory=dict)
+    open_orders_by_symbol: dict[str, tuple[ManagedOrder, ...]] = field(default_factory=dict)
+    last_trade_px_by_symbol: dict[str, int] = field(default_factory=dict)
+    event_symbol: str | None = None
+
+    def book_for(self, symbol: str) -> BookSnapshot:
+        return self.books_by_symbol.get(symbol, BookSnapshot())
+
+    def inventory_for(self, symbol: str) -> int:
+        return int(self.inventories_by_symbol.get(symbol, 0))
+
+    def open_orders_for(self, symbol: str) -> tuple[ManagedOrder, ...]:
+        return self.open_orders_by_symbol.get(symbol, ())
+
+    def last_trade_for(self, symbol: str) -> int | None:
+        return self.last_trade_px_by_symbol.get(symbol)

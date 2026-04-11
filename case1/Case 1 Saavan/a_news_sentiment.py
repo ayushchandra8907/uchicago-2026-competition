@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Transplanted from Ayush's marketA_v3 scorer.
+# Keep behavior aligned with the source module unless intentionally retuned.
+
 from dataclasses import dataclass
 import re
 
@@ -166,7 +169,7 @@ negative_bigrams: dict[str, float] = {
     "potential fines": -2.8,
     "fines looming": -2.6,
     "rising costs": -2.8,
-    "stalling progress": -2.8,
+    "stalling progress": -3.0,
     "shrink significantly": -2.6,
     "take hit": -2.0,
     "takes hit": -2.0,
@@ -174,7 +177,7 @@ negative_bigrams: dict[str, float] = {
     "termination major": -2.2,
     "major strategic": -0.8,
     "strategic alliance": 2.0,
-    "delayed stalling": -2.6,
+    "delayed stalling": -3.2,
     "proves unsuccessful": -3.4,
     "diluted shareholder": -2.8,
     "shareholder value": -2.2,
@@ -218,11 +221,11 @@ positive_unigrams: dict[str, float] = {
     "applications": 0.8,
     "holiday": 0.6,
     "surge": 1.6,
-    "strategic": 0.2,
+    "strategic": 0.0,
     "supplier": 0.8,
     "selected": 0.8,
     "federal": 0.6,
-    "technology": 0.1,
+    "technology": 0.0,
     "initiative": 0.2,
     "impressive": 1.2,
     "clears": 1.2,
@@ -308,7 +311,6 @@ negative_unigrams: dict[str, float] = {
     "fine": -1.8,
     "looming": -1.6,
     "confirmed": -0.6,
-    "hit": -0.2,
     "drop": -1.6,
     "subscriptions": -1.6,
     "misleading": -1.8,
@@ -409,6 +411,7 @@ def normalize_text(text: str | None) -> str:
 
 def normalize_term(term: str) -> str:
     return normalize_text(term)
+
 
 _POSITIVE_BIGRAMS = {normalize_term(term): weight for term, weight in positive_bigrams.items()}
 _NEGATIVE_BIGRAMS = {normalize_term(term): weight for term, weight in negative_bigrams.items()}

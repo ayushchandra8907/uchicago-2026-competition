@@ -4,7 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
+from a_bot_config import AConfig
 from a_bot_trace import load_trace_events, render_summary_markdown, summarize_trace_events
+from a_news_tracker import (
+    build_a_news_tracker_report,
+    build_unknown_news_term_report,
+    render_a_news_tracker_markdown,
+    render_unknown_terms_markdown,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +60,10 @@ def print_summary(summary: dict) -> None:
     print("PnL by strategy family:")
     for strategy, pnl in (summary.get("pnl_by_strategy_family") or {}).items():
         print(f"  {strategy}: {pnl}")
+    print("")
+    print("PnL by action class:")
+    for action_class, pnl in (summary.get("pnl_by_action_class") or {}).items():
+        print(f"  {action_class}: {pnl}")
     print("")
     print("Fills by intent:")
     for intent, count in (summary.get("fills_by_intent") or {}).items():
@@ -116,11 +127,19 @@ def print_summary(summary: dict) -> None:
     for mode, stats in (summary.get("a_mm_loss_by_mode") or {}).items():
         print(f"  {mode}: {stats}")
     print("")
+    print("A strategy breakdown:")
+    for key, value in (summary.get("a_strategy_breakdown") or {}).items():
+        print(f"  {key}: {value}")
+    print("")
     print("B cost-adjusted residual stats:")
     b_stats = summary.get("b_cost_adjusted_residual_stats") or {}
     print(f"  composite_basis: {b_stats.get('composite_basis')}")
     for strike, stats in (b_stats.get("by_strike") or {}).items():
         print(f"  strike {strike}: {stats}")
+    print("")
+    print("B strategy block reasons:")
+    for reason, count in (summary.get("b_strategy_block_reasons") or {}).items():
+        print(f"  {reason}: {count}")
     print("")
     print("Trace volume summary:")
     volume = summary.get("trace_volume_summary") or {}
@@ -138,11 +157,48 @@ def main() -> None:
     if args.rewrite_summary:
         summary_json_path = run_dir / "session_summary.json"
         summary_md_path = run_dir / "session_summary.md"
+        tracker_json_path = run_dir / "a_news_tracker.json"
+        tracker_md_path = run_dir / "a_news_tracker.md"
+        unknown_json_path = run_dir / "unknown_a_news_terms.json"
+        unknown_md_path = run_dir / "unknown_a_news_terms.md"
+        tracker_report = build_a_news_tracker_report(events, config=AConfig())
+        unknown_terms_report = build_unknown_news_term_report(events)
+        headline_rows = tracker_report.get("headline_analyses") or []
+        recommendation_rows = tracker_report.get("term_recommendations") or []
+        summary["a_news_summary"] = {
+            "headline_count": len(headline_rows),
+            "episode_count": len(summary.get("a_news_episode_summaries") or []),
+            "traded_count": sum(1 for row in headline_rows if row.get("traded")),
+            "missed_no_trade_count": sum(1 for row in headline_rows if row.get("verdict") == "missed_no_trade"),
+            "undersized_count": sum(1 for row in headline_rows if row.get("verdict") == "undersized"),
+            "wrong_direction_count": sum(1 for row in headline_rows if row.get("verdict") == "wrong_direction"),
+            "under_harvest_candidate_count": sum(1 for row in (summary.get("a_news_episode_summaries") or []) if row.get("under_harvest_candidate")),
+            "a_news_pnl": round(float((summary.get("pnl_by_strategy_family") or {}).get("a_news", 0.0)), 4),
+            "fill_count": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_count", 0)),
+            "fill_qty": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_qty", 0)),
+            "top_recommendations": [
+                {
+                    "term": row.get("term"),
+                    "suggested_action": row.get("suggested_action"),
+                    "suggested_weight_delta": row.get("suggested_weight_delta"),
+                }
+                for row in recommendation_rows
+                if row.get("suggested_action") not in {None, "review"}
+            ][:10],
+        }
         with summary_json_path.open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
         run_id = events[0].get("run_id") if events else "unknown"
         with summary_md_path.open("w", encoding="utf-8") as handle:
             handle.write(render_summary_markdown(summary, str(run_id), run_dir))
+        with tracker_json_path.open("w", encoding="utf-8") as handle:
+            json.dump(tracker_report, handle, indent=2, sort_keys=True)
+        with tracker_md_path.open("w", encoding="utf-8") as handle:
+            handle.write(render_a_news_tracker_markdown(tracker_report, run_dir))
+        with unknown_json_path.open("w", encoding="utf-8") as handle:
+            json.dump(unknown_terms_report, handle, indent=2, sort_keys=True)
+        with unknown_md_path.open("w", encoding="utf-8") as handle:
+            handle.write(render_unknown_terms_markdown(unknown_terms_report, run_dir))
 
 
 if __name__ == "__main__":

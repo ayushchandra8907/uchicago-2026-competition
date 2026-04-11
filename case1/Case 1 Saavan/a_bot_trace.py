@@ -5,12 +5,19 @@ from collections import Counter, defaultdict
 import csv
 from datetime import datetime, timezone
 import json
+from math import ceil, floor
 from pathlib import Path
 import time
 from typing import Any, Iterable
 import uuid
 
-from a_bot_config import TraceConfig
+from a_bot_config import AConfig, BConfig, TraceConfig
+from a_news_tracker import (
+    build_a_news_tracker_report,
+    build_unknown_news_term_report,
+    render_a_news_tracker_markdown,
+    render_unknown_terms_markdown,
+)
 
 
 SNAPSHOT_FIELDNAMES = [
@@ -37,6 +44,7 @@ SNAPSHOT_FIELDNAMES = [
     "multiplier_confidence",
     "inventory",
     "earnings_position",
+    "news_position",
     "mm_position",
     "buy_exposure",
     "sell_exposure",
@@ -64,6 +72,28 @@ SNAPSHOT_FIELDNAMES = [
     "news_caution_remaining_ms",
     "last_relevant_a_earnings_ms",
     "active_earnings_cycle_id",
+    "active_signal_kind",
+    "current_earnings_signal_id",
+    "current_news_signal_id",
+    "active_news_signal_id",
+    "pending_news_signal_id",
+    "news_sentiment_score",
+    "news_sentiment_bucket",
+    "base_fair_value",
+    "news_fair_value",
+    "news_target_inventory",
+    "pending_news_target_inventory",
+    "pending_news_json",
+    "news_confirmation_state",
+    "news_confirmation_deadline_ms",
+    "news_takeover_started_ms",
+    "pe_frozen",
+    "news_matched_phrases_json",
+    "news_matched_unigrams_json",
+    "news_matched_bigrams_json",
+    "unknown_candidate_phrases_json",
+    "unknown_candidate_unigrams_json",
+    "unknown_candidate_bigrams_json",
 ]
 
 
@@ -124,6 +154,135 @@ def estimate_mtm(state: dict[str, Any], cash: int | None) -> tuple[float | None,
     return float(cash or 0) + (inventory * mark_price), basis, mark_price
 
 
+def _trace_mark_from_event(event: dict[str, Any]) -> float | None:
+    for key in ("mark_price", "mid", "mid_price", "fair_value", "last_trade_px", "price"):
+        value = event.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _series_for_symbol(events: list[dict[str, Any]], symbol: str) -> list[tuple[int, float]]:
+    series: list[tuple[int, float]] = []
+    for event in events:
+        if str(event.get("symbol") or "") != symbol:
+            continue
+        mark = _trace_mark_from_event(event)
+        if mark is None:
+            continue
+        series.append((int(event.get("monotonic_ms", 0)), mark))
+    return series
+
+
+def _mark_at_or_after(series: list[tuple[int, float]], target_ms: int) -> float | None:
+    times = [item[0] for item in series]
+    index = bisect_left(times, target_ms)
+    if index >= len(series):
+        return None
+    return float(series[index][1])
+
+
+def _mark_at_or_before(series: list[tuple[int, float]], target_ms: int) -> float | None:
+    times = [item[0] for item in series]
+    index = bisect_left(times, target_ms)
+    if index >= len(series):
+        index = len(series) - 1
+    elif times[index] > target_ms:
+        index -= 1
+    if index < 0:
+        return None
+    return float(series[index][1])
+
+
+def _mark_near(series: list[tuple[int, float]], target_ms: int) -> float | None:
+    return _mark_at_or_after(series, target_ms) or _mark_at_or_before(series, target_ms)
+
+
+def _event_signal_ids(event: dict[str, Any]) -> set[str]:
+    return {
+        str(value)
+        for key in ("signal_id", "trade_group_id", "active_news_signal_id", "pending_news_signal_id", "current_news_signal_id")
+        for value in (event.get(key),)
+        if value
+    }
+
+
+def _matches_signal(event: dict[str, Any], signal_id: str | None) -> bool:
+    if signal_id is None:
+        return False
+    return signal_id in _event_signal_ids(event)
+
+
+def _a_news_signal_id(event: dict[str, Any]) -> str | None:
+    for key in ("active_news_signal_id", "pending_news_signal_id", "current_news_signal_id", "signal_id", "trade_group_id"):
+        value = event.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _is_relevant_a_unstructured_news(event: dict[str, Any]) -> bool:
+    if str(event.get("event_type") or "") != "news_received":
+        return False
+    if str(event.get("news_kind") or "") != "unstructured" or not bool(event.get("relevant")):
+        return False
+    raw_payload = event.get("raw_payload") or event.get("raw_news_payload") or {}
+    new_data = raw_payload.get("new_data") or {}
+    symbol = str(raw_payload.get("symbol") or raw_payload.get("asset") or "").upper()
+    asset = str(new_data.get("asset") or "").upper()
+    return symbol == "A" or asset == "A"
+
+
+def _is_relevant_a_structured_earnings(event: dict[str, Any]) -> bool:
+    if str(event.get("event_type") or "") != "news_received":
+        return False
+    raw_payload = event.get("raw_payload") or event.get("raw_news_payload") or {}
+    new_data = raw_payload.get("new_data") or {}
+    kind = str(raw_payload.get("kind") or event.get("news_kind") or "")
+    asset = str(new_data.get("asset") or raw_payload.get("symbol") or "").upper()
+    subtype = str(new_data.get("structured_subtype") or "")
+    return kind == "structured" and asset == "A" and subtype == "earnings" and bool(event.get("relevant"))
+
+
+def _signed_news_target_from_event(event: dict[str, Any], fallback_mid: float | None, config: AConfig) -> int | None:
+    for key in ("news_target_inventory", "pending_news_target_inventory", "original_shock_target_inventory", "shock_target_inventory"):
+        value = event.get(key)
+        if value is not None:
+            return int(value)
+    news_fair = event.get("news_fair_value")
+    if news_fair is None or fallback_mid is None:
+        return None
+    delta = float(news_fair) - float(fallback_mid)
+    direction = 1 if delta > 0 else -1 if delta < 0 else 0
+    if direction == 0:
+        return 0
+    score = abs(float(event.get("news_sentiment_score") or 0.0))
+    bucket = str(event.get("news_sentiment_bucket") or "none")
+    if score >= 5.0:
+        cap = config.news_very_extreme_position
+    elif bucket == "extreme":
+        cap = config.news_extreme_position
+    elif bucket == "strong":
+        cap = config.news_strong_position
+    elif bucket == "medium":
+        cap = config.news_medium_position
+    elif bucket == "light":
+        cap = config.news_light_position
+    else:
+        cap = 0
+    edge_abs = abs(delta)
+    min_edge = max(1, config.shock_take_min_edge)
+    if cap <= 0 or edge_abs < min_edge:
+        return 0
+    confidence_span = max(1, 80 - min_edge)
+    confidence = min(1.0, max(0.0, edge_abs - min_edge) / confidence_span)
+    target_abs = max(4, round(cap * confidence), round(edge_abs * 1.20))
+    target_abs = min(cap, target_abs)
+    if target_abs <= config.news_zero_position_threshold:
+        return 0
+    return direction * int(target_abs)
+
+
 def _quoted_spread(desired_bid: dict[str, Any] | None, desired_ask: dict[str, Any] | None, live_orders: list[dict[str, Any]]) -> int | None:
     if desired_bid is not None and desired_ask is not None:
         return int(desired_ask["px"]) - int(desired_bid["px"])
@@ -159,6 +318,249 @@ def load_trace_events(path_or_run_dir: str | Path) -> list[dict[str, Any]]:
     return events
 
 
+def build_a_news_episode_summaries(events: list[dict[str, Any]], signal_episode_rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    event_list = sorted(events, key=lambda event: (int(event.get("monotonic_ms", 0)), str(event.get("event_type", ""))))
+    config = AConfig()
+    a_marks = _series_for_symbol(event_list, "A")
+    a_news_events = [event for event in event_list if _is_relevant_a_unstructured_news(event)]
+    structured_events = [event for event in event_list if _is_relevant_a_structured_earnings(event)]
+    signal_pnl = {
+        str(row.get("signal_id")): float(row.get("total_pnl") or 0.0)
+        for row in (signal_episode_rows or [])
+        if str(row.get("market_key") or "") == "A" and str(row.get("strategy_family") or "") == "a_news"
+    }
+    summaries: list[dict[str, Any]] = []
+    final_ms = int(event_list[-1].get("monotonic_ms", 0)) if event_list else 0
+
+    for index, news_event in enumerate(a_news_events):
+        event_ms = int(news_event.get("monotonic_ms", 0))
+        signal_id = _a_news_signal_id(news_event) or f"a_news_{index + 1}"
+        next_news_ms = int(a_news_events[index + 1].get("monotonic_ms", final_ms)) if index + 1 < len(a_news_events) else final_ms
+        next_structured = next((event for event in structured_events if int(event.get("monotonic_ms", 0)) > event_ms), None)
+        next_structured_ms = None if next_structured is None else int(next_structured.get("monotonic_ms", 0))
+        next_structured_tick = None if next_structured is None else next_structured.get("exchange_tick")
+        event_mid = _mark_near(a_marks, event_ms)
+        signed_target = _signed_news_target_from_event(news_event, event_mid, config)
+        direction = 1 if (signed_target or 0) > 0 else -1 if (signed_target or 0) < 0 else int(news_event.get("shock_direction") or 0)
+        primary_side = "BUY" if direction > 0 else "SELL" if direction < 0 else None
+
+        fill_events = [
+            event
+            for event in event_list
+            if str(event.get("event_type") or "") == "order_filled"
+            and _matches_signal(event, signal_id)
+            and str(event.get("action_class") or "") in {"news_take", "news_unwind", "news_takeover_flatten"}
+        ]
+        take_fills = [event for event in fill_events if str(event.get("action_class") or "") == "news_take"]
+        unwind_fills = [event for event in fill_events if str(event.get("action_class") or "") in {"news_unwind", "news_takeover_flatten"}]
+        entry_fills = [event for event in fill_events if primary_side is not None and str(event.get("side") or "") == primary_side]
+        exit_fills = [event for event in fill_events if primary_side is not None and str(event.get("side") or "") != primary_side]
+
+        def _qty(rows: list[dict[str, Any]]) -> int:
+            return sum(int(row.get("fill_qty") or row.get("qty") or 0) for row in rows)
+
+        def _avg_px(rows: list[dict[str, Any]]) -> float | None:
+            qty = _qty(rows)
+            if qty <= 0:
+                return None
+            notional = sum(int(row.get("fill_qty") or row.get("qty") or 0) * float(row.get("fill_price") or row.get("price") or 0.0) for row in rows)
+            return notional / qty
+
+        episode_end = max(
+            [event_ms, min(next_news_ms, event_ms + config.news_max_hold_ms)]
+            + [int(event.get("monotonic_ms", event_ms)) for event in fill_events]
+        )
+        peak_news_inventory = 0
+        for event in event_list:
+            current_ms = int(event.get("monotonic_ms", 0))
+            if current_ms < event_ms or current_ms > episode_end:
+                continue
+            if str(event.get("market_key") or event.get("symbol") or "") != "A":
+                continue
+            news_position = event.get("news_position")
+            if news_position is not None:
+                peak_news_inventory = max(peak_news_inventory, abs(int(news_position)))
+
+        excursion_end = min(
+            [value for value in (next_structured_ms, event_ms + config.news_max_hold_ms, final_ms) if value is not None]
+        )
+        base_mid = event_mid or 0.0
+        deltas = [float(mark) - base_mid for ms, mark in a_marks if event_ms <= ms <= excursion_end]
+        if direction < 0:
+            favorable = max((-delta for delta in deltas), default=0.0)
+            adverse = max((delta for delta in deltas), default=0.0)
+        else:
+            favorable = max(deltas, default=0.0)
+            adverse = max((-delta for delta in deltas), default=0.0)
+
+        entry_qty = _qty(entry_fills)
+        entry_avg = _avg_px(entry_fills)
+        counterfactuals: dict[str, Any] = {}
+        if primary_side is not None and entry_qty > 0 and entry_avg is not None:
+            horizons = {
+                "hold_2s": event_ms + 2_000,
+                "hold_5s": event_ms + 5_000,
+                "hold_to_max_hold": event_ms + config.news_max_hold_ms,
+            }
+            if next_structured_ms is not None:
+                horizons["hold_to_next_structured_a_earnings"] = next_structured_ms
+            for label, target_ms in horizons.items():
+                mark = _mark_near(a_marks, min(target_ms, final_ms))
+                if mark is None:
+                    continue
+                pnl = direction * entry_qty * (float(mark) - float(entry_avg))
+                counterfactuals[label] = {
+                    "mark_ms": min(target_ms, final_ms),
+                    "mark_price": round(float(mark), 4),
+                    "estimated_pnl": round(float(pnl), 4),
+                }
+
+        actual_pnl = signal_pnl.get(signal_id, 0.0)
+        best_counter_label = None
+        best_counter_pnl = None
+        for label, row in counterfactuals.items():
+            estimated_pnl = float(row.get("estimated_pnl") or 0.0)
+            if best_counter_pnl is None or estimated_pnl > best_counter_pnl:
+                best_counter_label = label
+                best_counter_pnl = estimated_pnl
+        under_harvest_gap = 0.0 if best_counter_pnl is None else max(0.0, best_counter_pnl - actual_pnl)
+
+        summaries.append(
+            {
+                "signal_id": signal_id,
+                "tick": news_event.get("exchange_tick"),
+                "headline": news_event.get("content"),
+                "score": news_event.get("news_sentiment_score"),
+                "bucket": news_event.get("news_sentiment_bucket"),
+                "target_inventory": signed_target,
+                "primary_side": primary_side,
+                "fill_qty": _qty(fill_events),
+                "news_take_qty": _qty(take_fills),
+                "news_unwind_qty": _qty(unwind_fills),
+                "peak_news_inventory": peak_news_inventory,
+                "avg_entry_px": None if entry_avg is None else round(entry_avg, 4),
+                "avg_exit_px": None if _avg_px(exit_fills) is None else round(float(_avg_px(exit_fills)), 4),
+                "realized_episode_pnl": round(actual_pnl, 4),
+                "max_favorable_excursion": round(favorable, 4),
+                "max_adverse_excursion": round(adverse, 4),
+                "next_structured_a_earnings_ms": next_structured_ms,
+                "next_structured_a_earnings_tick": next_structured_tick,
+                "counterfactual_holds": counterfactuals,
+                "best_counterfactual_hold": best_counter_label,
+                "best_counterfactual_pnl": None if best_counter_pnl is None else round(best_counter_pnl, 4),
+                "under_harvest_pnl_gap": round(under_harvest_gap, 4),
+                "under_harvest_candidate": under_harvest_gap >= 1_000.0,
+            }
+        )
+    return summaries
+
+
+def build_b_shadow_underlying_mm_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    event_list = sorted(events, key=lambda event: (int(event.get("monotonic_ms", 0)), str(event.get("event_type", ""))))
+    config = BConfig()
+    b_signals = [
+        event
+        for event in event_list
+        if str(event.get("event_type") or "") == "derived_signal"
+        and str(event.get("strategy_family") or "") == "b_observe_only"
+    ]
+    b_marks = _series_for_symbol(event_list, config.underlying_symbol)
+    b_trades = [
+        event
+        for event in event_list
+        if str(event.get("event_type") or "") == "market_trade_observed"
+        and str(event.get("symbol") or "") == config.underlying_symbol
+        and event.get("price") is not None
+    ]
+    blocked: Counter[str] = Counter()
+    candidate_count = 0
+    hypothetical_fill_count = 0
+    hypothetical_pnl_5s = 0.0
+    markouts_5s: list[float] = []
+    quote_counts: Counter[str] = Counter()
+
+    for index, event in enumerate(b_signals):
+        payload = event.get("payload") or {}
+        now_ms = int(event.get("monotonic_ms", 0))
+        spread = event.get("spread")
+        microprice = event.get("microprice") if event.get("microprice") is not None else event.get("mid")
+        composite_fair = payload.get("composite_synthetic_fair")
+        synthetic_values = [float(value) for value in (payload.get("synthetic_forward_by_strike") or {}).values()]
+        synthetic_dispersion = max(synthetic_values) - min(synthetic_values) if synthetic_values else None
+        basis = float(payload.get("composite_basis") or 0.0)
+        imbalance = event.get("top_of_book_imbalance")
+
+        block_reason = None
+        if spread is None or event.get("best_bid_px") is None or event.get("best_ask_px") is None:
+            block_reason = "missing_b_book"
+        elif int(spread) < config.min_book_spread:
+            block_reason = "book_spread_too_tight"
+        elif composite_fair is None or microprice is None:
+            block_reason = "missing_composite_synthetic_fair"
+        elif synthetic_dispersion is not None and synthetic_dispersion > config.max_synthetic_dispersion:
+            block_reason = "synthetic_dispersion_wide"
+        elif abs(basis) < float(config.basis_entry_threshold_ticks):
+            block_reason = "basis_too_small"
+        elif imbalance is not None and ((basis > 0 and float(imbalance) < -config.imbalance_confirmation_threshold) or (basis < 0 and float(imbalance) > config.imbalance_confirmation_threshold)):
+            block_reason = "basis_imbalance_conflict"
+        if block_reason is not None:
+            blocked[block_reason] += 1
+            continue
+
+        candidate_count += 1
+        reference_fair = round((0.5 * float(microprice)) + (0.5 * float(composite_fair)))
+        basis_shift = max(-float(config.basis_strong_threshold_ticks), min(float(config.basis_strong_threshold_ticks), basis))
+        center = float(reference_fair) + (0.5 * basis_shift)
+        if basis > 0:
+            side = "BUY"
+            quote_px = int(floor(center - config.base_half_spread_ticks))
+            quote_px = min(quote_px, int(event.get("best_ask_px")) - 1)
+            if event.get("best_bid_px") is not None:
+                quote_px = min(quote_px, int(event.get("best_bid_px")))
+        else:
+            side = "SELL"
+            quote_px = int(ceil(center + config.base_half_spread_ticks))
+            quote_px = max(quote_px, int(event.get("best_bid_px")) + 1)
+            if event.get("best_ask_px") is not None:
+                quote_px = max(quote_px, int(event.get("best_ask_px")))
+        quote_counts[side] += 1
+
+        next_signal_ms = int(b_signals[index + 1].get("monotonic_ms", now_ms + 3_000)) if index + 1 < len(b_signals) else now_ms + 3_000
+        quote_end_ms = min(now_ms + 3_000, next_signal_ms)
+        fill_trade = next(
+            (
+                trade
+                for trade in b_trades
+                if now_ms < int(trade.get("monotonic_ms", 0)) <= quote_end_ms
+                and ((side == "BUY" and int(trade.get("price")) <= quote_px) or (side == "SELL" and int(trade.get("price")) >= quote_px))
+            ),
+            None,
+        )
+        if fill_trade is None:
+            continue
+        hypothetical_fill_count += 1
+        fill_ms = int(fill_trade.get("monotonic_ms", 0))
+        fill_px = float(quote_px)
+        mark_5s = _mark_near(b_marks, fill_ms + 5_000)
+        if mark_5s is None:
+            continue
+        signed_side = 1 if side == "BUY" else -1
+        markout = signed_side * (float(mark_5s) - fill_px)
+        markouts_5s.append(markout)
+        hypothetical_pnl_5s += markout
+
+    return {
+        "observe_only": True,
+        "candidate_quote_count": candidate_count,
+        "blocked_counts": dict(blocked.most_common()),
+        "hypothetical_quote_counts": dict(sorted(quote_counts.items())),
+        "hypothetical_fill_count": hypothetical_fill_count,
+        "hypothetical_pnl_5s": round(hypothetical_pnl_5s, 4),
+        "mean_hypothetical_5s_markout": round(sum(markouts_5s) / len(markouts_5s), 4) if markouts_5s else None,
+        "simulation_notes": "Shadow-only passive B underlying MM estimate from observed signals/trades; no live B orders are implied.",
+    }
+
+
 def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_ms: tuple[int, ...] = (250, 1_000, 5_000)) -> dict[str, Any]:
     event_list = sorted(list(events), key=lambda event: (int(event.get("monotonic_ms", 0)), str(event.get("event_type", ""))))
     mode_durations_by_market: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -168,6 +570,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     fills_by_intent: Counter[str] = Counter()
     fills_by_overlay: Counter[str] = Counter()
     fills_by_action_class: Counter[str] = Counter()
+    fill_qty_by_action_class: Counter[str] = Counter()
     submits_by_intent: Counter[str] = Counter()
     submits_by_overlay: Counter[str] = Counter()
     submits_by_action_class: Counter[str] = Counter()
@@ -180,6 +583,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     observe_only_count = 0
     inventory_values: list[int] = []
     earnings_inventory_values: list[int] = []
+    news_inventory_values: list[int] = []
     mm_inventory_values: list[int] = []
     quoted_spreads: list[int] = []
     latest_mtm: float | None = None
@@ -199,10 +603,12 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     latest_derived_signals: dict[str, dict[str, Any]] = {}
 
     owner_buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    action_buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
     signal_buckets: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     a_cycle_events: list[dict[str, Any]] = []
     mm_mode_markouts: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     mm_fills_inside_earnings_cycle = 0
+    b_strategy_block_reasons: Counter[str] = Counter()
     trace_event_counts: Counter[str] = Counter()
     trace_symbol_counts: Counter[str] = Counter()
 
@@ -322,6 +728,9 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             earnings_inventory = event.get("earnings_position")
             if earnings_inventory is not None:
                 earnings_inventory_values.append(int(earnings_inventory))
+            news_inventory = event.get("news_position")
+            if news_inventory is not None:
+                news_inventory_values.append(int(news_inventory))
             mm_inventory = event.get("mm_position")
             if mm_inventory is not None:
                 mm_inventory_values.append(int(mm_inventory))
@@ -338,6 +747,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
                 observe_only_count += 1
             if int(event.get("aggressive_action_count") or 0) == 0 and event.get("desired_bid") is None and event.get("desired_ask") is None:
                 no_action_reasons[str(event.get("reason") or "unknown")] += 1
+                if market_key == "B":
+                    b_strategy_block_reasons[str(event.get("reason") or "unknown")] += 1
 
         elif event_type == "news_received":
             payload = event.get("raw_payload") or event.get("raw_news_payload") or {}
@@ -409,12 +820,16 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
 
             fill_price = float(event.get("fill_price") or event.get("price") or 0.0)
             fill_qty = int(event.get("fill_qty") or event.get("qty") or 0)
+            fill_qty_by_action_class[action_class] += fill_qty
             signed_qty = fill_qty if str(event.get("side")) == "BUY" else -fill_qty
             owner_key = (market_key, pnl_owner, symbol)
+            action_key = (market_key, action_class, symbol)
             signal_key = (market_key, pnl_owner, symbol, signal_id)
             owner_bucket = owner_buckets.setdefault(owner_key, _bucket())
+            action_bucket = action_buckets.setdefault(action_key, _bucket())
             signal_bucket = signal_buckets.setdefault(signal_key, _bucket())
             _apply_fill(owner_bucket, signed_qty, fill_price, now_ms)
+            _apply_fill(action_bucket, signed_qty, fill_price, now_ms)
             _apply_fill(signal_bucket, signed_qty, fill_price, now_ms)
             mm_fill_inside_active_cycle = pnl_owner == "a_market_making" and market_key == "A" and bool(event.get("active_earnings_cycle_id"))
             if mm_fill_inside_active_cycle:
@@ -449,6 +864,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
 
     pnl_by_market: dict[str, float] = defaultdict(float)
     pnl_by_strategy_family: dict[str, float] = defaultdict(float)
+    pnl_by_action_class: dict[str, float] = defaultdict(float)
     signal_episode_rows: list[dict[str, Any]] = []
     strategy_rows: dict[str, dict[str, Any]] = {}
 
@@ -485,6 +901,19 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         row["fill_qty"] += int(bucket["fill_qty"])
         row["peak_abs_inventory"] = max(int(row["peak_abs_inventory"]), int(bucket["peak_abs_inventory"]))
         row["time_in_position_ms"] += int(bucket["time_in_position_ms"])
+
+    for (market_key, action_class, symbol), bucket in action_buckets.items():
+        position = int(bucket["position"])
+        avg_cost = float(bucket["avg_cost"])
+        latest_mark = latest_mark_by_symbol.get(symbol)
+        unrealized = 0.0
+        if latest_mark is not None:
+            if position > 0:
+                unrealized = position * (latest_mark - avg_cost)
+            elif position < 0:
+                unrealized = abs(position) * (avg_cost - latest_mark)
+        total_pnl = float(bucket["realized_pnl"]) + unrealized
+        pnl_by_action_class[f"{market_key}.{action_class}"] += total_pnl
 
     for (market_key, pnl_owner, symbol, signal_id), bucket in signal_buckets.items():
         position = int(bucket["position"])
@@ -619,6 +1048,25 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
     if a_mm_loss_by_mode:
         a_mm_loss_by_mode["fills_inside_earnings_cycle"] = mm_fills_inside_earnings_cycle
 
+    a_strategy_breakdown = {
+        "shock_take_qty": int(fill_qty_by_action_class.get("shock_take", 0)),
+        "shock_take_pnl": round(pnl_by_action_class.get("A.shock_take", 0.0), 4),
+        "shock_unwind_pnl": round(pnl_by_action_class.get("A.shock_unwind", 0.0), 4),
+        "shock_total_pnl": round(
+            pnl_by_action_class.get("A.shock_take", 0.0) + pnl_by_action_class.get("A.shock_unwind", 0.0),
+            4,
+        ),
+        "news_take_pnl": round(pnl_by_action_class.get("A.news_take", 0.0), 4),
+        "news_unwind_pnl": round(pnl_by_action_class.get("A.news_unwind", 0.0), 4),
+        "news_takeover_flatten_pnl": round(pnl_by_action_class.get("A.news_takeover_flatten", 0.0), 4),
+        "news_caution_pnl": round(pnl_by_action_class.get("A.news_caution_mm", 0.0), 4),
+        "steady_mm_pnl": round(pnl_by_action_class.get("A.market_making", 0.0), 4),
+        "steady_take_pnl": round(pnl_by_action_class.get("A.steady_take", 0.0), 4),
+        "mode_durations_ms": mode_durations_ms,
+    }
+
+    a_news_episode_summaries = build_a_news_episode_summaries(event_list, signal_episode_rows)
+
     b_cost_adjusted_residual_stats: dict[str, Any] = {}
     b_residual_events = [
         event
@@ -695,6 +1143,8 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
             },
         }
 
+    b_shadow_underlying_mm = build_b_shadow_underlying_mm_summary(event_list)
+
     trace_volume_summary = {
         "event_counts": dict(sorted(trace_event_counts.items())),
         "symbol_counts": dict(sorted(trace_symbol_counts.items())),
@@ -724,6 +1174,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "largest_inventory_short": min(inventory_values) if inventory_values else 0,
         "average_inventory": (sum(inventory_values) / len(inventory_values)) if inventory_values else 0.0,
         "average_earnings_inventory": (sum(earnings_inventory_values) / len(earnings_inventory_values)) if earnings_inventory_values else 0.0,
+        "average_news_inventory": (sum(news_inventory_values) / len(news_inventory_values)) if news_inventory_values else 0.0,
         "average_mm_inventory": (sum(mm_inventory_values) / len(mm_inventory_values)) if mm_inventory_values else 0.0,
         "average_quoted_spread": (sum(quoted_spreads) / len(quoted_spreads)) if quoted_spreads else None,
         "observe_only_count": observe_only_count,
@@ -736,6 +1187,7 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "markouts_by_action_class": _average_markouts(fill_markouts_by_action_class),
         "pnl_by_market": {key: round(value, 4) for key, value in sorted(pnl_by_market.items())},
         "pnl_by_strategy_family": {key: round(value, 4) for key, value in sorted(pnl_by_strategy_family.items())},
+        "pnl_by_action_class": {key: round(value, 4) for key, value in sorted(pnl_by_action_class.items())},
         "top_losing_strategy_families": top_losing_strategy_families,
         "top_losing_signal_episodes": top_losing_signal_episodes,
         "strategy_family_stats": strategy_rows,
@@ -743,10 +1195,14 @@ def summarize_trace_events(events: Iterable[dict[str, Any]], *, markout_windows_
         "a_irrelevant_structured_count": a_irrelevant_structured_count,
         "a_relevant_unstructured_count": a_relevant_unstructured_count,
         "a_episode_summaries": a_episode_summaries,
+        "a_news_episode_summaries": a_news_episode_summaries,
         "a_mm_loss_by_mode": a_mm_loss_by_mode,
+        "a_strategy_breakdown": a_strategy_breakdown,
         "derived_signal_counts": dict(sorted(derived_signal_counts.items())),
         "latest_derived_signals": latest_derived_signals,
         "b_cost_adjusted_residual_stats": b_cost_adjusted_residual_stats,
+        "b_shadow_underlying_mm": b_shadow_underlying_mm,
+        "b_strategy_block_reasons": dict(b_strategy_block_reasons.most_common()),
         "trace_volume_summary": trace_volume_summary,
         "activity_split": {
             "passive_mm": sum(count for intent, count in fills_by_intent.items() if intent in {"opening_mm", "steady_mm_passive", "multiplier_discovery_mm", "news_cautious_mm"}),
@@ -766,10 +1222,16 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
     no_action = summary.get("most_common_no_action_reasons") or {}
     pnl_by_market = summary.get("pnl_by_market") or {}
     pnl_by_strategy = summary.get("pnl_by_strategy_family") or {}
+    pnl_by_action_class = summary.get("pnl_by_action_class") or {}
     losing_strategies = summary.get("top_losing_strategy_families") or []
     a_episode_summaries = summary.get("a_episode_summaries") or []
+    a_news_episode_summaries = summary.get("a_news_episode_summaries") or []
     a_mm_loss_by_mode = summary.get("a_mm_loss_by_mode") or {}
+    a_strategy_breakdown = summary.get("a_strategy_breakdown") or {}
+    a_news_summary = summary.get("a_news_summary") or {}
     b_cost_stats = summary.get("b_cost_adjusted_residual_stats") or {}
+    b_shadow_underlying_mm = summary.get("b_shadow_underlying_mm") or {}
+    b_strategy_block_reasons = summary.get("b_strategy_block_reasons") or {}
     trace_volume_summary = summary.get("trace_volume_summary") or {}
     return "\n".join(
         [
@@ -785,6 +1247,7 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             f"- Largest short inventory: `{summary.get('largest_inventory_short', 0)}`",
             f"- Average inventory: `{summary.get('average_inventory', 0.0):.2f}`",
             f"- Average earnings inventory: `{summary.get('average_earnings_inventory', 0.0):.2f}`",
+            f"- Average news inventory: `{summary.get('average_news_inventory', 0.0):.2f}`",
             f"- Average MM inventory: `{summary.get('average_mm_inventory', 0.0):.2f}`",
             f"- Average quoted spread: `{summary.get('average_quoted_spread')}`",
             f"- Observe-only decisions: `{summary.get('observe_only_count', 0)}`",
@@ -798,6 +1261,9 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
             "",
             "## PnL By Strategy Family",
             *(f"- `{strategy}`: `{pnl}`" for strategy, pnl in pnl_by_strategy.items()),
+            "",
+            "## PnL By Action Class",
+            *(f"- `{action_class}`: `{pnl}`" for action_class, pnl in pnl_by_action_class.items()),
             "",
             "## Fills By Intent",
             *(f"- `{intent}`: `{count}`" for intent, count in fills_by_intent.items()),
@@ -836,12 +1302,34 @@ def render_summary_markdown(summary: dict[str, Any], run_id: str, run_dir: Path)
                 for mode, stats in a_mm_loss_by_mode.items()
             ),
             "",
+            "## A Strategy Breakdown",
+            *(f"- `{key}`: `{value}`" for key, value in a_strategy_breakdown.items()),
+            "",
+            "## A News Summary",
+            *(f"- `{key}`: `{value}`" for key, value in a_news_summary.items()),
+            "",
+            "## A News Episode Summaries",
+            *(
+                f"- `{row.get('signal_id')}` tick=`{row.get('tick')}` bucket=`{row.get('bucket')}` "
+                f"target=`{row.get('target_inventory')}` fill_qty=`{row.get('fill_qty')}` "
+                f"peak_news=`{row.get('peak_news_inventory')}` pnl=`{row.get('realized_episode_pnl')}` "
+                f"best_hold=`{row.get('best_counterfactual_hold')}` best_counterfactual_pnl=`{row.get('best_counterfactual_pnl')}` "
+                f"under_harvest_gap=`{row.get('under_harvest_pnl_gap')}` headline=`{row.get('headline')}`"
+                for row in a_news_episode_summaries
+            ),
+            "",
             "## B Cost-Adjusted Residual Stats",
             f"- Composite basis: `{b_cost_stats.get('composite_basis')}`",
             *(
                 f"- Strike `{strike}`: `{stats}`"
                 for strike, stats in (b_cost_stats.get("by_strike") or {}).items()
             ),
+            "",
+            "## B Shadow Underlying MM",
+            *(f"- `{key}`: `{value}`" for key, value in b_shadow_underlying_mm.items()),
+            "",
+            "## B Strategy Block Reasons",
+            *(f"- `{reason}`: `{count}`" for reason, count in b_strategy_block_reasons.items()),
             "",
             "## Trace Volume Summary",
             f"- Event counts: `{trace_volume_summary.get('event_counts')}`",
@@ -868,6 +1356,10 @@ class TraceRecorder:
         self.snapshots_path = self.run_dir / "decision_snapshots.csv"
         self.summary_json_path = self.run_dir / "session_summary.json"
         self.summary_md_path = self.run_dir / "session_summary.md"
+        self.a_news_tracker_json_path = self.run_dir / "a_news_tracker.json"
+        self.a_news_tracker_md_path = self.run_dir / "a_news_tracker.md"
+        self.unknown_a_news_terms_json_path = self.run_dir / "unknown_a_news_terms.json"
+        self.unknown_a_news_terms_md_path = self.run_dir / "unknown_a_news_terms.md"
         self._events_handle = self.events_path.open("a", encoding="utf-8")
         self._snapshot_writer = AppendSafeCsvWriter(self.snapshots_path, SNAPSHOT_FIELDNAMES)
         self._last_snapshot_ms_by_symbol: dict[str, int] = {}
@@ -919,12 +1411,36 @@ class TraceRecorder:
             "shock_direction": state.get("shock_direction"),
             "shock_threshold": state.get("shock_threshold"),
             "shock_target_fair": state.get("shock_target_fair"),
+            "shock_target_inventory": state.get("shock_target_inventory"),
+            "original_shock_target_inventory": state.get("original_shock_target_inventory"),
             "news_caution_active": state.get("news_caution_active"),
             "news_caution_until_ms": state.get("news_caution_until_ms"),
             "news_caution_remaining_ms": state.get("news_caution_remaining_ms"),
             "inventory": state.get("inventory"),
             "earnings_position": state.get("earnings_position"),
+            "news_position": state.get("news_position"),
             "mm_position": state.get("mm_position"),
+            "active_signal_kind": state.get("active_signal_kind"),
+            "base_fair_value": state.get("base_fair_value"),
+            "news_fair_value": state.get("news_fair_value"),
+            "news_sentiment_score": state.get("news_sentiment_score"),
+            "news_sentiment_bucket": state.get("news_sentiment_bucket"),
+            "news_confirmation_state": state.get("news_confirmation_state"),
+            "news_target_inventory": state.get("news_target_inventory"),
+            "pending_news_target_inventory": state.get("pending_news_target_inventory"),
+            "pending_news_signal_id": state.get("pending_news_signal_id"),
+            "active_news_signal_id": state.get("active_news_signal_id"),
+            "news_started_ms": state.get("news_started_ms"),
+            "pending_news": state.get("pending_news"),
+            "news_confirmation_deadline_ms": state.get("news_confirmation_deadline_ms"),
+            "news_takeover_started_ms": state.get("news_takeover_started_ms"),
+            "pe_frozen": state.get("pe_frozen"),
+            "news_matched_phrases": state.get("news_matched_phrases"),
+            "news_matched_unigrams": state.get("news_matched_unigrams"),
+            "news_matched_bigrams": state.get("news_matched_bigrams"),
+            "unknown_candidate_phrases": state.get("unknown_candidate_phrases"),
+            "unknown_candidate_unigrams": state.get("unknown_candidate_unigrams"),
+            "unknown_candidate_bigrams": state.get("unknown_candidate_bigrams"),
             "earnings_budget": state.get("earnings_budget"),
             "mm_budget": state.get("mm_budget"),
             "budget_shift_active": state.get("budget_shift_active"),
@@ -1003,6 +1519,32 @@ class TraceRecorder:
         )
         self._write_event(event)
 
+    def record_runtime_event(
+        self,
+        *,
+        event_type: str,
+        now_ms: int,
+        state: dict[str, Any],
+        cash: int | None,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        event = self._base_event(
+            event_type,
+            now_ms=now_ms,
+            exchange_tick=state.get("exchange_tick"),
+            mode=state.get("mode"),
+            symbol=state.get("symbol"),
+        )
+        event.update(self._state_fields(state, cash))
+        event.update(
+            {
+                "reason": reason,
+                "details": details or {},
+            }
+        )
+        self._write_event(event)
+
     def record_recovery_state(self, *, now_ms: int, state: dict[str, Any], cash: int | None, reason: str) -> None:
         event = self._base_event(
             "recovery_state_changed",
@@ -1065,6 +1607,7 @@ class TraceRecorder:
             {
                 "raw_payload": news_payload,
                 "raw_news_payload": news_payload,
+                "content": reaction.get("resolved_news_text"),
                 "news_kind": reaction.get("news_kind"),
                 "relevant": reaction.get("relevant"),
                 "mode_before_news": reaction.get("mode_before_news"),
@@ -1072,6 +1615,21 @@ class TraceRecorder:
                 "old_fair_value": reaction.get("old_fair_value"),
                 "new_fair_value": reaction.get("new_fair_value"),
                 "earnings_value": reaction.get("earnings_value"),
+                "news_sentiment_score": reaction.get("news_sentiment_score"),
+                "news_sentiment_bucket": reaction.get("news_sentiment_bucket"),
+                "base_fair_value": reaction.get("base_fair_value"),
+                "news_fair_value": reaction.get("news_fair_value"),
+                "news_target_inventory": reaction.get("news_target_inventory"),
+                "pending_news_target_inventory": reaction.get("pending_news_target_inventory"),
+                "news_confirmation_state": reaction.get("news_confirmation_state"),
+                "active_news_signal_id": reaction.get("active_news_signal_id"),
+                "news_matched_phrases": list(reaction.get("news_matched_phrases") or []),
+                "news_matched_unigrams": list(reaction.get("news_matched_unigrams") or []),
+                "news_matched_bigrams": list(reaction.get("news_matched_bigrams") or []),
+                "unknown_candidate_phrases": list(reaction.get("unknown_candidate_phrases") or []),
+                "unknown_candidate_unigrams": list(reaction.get("unknown_candidate_unigrams") or []),
+                "unknown_candidate_bigrams": list(reaction.get("unknown_candidate_bigrams") or []),
+                "resolved_news_text_source": reaction.get("resolved_news_text_source"),
                 "shock_direction": reaction.get("shock_direction"),
                 "shock_threshold": reaction.get("shock_threshold"),
                 "note": reaction.get("note"),
@@ -1428,6 +1986,7 @@ class TraceRecorder:
             "multiplier_confidence": event.get("multiplier_confidence"),
             "inventory": event.get("inventory"),
             "earnings_position": event.get("earnings_position"),
+            "news_position": event.get("news_position"),
             "mm_position": event.get("mm_position"),
             "buy_exposure": event.get("buy_exposure"),
             "sell_exposure": event.get("sell_exposure"),
@@ -1453,6 +2012,30 @@ class TraceRecorder:
             "mtm_basis": event.get("mtm_basis"),
             "mark_price": event.get("mark_price"),
             "news_caution_remaining_ms": event.get("news_caution_remaining_ms"),
+            "last_relevant_a_earnings_ms": event.get("last_relevant_a_earnings_ms"),
+            "active_earnings_cycle_id": event.get("active_earnings_cycle_id"),
+            "active_signal_kind": event.get("active_signal_kind"),
+            "current_earnings_signal_id": event.get("current_earnings_signal_id"),
+            "current_news_signal_id": event.get("current_news_signal_id"),
+            "active_news_signal_id": event.get("active_news_signal_id"),
+            "pending_news_signal_id": event.get("pending_news_signal_id"),
+            "news_sentiment_score": event.get("news_sentiment_score"),
+            "news_sentiment_bucket": event.get("news_sentiment_bucket"),
+            "base_fair_value": event.get("base_fair_value"),
+            "news_fair_value": event.get("news_fair_value"),
+            "news_target_inventory": event.get("news_target_inventory"),
+            "pending_news_target_inventory": event.get("pending_news_target_inventory"),
+            "pending_news_json": json.dumps(event.get("pending_news"), sort_keys=True, default=_json_default),
+            "news_confirmation_state": event.get("news_confirmation_state"),
+            "news_confirmation_deadline_ms": event.get("news_confirmation_deadline_ms"),
+            "news_takeover_started_ms": event.get("news_takeover_started_ms"),
+            "pe_frozen": event.get("pe_frozen"),
+            "news_matched_phrases_json": json.dumps(event.get("news_matched_phrases") or [], sort_keys=True, default=_json_default),
+            "news_matched_unigrams_json": json.dumps(event.get("news_matched_unigrams") or [], sort_keys=True, default=_json_default),
+            "news_matched_bigrams_json": json.dumps(event.get("news_matched_bigrams") or [], sort_keys=True, default=_json_default),
+            "unknown_candidate_phrases_json": json.dumps(event.get("unknown_candidate_phrases") or [], sort_keys=True, default=_json_default),
+            "unknown_candidate_unigrams_json": json.dumps(event.get("unknown_candidate_unigrams") or [], sort_keys=True, default=_json_default),
+            "unknown_candidate_bigrams_json": json.dumps(event.get("unknown_candidate_bigrams") or [], sort_keys=True, default=_json_default),
         }
 
     def finalize(self, *, now_ms: int, state: dict[str, Any], cash: int | None, note: str | None = None) -> None:
@@ -1472,9 +2055,43 @@ class TraceRecorder:
         self._events_handle.close()
         self._snapshot_writer.close()
         if self.trace_config.trace_write_summary_on_shutdown:
-            summary = summarize_trace_events(load_trace_events(self.run_dir), markout_windows_ms=self.trace_config.trace_markout_windows_ms)
+            events = load_trace_events(self.run_dir)
+            summary = summarize_trace_events(events, markout_windows_ms=self.trace_config.trace_markout_windows_ms)
+            tracker_report = build_a_news_tracker_report(events, config=AConfig())
+            unknown_terms_report = build_unknown_news_term_report(events)
+            headline_rows = tracker_report.get("headline_analyses") or []
+            recommendation_rows = tracker_report.get("term_recommendations") or []
+            summary["a_news_summary"] = {
+                "headline_count": len(headline_rows),
+                "episode_count": len(summary.get("a_news_episode_summaries") or []),
+                "traded_count": sum(1 for row in headline_rows if row.get("traded")),
+                "missed_no_trade_count": sum(1 for row in headline_rows if row.get("verdict") == "missed_no_trade"),
+                "undersized_count": sum(1 for row in headline_rows if row.get("verdict") == "undersized"),
+                "wrong_direction_count": sum(1 for row in headline_rows if row.get("verdict") == "wrong_direction"),
+                "under_harvest_candidate_count": sum(1 for row in (summary.get("a_news_episode_summaries") or []) if row.get("under_harvest_candidate")),
+                "a_news_pnl": round(float((summary.get("pnl_by_strategy_family") or {}).get("a_news", 0.0)), 4),
+                "fill_count": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_count", 0)),
+                "fill_qty": int(((summary.get("strategy_family_stats") or {}).get("a_news") or {}).get("fill_qty", 0)),
+                "top_recommendations": [
+                    {
+                        "term": row.get("term"),
+                        "suggested_action": row.get("suggested_action"),
+                        "suggested_weight_delta": row.get("suggested_weight_delta"),
+                    }
+                    for row in recommendation_rows
+                    if row.get("suggested_action") not in {None, "review"}
+                ][:10],
+            }
             with self.summary_json_path.open("w", encoding="utf-8") as handle:
                 json.dump(summary, handle, indent=2, sort_keys=True, default=_json_default)
             with self.summary_md_path.open("w", encoding="utf-8") as handle:
                 handle.write(render_summary_markdown(summary, self.run_id, self.run_dir))
+            with self.a_news_tracker_json_path.open("w", encoding="utf-8") as handle:
+                json.dump(tracker_report, handle, indent=2, sort_keys=True, default=_json_default)
+            with self.a_news_tracker_md_path.open("w", encoding="utf-8") as handle:
+                handle.write(render_a_news_tracker_markdown(tracker_report, self.run_dir))
+            with self.unknown_a_news_terms_json_path.open("w", encoding="utf-8") as handle:
+                json.dump(unknown_terms_report, handle, indent=2, sort_keys=True, default=_json_default)
+            with self.unknown_a_news_terms_md_path.open("w", encoding="utf-8") as handle:
+                handle.write(render_unknown_terms_markdown(unknown_terms_report, self.run_dir))
         self._closed = True

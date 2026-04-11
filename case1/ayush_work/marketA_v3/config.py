@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -15,6 +15,101 @@ class ExchangeConfig:
     host: str
     username: str
     password: str
+
+
+@dataclass(frozen=True)
+class MarketCStrategyConfig:
+    symbol_c: str = "C"
+    fed_hike: str = "R_HIKE"
+    fed_hold: str = "R_HOLD"
+    fed_cut: str = "R_CUT"
+    prediction_scale: int = 1_000
+    max_exchange_order_qty: int = 40
+    max_open_orders: int = 50
+    max_outstanding_volume: int = 120
+    max_absolute_position_per_contract: int = 200
+    shared_rate_position_budget: int = 600
+    signal_light_position: int = 40
+    signal_medium_position: int = 80
+    signal_strong_position: int = 140
+    signal_extreme_position: int = 200
+    entry_edge_ticks: int = 25
+    exit_edge_ticks: int = 10
+    no_arb_sum_tolerance_ticks: int = 120
+    expected_rate_step_bp: float = 25.0
+    cpi_small_surprise: float = 0.0002
+    cpi_medium_surprise: float = 0.0005
+    cpi_large_surprise: float = 0.0010
+    cpi_small_logit_shift: float = 0.35
+    cpi_medium_logit_shift: float = 0.75
+    cpi_large_logit_shift: float = 1.20
+    news_relevance_threshold: float = 0.75
+    news_light_logit_shift: float = 0.30
+    news_medium_logit_shift: float = 0.65
+    news_strong_logit_shift: float = 1.05
+    news_extreme_logit_shift: float = 1.40
+    news_score_delta_divisor: float = 2.5
+    posterior_floor_probability: float = 1e-4
+    flatten_near_zero_threshold: int = 0
+    macro_signal_timeout_ms: int = 10_000
+    round_duration_ms: int = 900_000
+    decision_probe_countdown_ms: int = 180_000
+    decision_probe_base_target: int = 20
+    decision_probe_confident_target: int = 80
+    decision_probe_confidence_gap_ticks: int = 175
+    decision_probe_confident_price: int = 700
+    baseline_center_price: int = 400
+    baseline_neutral_low_price: int = 320
+    baseline_neutral_high_price: int = 480
+    baseline_target_cap: int = 60
+    baseline_full_size_distance_ticks: int = 320
+    trading_macro_target_cap: int = 120
+    macro_pair_min_delta: float = 0.35
+    macro_pair_hold_tail_fallback_delta: float = 0.15
+    macro_move_light_ticks: int = 25
+    macro_move_medium_ticks: int = 50
+    macro_move_strong_ticks: int = 80
+    macro_move_extreme_ticks: int = 120
+    macro_equilibrium_hold_ms: int = 1_000
+    macro_equilibrium_min_elapsed_ms: int = 1_000
+    macro_equilibrium_min_samples: int = 3
+    macro_equilibrium_band_ticks: int = 12
+    macro_equilibrium_residual_edge_ticks: int = 15
+    macro_overshoot_trigger_fraction: float = 0.25
+    macro_overshoot_min_trigger_ticks: int = 8
+    macro_overshoot_trim_fraction: float = 0.50
+    macro_overshoot_min_residual_qty: int = 20
+    macro_reversal_min_progress_ticks: int = 18
+    macro_reversal_exit_ticks: int = 8
+    reversion_disable_countdown_ms: int = 180_000
+    reversion_low_price_threshold: int = 40
+    reversion_high_price_threshold: int = 960
+    reversion_overlay_target: int = 120
+    reversion_take_profit_ticks: int = 60
+    reversion_stop_loss_ticks: int = 25
+    reversion_reversal_min_progress_ticks: int = 18
+    reversion_reversal_exit_ticks: int = 8
+    pair_disable_countdown_ms: int = 180_000
+    pair_lookback_ms: int = 5_000
+    pair_min_move_ticks: int = 18
+    pair_overlay_target: int = 120
+    pair_reversal_min_progress_ticks: int = 18
+    pair_reversal_exit_ticks: int = 8
+    endgame_countdown_ms: int = 120_000
+    endgame_long_target: int = 200
+    endgame_short_target: int = -200
+    endgame_almost_dead_price: int = 50
+    order_slice_target_qty: int = 12
+    order_slice_min_qty: int = 7
+    order_slice_max_qty: int = 15
+    timer_interval_ms: int = 60
+    min_order_live_ms: int = 75
+    replace_qty_tolerance: int = 1
+    replace_price_tolerance_ticks: int = 0
+
+    @property
+    def tracked_symbols(self) -> tuple[str, str, str]:
+        return (self.fed_hike, self.fed_hold, self.fed_cut)
 
 
 @dataclass(frozen=True)
@@ -40,6 +135,7 @@ class StrategyConfig:
     shock_emergency_dump_ticks: int = 40
     shock_emergency_dump_fraction: float = 0.20
     shock_emergency_dump_min_inventory: int = 12
+    shock_max_hold_ms: int = 12_500
     shock_decay_start_ms: int = 5_000
     shock_decay_interval_ms: int = 500
     shock_decay_fraction: float = 0.08
@@ -128,6 +224,7 @@ class BotConfig:
     strategy: StrategyConfig
     logger: LoggerConfig
     paths: BotPaths
+    c_strategy: MarketCStrategyConfig = field(default_factory=MarketCStrategyConfig)
 
 
 def _optional_int(name: str, default: int) -> int:
@@ -220,6 +317,7 @@ def load_bot_config(base_dir: str | Path) -> BotConfig:
         shock_emergency_dump_ticks=_optional_int("A_V3_SHOCK_EMERGENCY_DUMP_TICKS", 40),
         shock_emergency_dump_fraction=_optional_float("A_V3_SHOCK_EMERGENCY_DUMP_FRACTION", 0.20),
         shock_emergency_dump_min_inventory=_optional_int("A_V3_SHOCK_EMERGENCY_DUMP_MIN_INVENTORY", 12),
+        shock_max_hold_ms=_optional_int("A_V3_SHOCK_MAX_HOLD_MS", 12_500),
         shock_decay_start_ms=_optional_int("A_V3_SHOCK_DECAY_START_MS", 5_000),
         shock_decay_interval_ms=_optional_int("A_V3_SHOCK_DECAY_INTERVAL_MS", 500),
         shock_decay_fraction=_optional_float("A_V3_SHOCK_DECAY_FRACTION", 0.08),
@@ -297,6 +395,7 @@ def load_bot_config(base_dir: str | Path) -> BotConfig:
     return BotConfig(
         exchange=exchange,
         strategy=strategy,
+        c_strategy=MarketCStrategyConfig(),
         logger=logger,
         paths=BotPaths(base_dir=base_path),
     )
