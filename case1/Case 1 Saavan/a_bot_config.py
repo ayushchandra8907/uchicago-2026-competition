@@ -205,7 +205,7 @@ class BConfig:
     option_lottery_atm_max_position: int = 40
     option_lottery_total_premium_budget: int = 1_500
     option_lottery_wing_premium_budget: int = 600
-    option_lottery_c1050_premium_budget: int = 450
+    option_lottery_c1050_premium_budget: int = 0
     option_lottery_p950_premium_budget: int = 450
     option_lottery_atm_total_premium_budget: int = 300
     option_lottery_near_strike_ticks: int = 80
@@ -624,7 +624,7 @@ def load_bot_config(
             option_lottery_atm_max_position=_optional_int("B_OPTION_LOTTERY_ATM_MAX_POSITION", 40) or 40,
             option_lottery_total_premium_budget=_optional_int("B_OPTION_LOTTERY_TOTAL_PREMIUM_BUDGET", 1_500) or 1_500,
             option_lottery_wing_premium_budget=_optional_int("B_OPTION_LOTTERY_WING_PREMIUM_BUDGET", 600) or 600,
-            option_lottery_c1050_premium_budget=_optional_int("B_OPTION_C1050_PREMIUM_BUDGET", 450) or 450,
+            option_lottery_c1050_premium_budget=_optional_int("B_OPTION_C1050_PREMIUM_BUDGET", 0),
             option_lottery_p950_premium_budget=_optional_int("B_OPTION_P950_PREMIUM_BUDGET", 450) or 450,
             option_lottery_atm_total_premium_budget=_optional_int("B_OPTION_LOTTERY_ATM_TOTAL_PREMIUM_BUDGET", 300) or 300,
             option_lottery_near_strike_ticks=_optional_int("B_OPTION_LOTTERY_NEAR_STRIKE_TICKS", 80) or 80,

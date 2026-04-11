@@ -563,7 +563,7 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(config.market_b.option_lottery_wing_max_position, 200)
             self.assertEqual(config.market_b.option_lottery_atm_max_position, 40)
             self.assertEqual(config.market_b.option_lottery_wing_premium_budget, 600)
-            self.assertEqual(config.market_b.option_lottery_c1050_premium_budget, 450)
+            self.assertEqual(config.market_b.option_lottery_c1050_premium_budget, 0)
             self.assertEqual(config.market_b.option_lottery_p950_premium_budget, 450)
             self.assertEqual(config.market_b.option_lottery_atm_total_premium_budget, 300)
             self.assertTrue(config.market_b.option_lottery_profit_take_enabled)

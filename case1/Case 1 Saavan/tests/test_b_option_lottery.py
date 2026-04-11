@@ -93,6 +93,29 @@ class BOptionLotteryTests(unittest.TestCase):
         self.assertIsNotNone(plan.bid)
         self.assertEqual(plan.bid.qty, 2)
 
+    def test_default_config_disables_c1050_lottery_budget(self) -> None:
+        strategy = BOptionLotteryStrategy(
+            BConfig(
+                option_lottery_total_premium_budget=12,
+                option_lottery_wing_premium_budget=9,
+                option_lottery_rebuy_cooldown_ms=0,
+            ),
+            RiskConfig(reprice_cooldown_ms=0, passive_reprice_threshold_ticks=1, passive_quote_ttl_ms=3_000),
+            book_depth_levels=5,
+        )
+        strategy.on_book_update_at("B", FakeOrderBook(bids={999: 10}, asks={1001: 10}), now_ms=1_000)
+        strategy.on_book_update_at("B", FakeOrderBook(bids={1002: 10}, asks={1004: 10}), now_ms=1_100)
+        strategy.on_book_update_at("B_C_1050", FakeOrderBook(bids={1: 10}, asks={3: 10}), now_ms=1_200)
+
+        plan = strategy.compute_quote_plan(
+            "B_C_1050",
+            now_ms=1_200,
+            residual_payload={"composite_basis": 2.0, "underlying_mid": 1003.0},
+        )
+
+        self.assertTrue(plan.observe_only)
+        self.assertEqual(plan.reason, "option_lottery_premium_budget_spent")
+
     def test_expensive_option_does_not_trade(self) -> None:
         strategy = self.make_strategy()
         strategy.on_book_update_at("B_C_1050", FakeOrderBook(bids={4: 10}, asks={5: 10}), now_ms=1_200)
