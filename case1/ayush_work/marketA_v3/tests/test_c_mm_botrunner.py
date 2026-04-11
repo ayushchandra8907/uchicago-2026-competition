@@ -19,9 +19,10 @@ def build_config() -> BotConfig:
 
 
 class CMMBotRunnerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cm_runner_tracks_only_stock_c(self):
+    async def test_cm_runner_tracks_stock_c_plus_rate_context(self):
         runner = BotRunner(build_config(), active_strategy="CM")
-        self.assertEqual(runner._tracked_symbols, ("C",))
+        self.assertEqual(runner._tracked_symbols, ("C", "R_HIKE", "R_HOLD", "R_CUT"))
+        self.assertEqual(runner._strategy_symbols, ("C",))
 
     async def test_apply_decision_for_cm_submits_on_c(self):
         runner = BotRunner(build_config(), active_strategy="CM")
