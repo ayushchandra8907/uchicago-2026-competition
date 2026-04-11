@@ -549,6 +549,8 @@ class ETFAFollowerStrategy:
     ) -> tuple[bool, str]:
         if elapsed_ms >= int(self.config.max_hold_ms):
             return True, "etf_max_hold_elapsed"
+        if self.inventory != 0 and elapsed_ms >= int(self.config.min_hold_ms) and self._target_price_reached(signal):
+            return True, "etf_target_price_reached"
 
         if signal.source_market == "A":
             a_snapshot = a_state or {}

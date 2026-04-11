@@ -144,6 +144,29 @@ class ETFAFollowerTests(unittest.TestCase):
         self.assertEqual(plan.mode, "ETF_A_HOLD")
         self.assertEqual(len(plan.aggressive_actions), 0)
 
+    def test_reaches_target_price_after_min_hold_then_unwinds(self) -> None:
+        strategy = self.make_strategy(alpha=0.25)
+        signal = strategy.on_a_news_reaction(
+            NewsReaction(
+                relevant=True,
+                fair_value_updated=True,
+                earnings_value=1.1,
+                old_fair_value=1000,
+                new_fair_value=1100,
+            ),
+            now_ms=1_100,
+        )
+        self.assertIsNotNone(signal)
+        strategy.sync_inventory_from_exchange(24, now_ms=1_200)
+        strategy.on_book_update_at("ETF", FakeOrderBook(bids={1023: 10}, asks={1027: 10}), now_ms=4_500)
+
+        plan = strategy.compute_quotes(now_ms=4_500, a_state={"mode": "POST_EARNINGS_SHOCK", "shock_direction": 1})
+
+        self.assertEqual(plan.mode, "ETF_UNWIND")
+        self.assertEqual(len(plan.aggressive_actions), 1)
+        self.assertEqual(plan.aggressive_actions[0].side, "SELL")
+        self.assertEqual(plan.reason, "etf_target_price_reached")
+
     def test_fill_after_position_update_does_not_double_count_inventory(self) -> None:
         strategy = self.make_strategy(alpha=0.25)
         strategy.on_a_news_reaction(
