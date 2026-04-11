@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import logging
+import os
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -1169,6 +1173,10 @@ class MarketABot(XChangeClient):
                     break
                 except EOFError:
                     self.connected = False
+                    self._emit_disconnect_alert(
+                        "eof",
+                        details=f"elapsed_runtime_ms={self._elapsed_runtime_ms()}",
+                    )
                     self._record_runtime_event(
                         "runtime_disconnect",
                         reason="eof",
@@ -1201,6 +1209,10 @@ class MarketABot(XChangeClient):
                         LOGGER.info("Exchange stream cancelled cleanly (%s).", self._shutdown_note)
                         break
                     self.connected = False
+                    self._emit_disconnect_alert(
+                        f"grpc:{exc.code().name}",
+                        details=exc.details(),
+                    )
                     self._record_runtime_event(
                         "runtime_disconnect",
                         reason=f"grpc:{exc.code().name}",
@@ -1270,6 +1282,44 @@ class MarketABot(XChangeClient):
         if not self._connected_once or not self._position_snapshot_seen.is_set():
             return True
         return self._elapsed_runtime_ms() < self._unexpected_disconnect_retry_cutoff_ms()
+
+    def _should_alert_disconnect(self) -> bool:
+        raw = os.getenv("BOT_DISCONNECT_ALERT_ENABLED")
+        if raw is None or raw.strip() == "":
+            return False
+        return raw.strip().lower() not in {"0", "false", "no", "off"} and not self._auto_stop_requested
+
+    def _emit_disconnect_alert(self, reason: str, details: str | None = None) -> None:
+        if not self._should_alert_disconnect():
+            return
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        message = f"[{timestamp}] WARNING unexpected bot disconnect: {reason}"
+        if details:
+            message = f"{message} | {details}"
+        try:
+            print(message, file=sys.stderr, flush=True)
+            print("\a", end="", file=sys.stderr, flush=True)
+        except Exception:
+            LOGGER.exception("Failed to emit disconnect warning to stderr.")
+
+        afplay = shutil.which("afplay")
+        if not afplay:
+            return
+        sound_path = (os.getenv("BOT_DISCONNECT_ALERT_SOUND") or "/System/Library/Sounds/Basso.aiff").strip()
+        if not sound_path:
+            return
+        sound_file = Path(sound_path)
+        if not sound_file.exists():
+            return
+        try:
+            subprocess.Popen(
+                [afplay, str(sound_file)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            LOGGER.exception("Failed to play disconnect alert sound.")
 
     @staticmethod
     def _is_retryable_stream_error(exc: grpc.aio.AioRpcError) -> bool:
@@ -2327,24 +2377,46 @@ class MarketABot(XChangeClient):
             )
 
 
-async def main() -> None:
+def load_runtime_config(
+    *,
+    default_host: str | None = DEFAULT_SERVER,
+    default_username: str | None = DEFAULT_USERNAME,
+    default_password: str | None = DEFAULT_PASSWORD,
+) -> BotConfig:
     base_dir = Path(__file__).resolve().parent
     try:
-        config = load_bot_config(
+        return load_bot_config(
             base_dir,
-            default_host=DEFAULT_SERVER,
-            default_username=DEFAULT_USERNAME,
-            default_password=DEFAULT_PASSWORD,
+            default_host=default_host,
+            default_username=default_username,
+            default_password=default_password,
             default_initial_multiplier=DEFAULT_A_INITIAL_MULTIPLIER,
             default_initial_fair_value=DEFAULT_A_INITIAL_FAIR_VALUE,
         )
     except ConfigError as exc:
         raise SystemExit(str(exc)) from exc
 
+
+async def run_bot(
+    *,
+    default_host: str | None = DEFAULT_SERVER,
+    default_username: str | None = DEFAULT_USERNAME,
+    default_password: str | None = DEFAULT_PASSWORD,
+) -> None:
+    config = load_runtime_config(
+        default_host=default_host,
+        default_username=default_username,
+        default_password=default_password,
+    )
+
     LOGGER.info("Starting multi-market runtime against %s", config.exchange.host)
     LOGGER.info("Journal path: %s", config.paths.journal_path)
     bot = MarketABot(config)
     await bot.start()
+
+
+async def main() -> None:
+    await run_bot()
 
 
 if __name__ == "__main__":
