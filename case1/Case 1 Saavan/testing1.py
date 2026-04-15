@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import logging
+import os
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -10,6 +14,7 @@ from typing import Optional
 import grpc
 
 from a_bot_config import BotConfig, ConfigError, load_bot_config
+from a_earnings_trap_overlay import AEarningsTrapOverlay
 from a_bot_journal import TradingJournal, select_recovered_pricing_state
 from a_bot_strategy import MarketAStrategy
 from a_bot_trace import TraceRecorder
@@ -176,6 +181,15 @@ class MarketABot(XChangeClient):
                 recovered_earnings_value=recovered_earnings_value,
                 book_depth_levels=max(10, config.trace.trace_book_depth_levels),
             )
+        self.a_trap_overlay = (
+            AEarningsTrapOverlay(
+                config.market_a,
+                config.risk,
+                book_depth_levels=max(10, config.trace.trace_book_depth_levels),
+            )
+            if bool(config.market_a.earnings_trap_enabled)
+            else None
+        )
         self.tracer = TraceRecorder.create_if_enabled(config.trace, session_prefix="a_bot_run", symbol="A")
         self._quote_lock = asyncio.Lock()
         self._position_snapshot_seen = asyncio.Event()
@@ -192,6 +206,7 @@ class MarketABot(XChangeClient):
         self._connected_once = False
         self._awaiting_reconnect_success = False
         self._reconnect_attempt_count = 0
+        self._passive_only_mode = str(os.getenv("BOT_PASSIVE_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
         if replay_state.live_orders:
             restored_ids = ", ".join(order.order_id for order in replay_state.live_orders)
@@ -213,6 +228,10 @@ class MarketABot(XChangeClient):
             LOGGER.info("Seeding A multiplier from config: %.4f", config.market_a.initial_multiplier)
         else:
             LOGGER.info("A valuation will learn a round-specific multiplier from structured earnings.")
+        if self.a_trap_overlay is not None:
+            LOGGER.info("A earnings trap overlay enabled for structured earnings shock experiments.")
+        if self._passive_only_mode:
+            LOGGER.warning("Global passive-only guard enabled: all strategies will submit non-marketable limit orders only.")
         if self.tracer is not None:
             LOGGER.info("Analysis mode enabled; writing trace outputs to %s", self.tracer.run_dir)
         if self.tracer is not None:
@@ -586,6 +605,24 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync_c("cancel response", force=True)
             return
 
+        if self.a_trap_overlay is not None and order_id in self.a_trap_overlay.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.a_trap_overlay.on_cancel_response(order_id, success)
+            self.journal.record_cancel_response(order_id, success, error)
+            if self.tracer is not None:
+                self.tracer.record_cancel_response(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    success=success,
+                    error=error,
+                    side=None if order is None else order.side,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync("trap cancel response")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_cancel_response(order_id, success)
@@ -745,6 +782,34 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync_c("fill", force=True)
             return
 
+        if self.a_trap_overlay is not None and order_id in self.a_trap_overlay.order_manager.orders:
+            now_ms = self._now_ms()
+            existing_order = self.a_trap_overlay.order_manager.orders.get(order_id)
+            side = "BUY" if existing_order is None else existing_order.side
+            strategy_inventory = int(self.strategy.inventory)
+            authoritative_inventory, _pre_fill_inventory = self._authoritative_inventory_after_fill(
+                "A",
+                side,
+                qty,
+                strategy_inventory,
+            )
+            order = self.a_trap_overlay.on_fill(order_id, qty, price)
+            self.journal.record_fill(order_id, qty, price)
+            self._sync_a_inventory_from_exchange(authoritative_inventory, now_ms=now_ms)
+            self.journal.record_inventory(int(self.strategy.inventory), cash=int(self.positions.get("cash", 0)))
+            if self.tracer is not None:
+                self.tracer.record_fill(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order=None if order is None else self._order_to_dict(order),
+                    order_id=order_id,
+                    qty=qty,
+                    price=price,
+                )
+            await self._evaluate_and_sync("trap fill")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_fill(order_id, qty, price)
@@ -841,6 +906,23 @@ class MarketABot(XChangeClient):
             await self._evaluate_and_sync_c("rejection", force=True)
             return
 
+        if self.a_trap_overlay is not None and order_id in self.a_trap_overlay.order_manager.orders:
+            now_ms = self._now_ms()
+            order = self.a_trap_overlay.on_rejection(order_id)
+            self.journal.record_rejection(order_id, reason)
+            LOGGER.warning("A trap order %s rejected: %s", order_id, reason)
+            if self.tracer is not None:
+                self.tracer.record_rejection(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=order_id,
+                    reason=reason,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self._evaluate_and_sync("trap rejection")
+            return
+
         was_recovery_active = self.strategy.recovery_active
         now_ms = self._now_ms()
         order = self.strategy.on_rejection(order_id)
@@ -930,6 +1012,8 @@ class MarketABot(XChangeClient):
         if symbol == "A":
             now_ms = self._now_ms()
             self.strategy.on_book_update_at(symbol, self.order_books[symbol], now_ms)
+            if self.a_trap_overlay is not None:
+                self.a_trap_overlay.on_book_update_at(symbol, self.order_books[symbol], now_ms)
             if self.tracer is not None:
                 self.tracer.record_book_update(
                     now_ms=now_ms,
@@ -1123,8 +1207,6 @@ class MarketABot(XChangeClient):
             reason="settlement_payout",
             details={"user": user, "market_id": market_id, "amount": int(amount), "tick": int(tick)},
         )
-        if self.config.auto_stop_after_round_complete:
-            self._request_round_complete_stop("settlement_payout")
 
     def _on_position_snapshot_received(self, now_ms: int) -> bool:
         self._position_snapshot_count += 1
@@ -1169,6 +1251,10 @@ class MarketABot(XChangeClient):
                     break
                 except EOFError:
                     self.connected = False
+                    self._emit_disconnect_alert(
+                        "eof",
+                        details=f"elapsed_runtime_ms={self._elapsed_runtime_ms()}",
+                    )
                     self._record_runtime_event(
                         "runtime_disconnect",
                         reason="eof",
@@ -1201,6 +1287,10 @@ class MarketABot(XChangeClient):
                         LOGGER.info("Exchange stream cancelled cleanly (%s).", self._shutdown_note)
                         break
                     self.connected = False
+                    self._emit_disconnect_alert(
+                        f"grpc:{exc.code().name}",
+                        details=exc.details(),
+                    )
                     self._record_runtime_event(
                         "runtime_disconnect",
                         reason=f"grpc:{exc.code().name}",
@@ -1270,6 +1360,44 @@ class MarketABot(XChangeClient):
         if not self._connected_once or not self._position_snapshot_seen.is_set():
             return True
         return self._elapsed_runtime_ms() < self._unexpected_disconnect_retry_cutoff_ms()
+
+    def _should_alert_disconnect(self) -> bool:
+        raw = os.getenv("BOT_DISCONNECT_ALERT_ENABLED")
+        if raw is None or raw.strip() == "":
+            return False
+        return raw.strip().lower() not in {"0", "false", "no", "off"} and not self._auto_stop_requested
+
+    def _emit_disconnect_alert(self, reason: str, details: str | None = None) -> None:
+        if not self._should_alert_disconnect():
+            return
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        message = f"[{timestamp}] WARNING unexpected bot disconnect: {reason}"
+        if details:
+            message = f"{message} | {details}"
+        try:
+            print(message, file=sys.stderr, flush=True)
+            print("\a", end="", file=sys.stderr, flush=True)
+        except Exception:
+            LOGGER.exception("Failed to emit disconnect warning to stderr.")
+
+        afplay = shutil.which("afplay")
+        if not afplay:
+            return
+        sound_path = (os.getenv("BOT_DISCONNECT_ALERT_SOUND") or "/System/Library/Sounds/Basso.aiff").strip()
+        if not sound_path:
+            return
+        sound_file = Path(sound_path)
+        if not sound_file.exists():
+            return
+        try:
+            subprocess.Popen(
+                [afplay, str(sound_file)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            LOGGER.exception("Failed to play disconnect alert sound.")
 
     @staticmethod
     def _is_retryable_stream_error(exc: grpc.aio.AioRpcError) -> bool:
@@ -1470,6 +1598,9 @@ class MarketABot(XChangeClient):
                 LOGGER.info("Cancelling %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only("A", placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order("A", placement.qty, side, placement.px)
                 managed_order = self.strategy.order_manager.note_submitted(
@@ -1508,6 +1639,7 @@ class MarketABot(XChangeClient):
                     placement.px,
                     placement.reason,
                 )
+            await self._sync_a_earnings_trap_overlay(reason, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.maybe_record_periodic_snapshot(
                     now_ms=now_ms,
@@ -1563,6 +1695,7 @@ class MarketABot(XChangeClient):
             else:
                 self._last_observe_only_reason = None
             await self._apply_ayush_decision(decision, now_ms=now_ms)
+            await self._sync_a_earnings_trap_overlay(reason, now_ms=now_ms)
             if self.tracer is not None:
                 self.tracer.maybe_record_periodic_snapshot(
                     now_ms=now_ms,
@@ -1626,6 +1759,9 @@ class MarketABot(XChangeClient):
             LOGGER.info("Cancelling Ayush A %s order %s because %s", order.side, order.order_id, cancel_reason)
 
     async def _submit_ayush_order(self, desired, *, now_ms: int) -> None:
+        desired = self._sanitize_desired_for_passive_only("A", desired)
+        if desired is None:
+            return
         side = Side.BUY if desired.side == "BUY" else Side.SELL
         order_id = await self.place_order("A", desired.qty, side, desired.px)
         managed_order = self.strategy.note_submitted(order_id=order_id, desired=desired, now_ms=now_ms)
@@ -1646,6 +1782,73 @@ class MarketABot(XChangeClient):
             desired.px,
             desired.reason,
         )
+
+    async def _sync_a_earnings_trap_overlay(self, reason: str, *, now_ms: int) -> None:
+        if self.a_trap_overlay is None:
+            return
+        plan = self.a_trap_overlay.compute_quotes(now_ms, self.strategy.trace_state(now_ms))
+        actions = self.a_trap_overlay.order_manager.build_actions(plan, now_ms)
+
+        for cancel in actions.cancels:
+            order = self.a_trap_overlay.order_manager.mark_cancel_requested(cancel.order_id, now_ms)
+            self.journal.record_cancel_requested(cancel.order_id)
+            if self.tracer is not None:
+                self.tracer.record_cancel_requested(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order_id=cancel.order_id,
+                    side=cancel.side,
+                    cancel_reason=cancel.reason,
+                    mode_at_cancel=self.strategy.mode,
+                    order=None if order is None else self._order_to_dict(order),
+                )
+            await self.cancel_order(cancel.order_id)
+            LOGGER.info("Cancelling A trap %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
+
+        for placement in actions.placements:
+            placement = self._sanitize_placement_for_passive_only("A", placement)
+            if placement is None:
+                continue
+            side = Side.BUY if placement.side == "BUY" else Side.SELL
+            order_id = await self.place_order("A", placement.qty, side, placement.px)
+            managed_order = self.a_trap_overlay.order_manager.note_submitted(
+                order_id=order_id,
+                side=placement.side,
+                px=placement.px,
+                qty=placement.qty,
+                now_ms=now_ms,
+                overlay=placement.overlay,
+                aggressive=placement.aggressive,
+                intent=placement.intent,
+                mode_at_submit=placement.mode_at_submit,
+                evaluation_reason=placement.evaluation_reason,
+                market_key=placement.market_key,
+                strategy_family=placement.strategy_family,
+                action_class=placement.action_class,
+                pnl_owner=placement.pnl_owner,
+                signal_id=placement.signal_id,
+                trade_group_id=placement.trade_group_id,
+                leg_role=placement.leg_role,
+            )
+            self.a_trap_overlay.on_order_submitted(managed_order.signal_id)
+            self.journal.record_order_submitted(managed_order)
+            if self.tracer is not None:
+                self.tracer.record_order_submitted(
+                    now_ms=now_ms,
+                    state=self._trace_state_for_symbol("A", now_ms),
+                    cash=self._current_cash(),
+                    order=self._order_to_dict(managed_order),
+                )
+            LOGGER.info(
+                "Placed A trap %s order %s: qty=%s px=%s reason=%s trigger=%s",
+                placement.side,
+                order_id,
+                placement.qty,
+                placement.px,
+                placement.reason,
+                reason,
+            )
 
     async def _evaluate_and_sync_c(self, reason: str, *, force: bool = False) -> None:
         if (
@@ -1693,6 +1896,9 @@ class MarketABot(XChangeClient):
             if not self._c_trading_enabled:
                 return
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only(self.config.market_c.symbol, placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order(self.config.market_c.symbol, placement.qty, side, placement.px)
                 managed_order = self.c_strategy.order_manager.note_submitted(
@@ -1909,6 +2115,9 @@ class MarketABot(XChangeClient):
                 LOGGER.info("Cancelling ETF %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only(self.config.etf.symbol, placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order(self.config.etf.symbol, placement.qty, side, placement.px)
                 managed_order = self.etf_strategy.order_manager.note_submitted(
@@ -1999,6 +2208,9 @@ class MarketABot(XChangeClient):
                 LOGGER.info("Cancelling B %s order %s because %s", cancel.side, cancel.order_id, cancel.reason)
 
             for placement in actions.placements:
+                placement = self._sanitize_placement_for_passive_only(self.config.market_b.underlying_symbol, placement)
+                if placement is None:
+                    continue
                 side = Side.BUY if placement.side == "BUY" else Side.SELL
                 order_id = await self.place_order(self.config.market_b.underlying_symbol, placement.qty, side, placement.px)
                 managed_order = self.b_strategy.order_manager.note_submitted(
@@ -2097,6 +2309,9 @@ class MarketABot(XChangeClient):
                     LOGGER.info("Cancelling %s %s order %s because %s", symbol, cancel.side, cancel.order_id, cancel.reason)
 
                 for placement in actions.placements:
+                    placement = self._sanitize_placement_for_passive_only(symbol, placement)
+                    if placement is None:
+                        continue
                     side = Side.BUY if placement.side == "BUY" else Side.SELL
                     order_id = await self.place_order(symbol, placement.qty, side, placement.px)
                     managed_order = self.b_option_strategy.note_submitted(
@@ -2177,6 +2392,85 @@ class MarketABot(XChangeClient):
         if exchange_inventory == strategy_inventory_before_fill + signed_qty:
             return exchange_inventory, strategy_inventory_before_fill
         return strategy_inventory_before_fill + signed_qty, strategy_inventory_before_fill
+
+    def _sanitize_desired_for_passive_only(self, symbol: str, desired):
+        if desired is None or not self._passive_only_mode:
+            return desired
+        safe_px, block_reason = self._passive_only_price(symbol, desired.side, desired.px)
+        if safe_px is None:
+            LOGGER.warning(
+                "Passive-only guard skipped %s %s order because %s.",
+                symbol,
+                desired.side,
+                block_reason,
+            )
+            return None
+        if bool(getattr(desired, "aggressive", False)) or int(desired.px) != int(safe_px):
+            LOGGER.warning(
+                "Passive-only guard adjusted %s %s order from px=%s aggressive=%s to px=%s.",
+                symbol,
+                desired.side,
+                desired.px,
+                bool(getattr(desired, "aggressive", False)),
+                safe_px,
+            )
+        return replace(desired, px=int(safe_px), aggressive=False)
+
+    def _sanitize_placement_for_passive_only(self, symbol: str, placement):
+        if placement is None or not self._passive_only_mode:
+            return placement
+        safe_px, block_reason = self._passive_only_price(symbol, placement.side, placement.px)
+        if safe_px is None:
+            LOGGER.warning(
+                "Passive-only guard skipped %s %s order because %s.",
+                symbol,
+                placement.side,
+                block_reason,
+            )
+            return None
+        if bool(getattr(placement, "aggressive", False)) or int(placement.px) != int(safe_px):
+            LOGGER.warning(
+                "Passive-only guard adjusted %s %s order from px=%s aggressive=%s to px=%s.",
+                symbol,
+                placement.side,
+                placement.px,
+                bool(getattr(placement, "aggressive", False)),
+                safe_px,
+            )
+        return replace(placement, px=int(safe_px), aggressive=False)
+
+    def _passive_only_price(self, symbol: str, side: str, requested_px: int) -> tuple[int | None, str | None]:
+        if not self._passive_only_mode:
+            return int(requested_px), None
+        book = self.order_books.get(symbol)
+        bids = getattr(book, "bids", {}) if book is not None else {}
+        asks = getattr(book, "asks", {}) if book is not None else {}
+        best_bid = max((int(px) for px, qty in bids.items() if int(qty) > 0), default=None)
+        best_ask = min((int(px) for px, qty in asks.items() if int(qty) > 0), default=None)
+        requested_px = int(requested_px)
+
+        if side == "BUY":
+            if best_bid is None:
+                return None, "missing_best_bid_for_passive_only_guard"
+            safe_px = min(requested_px, int(best_bid))
+            if best_ask is not None:
+                safe_px = min(safe_px, int(best_ask) - 1)
+            if safe_px <= 0:
+                return None, "nonpositive_passive_only_price"
+            return int(safe_px), None
+
+        if best_ask is None:
+            return None, "missing_best_ask_for_passive_only_guard"
+        safe_px = max(requested_px, int(best_ask))
+        if best_bid is not None:
+            safe_px = max(safe_px, int(best_bid) + 1)
+        return int(safe_px), None
+
+    def _sync_a_inventory_from_exchange(self, inventory: int, *, now_ms: int) -> None:
+        if self._ayush_port_mode:
+            self.strategy.sync_inventory_from_exchange(int(inventory), now_ms=now_ms)
+            return
+        self.strategy.sync_inventory_from_exchange(int(inventory))
 
     def _current_cash(self) -> int | None:
         return int(self.positions.get("cash", 0)) if self._position_snapshot_seen.is_set() else None
@@ -2327,24 +2621,46 @@ class MarketABot(XChangeClient):
             )
 
 
-async def main() -> None:
+def load_runtime_config(
+    *,
+    default_host: str | None = DEFAULT_SERVER,
+    default_username: str | None = DEFAULT_USERNAME,
+    default_password: str | None = DEFAULT_PASSWORD,
+) -> BotConfig:
     base_dir = Path(__file__).resolve().parent
     try:
-        config = load_bot_config(
+        return load_bot_config(
             base_dir,
-            default_host=DEFAULT_SERVER,
-            default_username=DEFAULT_USERNAME,
-            default_password=DEFAULT_PASSWORD,
+            default_host=default_host,
+            default_username=default_username,
+            default_password=default_password,
             default_initial_multiplier=DEFAULT_A_INITIAL_MULTIPLIER,
             default_initial_fair_value=DEFAULT_A_INITIAL_FAIR_VALUE,
         )
     except ConfigError as exc:
         raise SystemExit(str(exc)) from exc
 
+
+async def run_bot(
+    *,
+    default_host: str | None = DEFAULT_SERVER,
+    default_username: str | None = DEFAULT_USERNAME,
+    default_password: str | None = DEFAULT_PASSWORD,
+) -> None:
+    config = load_runtime_config(
+        default_host=default_host,
+        default_username=default_username,
+        default_password=default_password,
+    )
+
     LOGGER.info("Starting multi-market runtime against %s", config.exchange.host)
     LOGGER.info("Journal path: %s", config.paths.journal_path)
     bot = MarketABot(config)
     await bot.start()
+
+
+async def main() -> None:
+    await run_bot()
 
 
 if __name__ == "__main__":

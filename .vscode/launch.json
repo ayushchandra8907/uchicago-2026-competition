@@ -8,6 +8,28 @@
       "program": "${workspaceFolder}/data_scraping/market_research_logger.py",
       "cwd": "${workspaceFolder}",
       "console": "internalConsole"
+    },
+    {
+      "name": "Competition Bot",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/case1/Case 1 Saavan/run_competition.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    },
+    {
+      "name": "PM Guard Only",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/case1/caleb_work/run_pm_guard.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
     }
   ]
 }
