@@ -48,7 +48,7 @@ class MyXchangeClient(XChangeClient):
 
 
 async def main():
-    SERVER = '34.197.188.76:3333'
+    SERVER = '3from.76:3333'
     my_client = MyXchangeClient(SERVER, "uiuc", "mesa-lynx-octopus")
     await my_client.start()
 
