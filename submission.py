@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
@@ -234,7 +233,7 @@ class MyStrategy(StrategyBase):
             "last5": closes / day_prices[:, max(self.ticks_per_day - 5, 0), :] - 1.0,
             "range": highs / lows - 1.0,
             "intraday_vol": np.std(tick_rets, axis=1, ddof=1),
-            "close_loc": (closes - lows) / (highs - lows + 1e-12),
+            "close_loc": (closes-lows) / (highs - lows + 1e-12),
             "sector_rel": sector_rel,
         }
 
